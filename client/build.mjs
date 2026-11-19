@@ -61,3 +61,10 @@ for (const output of result.outputs) {
 }
 
 console.log(`Client built to ${OUTDIR}/`);
+
+// Phase 5 — PWA + SEO static files (manifest, service worker, icons,
+// sitemap, robots) live in ./client/static and are served from the site
+// root (server.ts serves everything under ./public). The build wipes
+// ./public above, so copy them in after every build.
+await cp("./client/static", OUTDIR, { recursive: true });
+console.log(`Static PWA/SEO files copied to ${OUTDIR}/`);
