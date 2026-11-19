@@ -122,6 +122,37 @@ export type NotificationRow = {
   createdAt: Date;
 };
 
+// Phase 3 — Help Center articles and support tickets.
+
+export type HelpArticleRow = {
+  id: number;
+  title: string;
+  body: string;
+  category: string;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type SupportTicketRow = {
+  id: number;
+  userId: number | null;
+  anonId: string | null;
+  ownerKey: string;
+  subject: string;
+  category: string;
+  status: string;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type TicketMessageRow = {
+  id: number;
+  ticketId: number;
+  authorRole: string;
+  message: string;
+  createdAt: Date;
+};
+
 type UserRaw = {
   id: number;
   name: string;
@@ -1292,5 +1323,287 @@ export class Store {
       )
       .get(ownerKey, dayStartMs) as { id: number } | null;
     return !!row;
+  }
+
+  // -- Help Center articles (Phase 3) --------------------------------------
+
+  private toHelpArticleRow(r: {
+    id: number;
+    title: string;
+    body: string;
+    category: string;
+    created_at: number;
+    updated_at: number;
+  }): HelpArticleRow {
+    return {
+      id: r.id,
+      title: r.title,
+      body: r.body,
+      category: r.category,
+      createdAt: new Date(r.created_at),
+      updatedAt: new Date(r.updated_at),
+    };
+  }
+
+  countHelpArticles(): number {
+    const row = this.db
+      .query("SELECT COUNT(*) AS n FROM help_articles")
+      .get() as { n: number };
+    return row.n;
+  }
+
+  listHelpArticles(): HelpArticleRow[] {
+    const rows = this.db
+      .query("SELECT * FROM help_articles ORDER BY id ASC")
+      .all() as {
+      id: number;
+      title: string;
+      body: string;
+      category: string;
+      created_at: number;
+      updated_at: number;
+    }[];
+    return rows.map((r) => this.toHelpArticleRow(r));
+  }
+
+  insertHelpArticle(row: {
+    title: string;
+    body: string;
+    category: string;
+  }): number {
+    const now = Date.now();
+    const info = this.db
+      .query(
+        "INSERT INTO help_articles (title, body, category, created_at, updated_at) " +
+          "VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(row.title, row.body, row.category, now, now);
+    return Number(info.lastInsertRowid);
+  }
+
+  updateHelpArticle(
+    id: number,
+    patch: { title?: string; category?: string; body?: string },
+  ): void {
+    const sets: string[] = ["updated_at = ?"];
+    const values: (string | number)[] = [Date.now()];
+    if (patch.title !== undefined) {
+      sets.push("title = ?");
+      values.push(patch.title);
+    }
+    if (patch.category !== undefined) {
+      sets.push("category = ?");
+      values.push(patch.category);
+    }
+    if (patch.body !== undefined) {
+      sets.push("body = ?");
+      values.push(patch.body);
+    }
+    this.db
+      .query(`UPDATE help_articles SET ${sets.join(", ")} WHERE id = ?`)
+      .run(...values, id);
+  }
+
+  deleteHelpArticle(id: number): void {
+    this.db.query("DELETE FROM help_articles WHERE id = ?").run(id);
+  }
+
+  // -- Support tickets (Phase 3) --------------------------------------------
+
+  private toSupportTicketRow(r: {
+    id: number;
+    user_id: number | null;
+    anon_id: string | null;
+    owner_key: string;
+    subject: string;
+    category: string;
+    status: string;
+    created_at: number;
+    updated_at: number;
+  }): SupportTicketRow {
+    return {
+      id: r.id,
+      userId: r.user_id,
+      anonId: r.anon_id,
+      ownerKey: r.owner_key,
+      subject: r.subject,
+      category: r.category,
+      status: r.status,
+      createdAt: new Date(r.created_at),
+      updatedAt: new Date(r.updated_at),
+    };
+  }
+
+  private toTicketMessageRow(r: {
+    id: number;
+    ticket_id: number;
+    author_role: string;
+    message: string;
+    created_at: number;
+  }): TicketMessageRow {
+    return {
+      id: r.id,
+      ticketId: r.ticket_id,
+      authorRole: r.author_role,
+      message: r.message,
+      createdAt: new Date(r.created_at),
+    };
+  }
+
+  insertTicket(row: {
+    userId: number | null;
+    anonId: string | null;
+    ownerKey: string;
+    subject: string;
+    category: string;
+  }): number {
+    const now = Date.now();
+    const info = this.db
+      .query(
+        "INSERT INTO support_tickets (user_id, anon_id, owner_key, subject, category, status, created_at, updated_at) " +
+          "VALUES (?, ?, ?, ?, ?, 'open', ?, ?)",
+      )
+      .run(
+        row.userId,
+        row.anonId,
+        row.ownerKey,
+        row.subject,
+        row.category,
+        now,
+        now,
+      );
+    return Number(info.lastInsertRowid);
+  }
+
+  getTicketById(id: number): SupportTicketRow | null {
+    const row = this.db
+      .query("SELECT * FROM support_tickets WHERE id = ? LIMIT 1")
+      .get(id) as {
+      id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      owner_key: string;
+      subject: string;
+      category: string;
+      status: string;
+      created_at: number;
+      updated_at: number;
+    } | null;
+    return row ? this.toSupportTicketRow(row) : null;
+  }
+
+  getTicketByIdAndOwner(id: number, ownerKey: string): SupportTicketRow | null {
+    const row = this.db
+      .query(
+        "SELECT * FROM support_tickets WHERE id = ? AND owner_key = ? LIMIT 1",
+      )
+      .get(id, ownerKey) as {
+      id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      owner_key: string;
+      subject: string;
+      category: string;
+      status: string;
+      created_at: number;
+      updated_at: number;
+    } | null;
+    return row ? this.toSupportTicketRow(row) : null;
+  }
+
+  listTicketsForOwner(ownerKey: string): SupportTicketRow[] {
+    const rows = this.db
+      .query(
+        "SELECT * FROM support_tickets WHERE owner_key = ? ORDER BY id DESC",
+      )
+      .all(ownerKey) as {
+      id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      owner_key: string;
+      subject: string;
+      category: string;
+      status: string;
+      created_at: number;
+      updated_at: number;
+    }[];
+    return rows.map((r) => this.toSupportTicketRow(r));
+  }
+
+  listAllTickets(): SupportTicketRow[] {
+    const rows = this.db
+      .query("SELECT * FROM support_tickets ORDER BY id DESC")
+      .all() as {
+      id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      owner_key: string;
+      subject: string;
+      category: string;
+      status: string;
+      created_at: number;
+      updated_at: number;
+    }[];
+    return rows.map((r) => this.toSupportTicketRow(r));
+  }
+
+  updateTicketStatus(id: number, status: string): void {
+    this.db
+      .query(
+        "UPDATE support_tickets SET status = ?, updated_at = ? WHERE id = ?",
+      )
+      .run(status, Date.now(), id);
+  }
+
+  insertTicketMessage(row: {
+    ticketId: number;
+    authorRole: string;
+    message: string;
+  }): number {
+    const info = this.db
+      .query(
+        "INSERT INTO ticket_messages (ticket_id, author_role, message, created_at) " +
+          "VALUES (?, ?, ?, ?)",
+      )
+      .run(row.ticketId, row.authorRole, row.message, Date.now());
+    return Number(info.lastInsertRowid);
+  }
+
+  listTicketMessages(ticketId: number): TicketMessageRow[] {
+    const rows = this.db
+      .query(
+        "SELECT * FROM ticket_messages WHERE ticket_id = ? ORDER BY id ASC",
+      )
+      .all(ticketId) as {
+      id: number;
+      ticket_id: number;
+      author_role: string;
+      message: string;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toTicketMessageRow(r));
+  }
+
+  deleteTicketMessagesForTickets(ticketIds: number[]): void {
+    if (ticketIds.length === 0) return;
+    const placeholders = ticketIds.map(() => "?").join(", ");
+    this.db
+      .query(
+        `DELETE FROM ticket_messages WHERE ticket_id IN (${placeholders})`,
+      )
+      .run(...ticketIds);
+  }
+
+  deleteTicketsForUser(userId: number): void {
+    this.db
+      .query("DELETE FROM support_tickets WHERE user_id = ?")
+      .run(userId);
+  }
+
+  listTicketIdsForUser(userId: number): number[] {
+    const rows = this.db
+      .query("SELECT id FROM support_tickets WHERE user_id = ?")
+      .all(userId) as { id: number }[];
+    return rows.map((r) => r.id);
   }
 }

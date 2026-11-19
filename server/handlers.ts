@@ -453,7 +453,7 @@ function qualityLabel(url: string, isOrigin: boolean): string {
 // received, plan activated/expired/exhausted, daily limit reached).
 // ---------------------------------------------------------------------------
 
-type NotificationType = "payment" | "plan" | "limit";
+type NotificationType = "payment" | "plan" | "limit" | "support";
 
 /** Owner key shared by favourites and notifications: one text key per
  *  account ("user:<id>") or anonymous browser ("anon:<browser id>") so
@@ -1746,6 +1746,9 @@ function deleteUser(
   env.store.deleteFavoritesForUser(userId);
   env.store.deleteNotificationsForUser(userId);
   env.store.deleteUserSettings(userId);
+  const ticketIds = env.store.listTicketIdsForUser(userId);
+  env.store.deleteTicketMessagesForTickets(ticketIds);
+  env.store.deleteTicketsForUser(userId);
   env.store.deleteUserById(userId);
   // Recorded payments are KEPT (they carry the customer name/email) so
   // revenue history stays correct.
@@ -1999,6 +2002,427 @@ function deleteNotification(env: Env, args: unknown): { ok: true } {
   return { ok: true as const };
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3 — Help Center + Support Tickets (master spec).
+//
+// Tickets work for logged-in customers (per account) and anonymous
+// visitors (per browser), like History and Favourites. There is no
+// email service on this site, so ticket replies are delivered
+// in-app: the owner gets a "support" notification when the admin
+// replies, and sees the thread on the Support Tickets page.
+// ---------------------------------------------------------------------------
+
+/** The Help Center articles shown to every visitor. Real content only,
+ *  written for this site — no invented support email, no invented
+ *  claims. Seeded once when the table is empty; the admin manages them
+ *  from Admin → Support afterwards. */
+const DEFAULT_HELP_ARTICLES: { title: string; body: string; category: string }[] = [
+  {
+    title: "How do I download a Jimeng video?",
+    category: "Downloading",
+    body: "Open the video in the Jimeng app or on jimeng.jianying.com, make sure it is Published (Public), then use the share arrow and copy the link. Paste the link in the box on the Jimeng Downloader page and tap “Get Video”. The video preview appears — choose a quality and tap “Download MP4”. The file is first prepared on this site's server, then the Save buttons appear below. On a phone, “Share and Save” is the most reliable option: choose “Save to Files” or your Gallery app in the share sheet. Another method that works on phones: open the playing video's three dots (⋮) menu, tap Share, then Save at the end — the video goes straight to your gallery.",
+  },
+  {
+    title: "Why is my link not working?",
+    category: "Downloading",
+    body: "The most common reasons: (1) the video is still a draft or private — Publish (Public) it on Jimeng first, private drafts cannot be fetched; (2) the share link is old or expired — copy a fresh link from the Jimeng app and try again (avatar / cast-template invite links are usually only valid for about 48 hours); (3) the link was copied incompletely — paste the full share text and the link is extracted from it automatically. If the page says “page opened, no video file found”, the link opened but Jimeng returned no video for it — it is usually a draft, a deleted video, or an expired invite.",
+  },
+  {
+    title: "Why does the downloaded video have no watermark?",
+    category: "Watermark",
+    body: "Jimeng keeps two files for every published video: a display file, with the “AI generated” badge at the top and the Jimeng @user watermark at the bottom burned in, plus a Jimeng ending card appended at the end; and an original master (origin) file that is completely clean. This tool always fetches the master file from the public share link. If only the display file is ever available for a link, it is clearly labelled “File with watermark” in the quality list — a watermarked file is never called “No Watermark”.",
+  },
+  {
+    title: "What is the free daily limit?",
+    category: "Plans & limits",
+    body: "Downloading is free up to a daily limit set by the site owner (10 downloads per day by default). The limit counts successful downloads only — a failed download does not use up any of your quota — and it resets at the start of each new day (UTC). Visitors without an account are counted per browser; logged-in customers are counted per account. When the limit is reached, the Plans page opens automatically so you can buy a monthly plan. If you need more than the free limit, a plan gives you a fixed number of downloads (for example 1,000, 5,000 or 10,000) for 30 days.",
+  },
+  {
+    title: "How do monthly plans work?",
+    category: "Plans & limits",
+    body: "On the Plans page, tap Buy on a plan — this creates a purchase request for the admin (there is no payment gateway on the site yet). The admin marks the request as paid once the payment is received, then activates the plan for your account. Your plan then gives you its download quota for its duration (for example 1,000 downloads for 30 days). When the quota is used up or the plan expires, you fall back to the Free plan with its daily limit. You can see your active plan, remaining downloads and purchase history on the My Plan page.",
+  },
+  {
+    title: "How does Bulk Download work?",
+    category: "Downloading",
+    body: "Open Bulk Download from the menu (or the Bulk tab on the Jimeng page) and paste one Jimeng link per line — up to 10 at a time. Tap “Fetch All Videos” and each video is fetched one by one, each with its own export-quality dropdown and its own Download button. “Download All” downloads the fetched videos one after another, and “Download ZIP” puts them all in one ZIP file. Every successful video also counts toward your free daily limit or plan quota, exactly like a single download.",
+  },
+  {
+    title: "How do Favourites, Notifications and Download Settings work?",
+    category: "Account",
+    body: "Tap the heart on any video (on the result, in Bulk, or in your History) to save it to Favourites — your Favourites page lists them with a Download again button. In Download Settings you can choose a default quality (for example 720p) and a default mode (Single or Bulk) — the chosen quality is pre-selected on every video you fetch. Notifications appear when a payment is received, a plan is activated or ends, your free daily limit is reached, or the admin replies to one of your support tickets. Logged-in customers keep all of these on their account; visitors without an account keep them in this browser.",
+  },
+  {
+    title: "How do I log in, or change my password?",
+    category: "Account",
+    body: "Downloads are free and need no login. An account is only needed to buy a monthly plan. Register once on the Login page (name, email, password) and you stay logged in. The same login page is used by everyone: the admin signs in there with the admin email and password and goes straight to the Admin Panel. To change your password, open My Profile when logged in and use “Change password” — your current password is required, and all other sessions are signed out.",
+  },
+  {
+    title: "What is Jimeng AI?",
+    category: "About",
+    body: "Jimeng AI (jimeng.jianying.com) is ByteDance's AI creative platform — the same company behind TikTok and CapCut. You can create AI videos and images just by typing text or providing an image. It runs on the Seedance model family, and text-to-video, image-to-video and AI image generation are all available in one place. Jimeng is mainly for China; its international version is Dreamina (under CapCut), so public Dreamina share links can also work with this downloader. This tool is not affiliated with Jimeng or ByteDance.",
+  },
+  {
+    title: "Can I use these videos anywhere?",
+    category: "About",
+    body: "Download videos for personal use only. All rights remain with their creators and ByteDance / Jimeng AI — do not repost someone else's video as your own or use it commercially. If you are a rights holder and a video should not be available here, use the Contact page to reach us and include the video link and proof of ownership.",
+  },
+];
+
+function ensureHelpArticles(env: Env): void {
+  if (env.store.countHelpArticles() === 0) {
+    for (const a of DEFAULT_HELP_ARTICLES) {
+      env.store.insertHelpArticle(a);
+    }
+  }
+}
+
+const TICKET_CATEGORIES = [
+  "billing",
+  "download",
+  "account",
+  "problem",
+  "other",
+] as const;
+type TicketCategory = (typeof TICKET_CATEGORIES)[number];
+
+function listHelpArticles(env: Env): {
+  articles: {
+    id: number;
+    title: string;
+    body: string;
+    category: string;
+    createdAt: string;
+  }[];
+} {
+  ensureHelpArticles(env);
+  return {
+    articles: env.store.listHelpArticles().map((r) => ({
+      id: r.id,
+      title: r.title,
+      body: r.body,
+      category: r.category,
+      createdAt: r.createdAt.toISOString(),
+    })),
+  };
+}
+
+function createHelpArticle(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null; id: number | null } {
+  requireAdmin(env, args);
+  const title = reqString(args, "title", 200).trim();
+  const category = reqString(args, "category", 100).trim();
+  const body = reqString(args, "body", 20000).trim();
+  const id = env.store.insertHelpArticle({ title, category, body });
+  return { ok: true, error: null, id };
+}
+
+function updateHelpArticle(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null } {
+  requireAdmin(env, args);
+  const id = reqInt(args, "id");
+  const rec = asRecord(args);
+  const patch: { title?: string; category?: string; body?: string } = {};
+  for (const field of ["title", "category", "body"] as const) {
+    const v = rec?.[field];
+    if (v === undefined || v === null) continue;
+    if (typeof v !== "string" || v.trim() === "") {
+      throw new HandlerError(400, `${field} is required`);
+    }
+    const max = field === "body" ? 20000 : field === "title" ? 200 : 100;
+    if (v.length > max) throw new HandlerError(400, `${field} is too long`);
+    patch[field] = v.trim();
+  }
+  env.store.updateHelpArticle(id, patch);
+  return { ok: true, error: null };
+}
+
+function deleteHelpArticle(env: Env, args: unknown): { ok: true } {
+  requireAdmin(env, args);
+  env.store.deleteHelpArticle(reqInt(args, "id"));
+  return { ok: true as const };
+}
+
+function createTicket(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null; ticketId: number | null } {
+  const subject = reqString(args, "subject", 200).trim();
+  const rec = asRecord(args);
+  const category = rec?.category;
+  if (
+    typeof category !== "string" ||
+    !(TICKET_CATEGORIES as readonly string[]).includes(category)
+  ) {
+    throw new HandlerError(
+      400,
+      "category must be one of: billing, download, account, problem, other",
+    );
+  }
+  const messageText = reqString(args, "message", 4000).trim();
+  const link = optString(args, "link", 500).trim();
+  const me = authUser(env, optToken(args));
+  const userId = me?.id ?? null;
+  const anonId = me ? null : (optString(args, "anonId", 100) || null);
+  const ownerKey = ownerKeyFor(userId, anonId);
+  if (!ownerKey) {
+    return { ok: false, error: "Could not identify this browser — please try again.", ticketId: null };
+  }
+  const message = link ? `${messageText}\n\nLink: ${link}` : messageText;
+  const ticketId = env.store.insertTicket({
+    userId,
+    anonId,
+    ownerKey,
+    subject,
+    category: category as TicketCategory,
+  });
+  env.store.insertTicketMessage({
+    ticketId,
+    authorRole: "user",
+    message,
+  });
+  return { ok: true, error: null, ticketId };
+}
+
+function listMyTickets(env: Env, args: unknown): {
+  tickets: {
+    id: number;
+    subject: string;
+    category: string;
+    status: string;
+    createdAt: string;
+    updatedAt: string;
+  }[];
+} {
+  const me = authUser(env, optToken(args));
+  const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+  if (!ownerKey) return { tickets: [] };
+  return {
+    tickets: env.store.listTicketsForOwner(ownerKey).map((r) => ({
+      id: r.id,
+      subject: r.subject,
+      category: r.category,
+      status: r.status,
+      createdAt: r.createdAt.toISOString(),
+      updatedAt: r.updatedAt.toISOString(),
+    })),
+  };
+}
+
+function getTicket(env: Env, args: unknown): {
+  ticket: {
+    id: number;
+    subject: string;
+    category: string;
+    status: string;
+    createdAt: string;
+    updatedAt: string;
+  } | null;
+  messages: {
+    id: number;
+    authorRole: string;
+    message: string;
+    createdAt: string;
+  }[];
+} {
+  const id = reqInt(args, "id");
+  const me = authUser(env, optToken(args));
+  const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+  if (!ownerKey) return { ticket: null, messages: [] };
+  const t = env.store.getTicketByIdAndOwner(id, ownerKey);
+  if (!t) return { ticket: null, messages: [] };
+  return {
+    ticket: {
+      id: t.id,
+      subject: t.subject,
+      category: t.category,
+      status: t.status,
+      createdAt: t.createdAt.toISOString(),
+      updatedAt: t.updatedAt.toISOString(),
+    },
+    messages: env.store.listTicketMessages(t.id).map((m) => ({
+      id: m.id,
+      authorRole: m.authorRole,
+      message: m.message,
+      createdAt: m.createdAt.toISOString(),
+    })),
+  };
+}
+
+function replyTicket(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null } {
+  const id = reqInt(args, "id");
+  const message = reqString(args, "message", 4000).trim();
+  const me = authUser(env, optToken(args));
+  const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+  if (!ownerKey) return { ok: false, error: "Could not identify this browser — please try again." };
+  const t = env.store.getTicketByIdAndOwner(id, ownerKey);
+  if (!t) return { ok: false, error: "Ticket not found." };
+  env.store.insertTicketMessage({
+    ticketId: t.id,
+    authorRole: "user",
+    message,
+  });
+  env.store.updateTicketStatus(t.id, "open");
+  return { ok: true, error: null };
+}
+
+function closeTicket(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null } {
+  const id = reqInt(args, "id");
+  const me = authUser(env, optToken(args));
+  const isAdmin = me?.role === "admin";
+  let t;
+  if (isAdmin) {
+    // Admin can close any ticket.
+    t = env.store.getTicketById(id);
+  } else {
+    // Owner close, same ownerKey scoping as replyTicket: a logged-in
+    // owner uses "user:<id>", an anonymous owner uses "anon:<browser>".
+    // No login gate — anonymous owners can close their own tickets.
+    const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+    if (!ownerKey) return { ok: false, error: "Could not identify this browser — please try again." };
+    t = env.store.getTicketByIdAndOwner(id, ownerKey);
+  }
+  if (!t) return { ok: false, error: "Ticket not found." };
+  env.store.updateTicketStatus(t.id, "closed");
+  return { ok: true, error: null };
+}
+
+function listAllTickets(env: Env, args: unknown): {
+  tickets: {
+    id: number;
+    subject: string;
+    category: string;
+    status: string;
+    customerName: string;
+    customerEmail: string;
+    createdAt: string;
+    updatedAt: string;
+  }[];
+} {
+  requireAdmin(env, args);
+  return {
+    tickets: env.store.listAllTickets().map((r) => {
+      let customerName = "Guest (browser)";
+      let customerEmail = "";
+      if (r.userId !== null) {
+        const u = env.store.getUserById(r.userId);
+        customerName = u?.name ?? "Deleted account";
+        customerEmail = u?.email ?? "";
+      }
+      return {
+        id: r.id,
+        subject: r.subject,
+        category: r.category,
+        status: r.status,
+        customerName,
+        customerEmail,
+        createdAt: r.createdAt.toISOString(),
+        updatedAt: r.updatedAt.toISOString(),
+      };
+    }),
+  };
+}
+
+function getAdminTicket(env: Env, args: unknown): {
+  ticket: {
+    id: number;
+    subject: string;
+    category: string;
+    status: string;
+    customerName: string;
+    customerEmail: string;
+    createdAt: string;
+    updatedAt: string;
+  } | null;
+  messages: {
+    id: number;
+    authorRole: string;
+    message: string;
+    createdAt: string;
+  }[];
+} {
+  requireAdmin(env, args);
+  const t = env.store.getTicketById(reqInt(args, "id"));
+  if (!t) return { ticket: null, messages: [] };
+  let customerName = "Guest (browser)";
+  let customerEmail = "";
+  if (t.userId !== null) {
+    const u = env.store.getUserById(t.userId);
+    customerName = u?.name ?? "Deleted account";
+    customerEmail = u?.email ?? "";
+  }
+  return {
+    ticket: {
+      id: t.id,
+      subject: t.subject,
+      category: t.category,
+      status: t.status,
+      customerName,
+      customerEmail,
+      createdAt: t.createdAt.toISOString(),
+      updatedAt: t.updatedAt.toISOString(),
+    },
+    messages: env.store.listTicketMessages(t.id).map((m) => ({
+      id: m.id,
+      authorRole: m.authorRole,
+      message: m.message,
+      createdAt: m.createdAt.toISOString(),
+    })),
+  };
+}
+
+function replyTicketAdmin(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null } {
+  requireAdmin(env, args);
+  const id = reqInt(args, "id");
+  const message = reqString(args, "message", 4000).trim();
+  const t = env.store.getTicketById(id);
+  if (!t) return { ok: false, error: "Ticket not found." };
+  env.store.insertTicketMessage({
+    ticketId: t.id,
+    authorRole: "admin",
+    message,
+  });
+  env.store.updateTicketStatus(t.id, "answered");
+  createNotification(env, {
+    userId: t.userId,
+    anonId: t.anonId,
+    type: "support",
+    title: "Admin replied to your ticket",
+    message: `The admin replied to your ticket “${t.subject}”. Open Support Tickets to read the reply.`,
+  });
+  return { ok: true, error: null };
+}
+
+function setTicketStatus(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null } {
+  requireAdmin(env, args);
+  const id = reqInt(args, "id");
+  const rec = asRecord(args);
+  const status = rec?.status;
+  if (status !== "open" && status !== "closed") {
+    throw new HandlerError(400, 'status must be "open" or "closed"');
+  }
+  const t = env.store.getTicketById(id);
+  if (!t) return { ok: false, error: "Ticket not found." };
+  env.store.updateTicketStatus(id, status);
+  return { ok: true, error: null };
+}
+
 export type ActionHandler = (env: Env, args: unknown) => Promise<unknown> | unknown;
 
 export const ACTIONS: Record<string, ActionHandler> = {
@@ -2051,4 +2475,17 @@ export const ACTIONS: Record<string, ActionHandler> = {
   markNotificationRead,
   markAllNotificationsRead,
   deleteNotification,
+  listHelpArticles,
+  createHelpArticle,
+  updateHelpArticle,
+  deleteHelpArticle,
+  createTicket,
+  listMyTickets,
+  getTicket,
+  replyTicket,
+  closeTicket,
+  listAllTickets,
+  getAdminTicket,
+  replyTicketAdmin,
+  setTicketStatus,
 };

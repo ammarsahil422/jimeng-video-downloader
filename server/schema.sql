@@ -157,3 +157,45 @@ CREATE TABLE IF NOT EXISTS notifications (
 
 CREATE INDEX IF NOT EXISTS notifications_owner_idx
   ON notifications (owner_key, created_at);
+
+-- Phase 3 (master spec, ported from the artifact's drizzle/0006
+-- migration): Help Center articles and support tickets. Articles are
+-- seeded once on first read (see ensureHelpArticles in handlers.ts);
+-- the admin manages them from Admin → Support. Tickets work for
+-- logged-in customers (per account) and anonymous visitors (per
+-- browser), like History and Favourites. There is no email service:
+-- ticket replies are delivered in-app via a "support" notification.
+CREATE TABLE IF NOT EXISTS help_articles (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  category TEXT NOT NULL DEFAULT 'General',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS support_tickets (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  anon_id TEXT,
+  owner_key TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  category TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'open',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS support_tickets_owner_idx
+  ON support_tickets (owner_key, created_at);
+
+CREATE TABLE IF NOT EXISTS ticket_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_id INTEGER NOT NULL,
+  author_role TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ticket_messages_ticket_idx
+  ON ticket_messages (ticket_id, created_at);
