@@ -140,6 +140,8 @@ CREATE TABLE IF NOT EXISTS user_settings (
   user_id INTEGER PRIMARY KEY,
   default_quality TEXT NOT NULL DEFAULT 'best',
   default_mode TEXT NOT NULL DEFAULT 'single',
+  theme TEXT NOT NULL DEFAULT 'dark',
+  language TEXT NOT NULL DEFAULT 'en',
   updated_at INTEGER NOT NULL
 );
 

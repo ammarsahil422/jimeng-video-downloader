@@ -742,7 +742,28 @@ type ResolveResponse = {
   downloadId: number | null;
 };
 
+/** Standalone equivalent of the artifact's ensureSubscriptionSchema:
+ *  makes sure the downloads attribution columns (user_id / anon_id) exist
+ *  before resolveLink writes a history row. The Store constructor already
+ *  adds them at boot; this is belt-and-braces for a database created by an
+ *  older build, so a resolve-first request can never crash with
+ *  "no column named user_id". Idempotent — the PRAGMA check skips the
+ *  ALTER when the column is already there. */
+function ensureSubscriptionSchema(env: Env): void {
+  const cols = env.store.db.query("PRAGMA table_info(downloads)").all() as {
+    name: string;
+  }[];
+  const names = new Set(cols.map((c) => c.name));
+  if (!names.has("user_id")) {
+    env.store.db.exec("ALTER TABLE downloads ADD COLUMN user_id INTEGER");
+  }
+  if (!names.has("anon_id")) {
+    env.store.db.exec("ALTER TABLE downloads ADD COLUMN anon_id TEXT");
+  }
+}
+
 async function resolveLink(env: Env, args: unknown): Promise<ResolveResponse> {
+  ensureSubscriptionSchema(env);
   const text = reqString(args, "text", 4000);
   // Who fetched this — a logged-in account, or an anonymous browser
   // (anonId the client stores in localStorage). Used only to attribute
@@ -976,14 +997,86 @@ async function prepareDownload(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Site SEO (Phase 5, master spec).
+//
+// The title / description / keywords the site shows in its HTML meta tags
+// (and the admin edits in Admin → Settings → SEO). Stored as plain
+// settings rows (seo_title, seo_description, seo_keywords); an empty or
+// missing value falls back to the defaults below, which match the static
+// meta tags in client/index.html.
+//
+// Honest limit: the saved values flow to document.title/meta CLIENT-side
+// via getSiteSeo — the static index.html meta tags and the static
+// sitemap.xml do NOT change when the admin saves new SEO text.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SEO = {
+  title: "Jimeng Video Downloader — No Watermark",
+  description:
+    "Download Jimeng AI videos without watermark — free, no login required. Paste a public Jimeng share link and save the original MP4 in seconds.",
+  keywords:
+    "jimeng downloader, jimeng video downloader, download jimeng video without watermark, dreamina downloader, jimeng mp4",
+} as const;
+
+function getSiteSeoValues(env: Env): { title: string; description: string; keywords: string } {
+  const title = env.store.getSetting("seo_title");
+  const description = env.store.getSetting("seo_description");
+  const keywords = env.store.getSetting("seo_keywords");
+  return {
+    title: title?.trim() ? title.trim() : DEFAULT_SEO.title,
+    description: description?.trim() ? description.trim() : DEFAULT_SEO.description,
+    keywords: keywords?.trim() ? keywords.trim() : DEFAULT_SEO.keywords,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Adsterra smart link (the site owner's own ad link).
+//
+// One sponsored link, shown as a clearly labelled banner on the Jimeng
+// downloader page only — below the video result, never above or over any
+// Download button, never intercepting a download click, no popunder, no
+// auto-redirect, no timer. Stored in the settings table:
+//   smart_link_url     — the URL (empty = removed by the admin)
+//   smart_link_enabled — "1" / "0"
+// The default is the owner's Adsterra smart link, so the banner shows
+// immediately on a fresh database; the admin can change, disable or
+// remove it in Admin → Ads at any time. Removing writes an empty URL
+// (not a deleted row) so the default does NOT come back after a remove.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_SMART_LINK_URL =
+  "https://auctionr.org/4/83adcd468ac5bbb0c8ecf153de0ed631";
+
+function getSmartLinkValues(env: Env): { url: string | null; enabled: boolean } {
+  const urlRaw = env.store.getSetting("smart_link_url");
+  const enabledRaw = env.store.getSetting("smart_link_enabled");
+  // Absent row = never touched → the owner's default link, enabled.
+  // Present-but-empty = the admin removed it → stays removed.
+  const url = urlRaw === null ? DEFAULT_SMART_LINK_URL : urlRaw.trim() ? urlRaw.trim() : null;
+  const enabled = enabledRaw === null ? true : enabledRaw === "1";
+  return { url, enabled: Boolean(url) && enabled };
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const u = new URL(value);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 function getSettings(env: Env, args: unknown): {
   apiKeyHint: string | null;
   hasApiKey: boolean;
   apiBaseUrl: string | null;
   adSlots: Record<AdSlot, boolean>;
+  smartLink: { url: string | null; enabled: boolean };
 } {
   // The API-key hint and base URL are returned only to the admin — regular
   // visitors get nulls. The ad-slot booleans drive the public placeholders.
+  // The smart link is a public ad link (no secrets), so everyone gets it.
   const isAdmin = authAdmin(env, optToken(args)) !== null;
   const apiKey = isAdmin ? env.store.getSetting("api_key") : null;
   const adSlots = {} as Record<AdSlot, boolean>;
@@ -995,7 +1088,58 @@ function getSettings(env: Env, args: unknown): {
     hasApiKey: isAdmin ? Boolean(apiKey) : false,
     apiBaseUrl: isAdmin ? env.store.getSetting("api_base_url") : null,
     adSlots,
+    smartLink: getSmartLinkValues(env),
   };
+}
+
+function getSiteSeo(env: Env): { title: string; description: string; keywords: string } {
+  return getSiteSeoValues(env);
+}
+
+function getSeoSettings(env: Env, args: unknown): { title: string; description: string; keywords: string } {
+  requireAdmin(env, args);
+  return getSiteSeoValues(env);
+}
+
+function saveSeoSettings(env: Env, args: unknown): { ok: boolean; error: string | null } {
+  const admin = requireAdmin(env, args);
+  const title = reqString(args, "title", 120).trim();
+  const description = reqString(args, "description", 300).trim();
+  const keywords = optString(args, "keywords", 300).trim();
+  if (!title) throw new HandlerError(400, "title is required");
+  if (!description) throw new HandlerError(400, "description is required");
+  env.store.setSetting("seo_title", title);
+  env.store.setSetting("seo_description", description);
+  env.store.setSetting("seo_keywords", keywords);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.seo_save", detail: `SEO title set to “${title}”.` });
+  return { ok: true, error: null };
+}
+
+function saveSmartLink(env: Env, args: unknown): { ok: boolean; error: string | null } {
+  const admin = requireAdmin(env, args);
+  const rec = asRecord(args);
+  const url = reqString(args, "url", 500).trim();
+  const enabled = rec?.enabled;
+  if (typeof enabled !== "boolean") {
+    throw new HandlerError(400, "enabled must be a boolean");
+  }
+  if (!isHttpUrl(url)) {
+    return { ok: false, error: "Enter a valid link starting with http:// or https://" };
+  }
+  env.store.setSetting("smart_link_url", url);
+  env.store.setSetting("smart_link_enabled", enabled ? "1" : "0");
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.ads.smartlink_save", detail: `Smart link saved (${enabled ? "enabled" : "disabled"}).` });
+  return { ok: true, error: null };
+}
+
+function clearSmartLink(env: Env, args: unknown): { ok: true } {
+  const admin = requireAdmin(env, args);
+  // Writes an empty URL (not a deleted row) so the default link does not
+  // come back after a remove.
+  env.store.setSetting("smart_link_url", "");
+  env.store.setSetting("smart_link_enabled", "0");
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.ads.smartlink_clear", detail: "Smart link removed — the Sponsored banner is hidden." });
+  return { ok: true as const };
 }
 
 function saveApiKey(env: Env, args: unknown): { ok: true; hint: string } {
@@ -1614,6 +1758,10 @@ function createPlan(
   args: unknown,
 ): { ok: boolean; error: string | null; id: number | null } {
   const admin = requireAdmin(env, args);
+  // Phase 5 fix: seed the defaults first — creating the very first plan
+  // must not suppress the 3 default plans (they seed only when the table
+  // is empty on first read).
+  ensureDefaultPlans(env);
   const name = reqString(args, "name", 120).trim();
   const priceCents = reqIntRange(args, "priceCents", 0, 100000000);
   const durationDays = reqIntRange(args, "durationDays", 1, 3650);
@@ -2179,13 +2327,15 @@ async function changeUserPassword(
 function getDownloadSettings(
   env: Env,
   args: unknown,
-): { defaultQuality: QualityPref; defaultMode: DownloadModePref } {
+): { defaultQuality: QualityPref; defaultMode: DownloadModePref; theme: "dark" | "light"; language: "en" | "ur" } {
   const me = authUser(env, optToken(args));
-  if (!me) return { defaultQuality: "best", defaultMode: "single" };
+  if (!me) return { defaultQuality: "best", defaultMode: "single", theme: "dark", language: "en" };
   const row = env.store.getUserSettings(me.id);
   return {
     defaultQuality: (row?.defaultQuality ?? "best") as QualityPref,
     defaultMode: (row?.defaultMode ?? "single") as DownloadModePref,
+    theme: (row?.theme ?? "dark") as "dark" | "light",
+    language: (row?.language ?? "en") as "en" | "ur",
   };
 }
 
@@ -2194,6 +2344,8 @@ function saveDownloadSettings(env: Env, args: unknown): { ok: true } {
   const rec = asRecord(args);
   const quality = rec?.defaultQuality;
   const mode = rec?.defaultMode;
+  const theme = rec?.theme;
+  const language = rec?.language;
   if (typeof quality !== "string" || !QUALITY_PREFS.includes(quality)) {
     throw new HandlerError(
       400,
@@ -2203,10 +2355,20 @@ function saveDownloadSettings(env: Env, args: unknown): { ok: true } {
   if (mode !== "single" && mode !== "bulk") {
     throw new HandlerError(400, 'defaultMode must be "single" or "bulk"');
   }
+  if (theme !== undefined && theme !== "dark" && theme !== "light") {
+    throw new HandlerError(400, 'theme must be "dark" or "light"');
+  }
+  if (language !== undefined && language !== "en" && language !== "ur") {
+    throw new HandlerError(400, 'language must be "en" or "ur"');
+  }
+  // Same as the artifact: omitted theme/language default to dark/en
+  // (they are not preserved from a previous save).
   env.store.upsertUserSettings(
     me.id,
     quality as QualityPref,
     mode as DownloadModePref,
+    (theme as "dark" | "light") ?? "dark",
+    (language as "en" | "ur") ?? "en",
   );
   return { ok: true as const };
 }
@@ -2383,6 +2545,10 @@ function createHelpArticle(
   args: unknown,
 ): { ok: boolean; error: string | null; id: number | null } {
   const admin = requireAdmin(env, args);
+  // Phase 5 fix: seed the defaults first — creating the very first
+  // article must not suppress the 10 default articles (they seed only
+  // when the table is empty on first read).
+  ensureHelpArticles(env);
   const title = reqString(args, "title", 200).trim();
   const category = reqString(args, "category", 100).trim();
   const body = reqString(args, "body", 20000).trim();
@@ -3503,6 +3669,11 @@ export const ACTIONS: Record<string, ActionHandler> = {
   resolveLink,
   prepareDownload,
   getSettings,
+  getSiteSeo,
+  getSeoSettings,
+  saveSeoSettings,
+  saveSmartLink,
+  clearSmartLink,
   saveApiKey,
   clearApiKey,
   saveAdCode,

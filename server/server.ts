@@ -45,6 +45,8 @@ const MIME: Record<string, string> = {
   ".gif": "image/gif",
   ".svg": "image/svg+xml",
   ".ico": "image/x-icon",
+  ".webmanifest": "application/manifest+json",
+  ".xml": "application/xml; charset=utf-8",
   ".woff2": "font/woff2",
   ".woff": "font/woff",
   ".ttf": "font/ttf",

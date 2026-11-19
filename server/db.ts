@@ -115,6 +115,8 @@ export type UserSettingsRow = {
   userId: number;
   defaultQuality: string;
   defaultMode: string;
+  theme: string;
+  language: string;
   updatedAt: Date;
 };
 
@@ -249,6 +251,23 @@ export class Store {
     const sessNames = new Set(sessCols.map((c) => c.name));
     if (!sessNames.has("last_seen_at")) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN last_seen_at INTEGER");
+    }
+    // Phase 5 columns (added after the first release): the theme and
+    // language preferences on user_settings. Added here at startup,
+    // BEFORE any auth query — same pattern as the Phase 4 columns above.
+    const settingsCols = this.db
+      .query("PRAGMA table_info(user_settings)")
+      .all() as { name: string }[];
+    const settingsNames = new Set(settingsCols.map((c) => c.name));
+    if (!settingsNames.has("theme")) {
+      this.db.exec(
+        "ALTER TABLE user_settings ADD COLUMN theme TEXT NOT NULL DEFAULT 'dark'",
+      );
+    }
+    if (!settingsNames.has("language")) {
+      this.db.exec(
+        "ALTER TABLE user_settings ADD COLUMN language TEXT NOT NULL DEFAULT 'en'",
+      );
     }
   }
 
@@ -1297,6 +1316,8 @@ export class Store {
       user_id: number;
       default_quality: string;
       default_mode: string;
+      theme?: string | null;
+      language?: string | null;
       updated_at: number;
     } | null;
     if (!row) return null;
@@ -1304,6 +1325,8 @@ export class Store {
       userId: row.user_id,
       defaultQuality: row.default_quality,
       defaultMode: row.default_mode,
+      theme: row.theme === "light" ? "light" : "dark",
+      language: row.language === "ur" ? "ur" : "en",
       updatedAt: new Date(row.updated_at),
     };
   }
@@ -1312,15 +1335,18 @@ export class Store {
     userId: number,
     defaultQuality: string,
     defaultMode: string,
+    theme: string,
+    language: string,
   ): void {
     this.db
       .query(
-        "INSERT INTO user_settings (user_id, default_quality, default_mode, updated_at) " +
-          "VALUES (?, ?, ?, ?) " +
+        "INSERT INTO user_settings (user_id, default_quality, default_mode, theme, language, updated_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?) " +
           "ON CONFLICT(user_id) DO UPDATE SET default_quality = excluded.default_quality, " +
-          "default_mode = excluded.default_mode, updated_at = excluded.updated_at",
+          "default_mode = excluded.default_mode, theme = excluded.theme, " +
+          "language = excluded.language, updated_at = excluded.updated_at",
       )
-      .run(userId, defaultQuality, defaultMode, Date.now());
+      .run(userId, defaultQuality, defaultMode, theme, language, Date.now());
   }
 
   deleteUserSettings(userId: number): void {
@@ -2141,12 +2167,16 @@ export class Store {
       user_id: number;
       default_quality: string;
       default_mode: string;
+      theme?: string | null;
+      language?: string | null;
       updated_at: number;
     }[];
     return rows.map((r) => ({
       userId: r.user_id,
       defaultQuality: r.default_quality,
       defaultMode: r.default_mode,
+      theme: r.theme === "light" ? "light" : "dark",
+      language: r.language === "ur" ? "ur" : "en",
       updatedAt: new Date(r.updated_at),
     }));
   }
