@@ -156,6 +156,8 @@ export type SecurityOverview = {
 
 export type DownloadQualityPref = "best" | "original" | "720p" | "480p" | "360p";
 export type DownloadModePref = "single" | "bulk";
+export type ThemePref = "dark" | "light";
+export type LangPref = "en" | "ur";
 
 export type AdSlots = {
   head: boolean;
@@ -170,6 +172,7 @@ export type SettingsResult = {
   hasApiKey: boolean;
   apiBaseUrl: string | null;
   adSlots: AdSlots;
+  smartLink: { url: string | null; enabled: boolean };
 };
 
 export type HistoryItem = {
@@ -390,12 +393,38 @@ export interface Actions {
   getDownloadSettings: (args: { token?: string }) => Promise<{
     defaultQuality: DownloadQualityPref;
     defaultMode: DownloadModePref;
+    theme: ThemePref;
+    language: LangPref;
   }>;
   saveDownloadSettings: (args: {
     defaultQuality: DownloadQualityPref;
     defaultMode: DownloadModePref;
+    theme?: ThemePref;
+    language?: LangPref;
     token?: string;
   }) => Promise<{ ok: true }>;
+  getSiteSeo: (args: Record<string, never>) => Promise<{
+    title: string;
+    description: string;
+    keywords: string;
+  }>;
+  getSeoSettings: (args: { token?: string }) => Promise<{
+    title: string;
+    description: string;
+    keywords: string;
+  }>;
+  saveSeoSettings: (args: {
+    title: string;
+    description: string;
+    keywords?: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  saveSmartLink: (args: {
+    url: string;
+    enabled: boolean;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  clearSmartLink: (args: { token?: string }) => Promise<{ ok: true }>;
   listNotifications: (args: {
     limit?: number;
     token?: string;

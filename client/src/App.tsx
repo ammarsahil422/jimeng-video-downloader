@@ -4,11 +4,26 @@ import JSZip from "jszip";
 import QRCode from "qrcode";
 import { SafeAreaTopScrim } from "./safe-area";
 import { api, type ApiResponse } from "./api";
+import {
+  LangProvider,
+  PrefsProvider,
+  applyTheme,
+  getLocalLang,
+  getLocalTheme,
+  setLocalLang,
+  setLocalTheme,
+  usePrefs,
+  useT,
+  type Lang,
+  type Theme,
+} from "./i18n";
 
 const FIELDS = {
   resolveLink: { text: {} },
   saveApiKey: { apiKey: {}, apiBaseUrl: {} },
   saveAdCode: { code: {} },
+  saveSmartLink: { url: {} },
+  saveSeoSettings: { title: {}, description: {}, keywords: {} },
   submitContact: { name: {}, email: {}, message: {} },
   register: { name: {}, email: {}, password: {} },
   login: { email: {}, password: {} },
@@ -129,14 +144,16 @@ function getAnonId(): string {
   }
 }
 
-/** Download preferences (Phase 2). Logged-in customers keep them on
- *  their account (server); anonymous visitors keep the same preferences
- *  in this browser's localStorage. Quality values are real options only
- *  — "best" means the default first option (720p Origin). */
+/** Download preferences (Phase 2 + Phase 5). Logged-in customers keep
+ *  them on their account (server); anonymous visitors keep the same
+ *  preferences in this browser's localStorage. Quality values are real
+ *  options only — "best" means the default first option (720p Origin).
+ *  Theme + language live here too (Phase 5): localStorage is the
+ *  first-paint source, the account value is applied once it loads. */
 type QualityPref = "best" | "original" | "720p" | "480p" | "360p";
 type DownloadModePref = "single" | "bulk";
-type DownloadSettingsPref = { defaultQuality: QualityPref; defaultMode: DownloadModePref };
-const DEFAULT_DOWNLOAD_SETTINGS: DownloadSettingsPref = { defaultQuality: "best", defaultMode: "single" };
+type DownloadSettingsPref = { defaultQuality: QualityPref; defaultMode: DownloadModePref; theme: Theme; language: Lang };
+const DEFAULT_DOWNLOAD_SETTINGS: DownloadSettingsPref = { defaultQuality: "best", defaultMode: "single", theme: "dark", language: "en" };
 const QUALITY_OPTIONS: { value: QualityPref; label: string }[] = [
   { value: "best", label: "Best available (720p Origin)" },
   { value: "original", label: "Original master" },
@@ -149,24 +166,34 @@ const LOCAL_SETTINGS_KEY = "jimeng_download_settings";
 function getLocalDownloadSettings(): DownloadSettingsPref {
   try {
     const raw = localStorage.getItem(LOCAL_SETTINGS_KEY);
-    if (!raw) return DEFAULT_DOWNLOAD_SETTINGS;
+    if (!raw) return { ...DEFAULT_DOWNLOAD_SETTINGS, theme: getLocalTheme(), language: getLocalLang() };
     const parsed = JSON.parse(raw) as Partial<DownloadSettingsPref>;
     const quality = QUALITY_OPTIONS.some((o) => o.value === parsed.defaultQuality)
       ? (parsed.defaultQuality as QualityPref)
       : "best";
     const mode: DownloadModePref = parsed.defaultMode === "bulk" ? "bulk" : "single";
-    return { defaultQuality: quality, defaultMode: mode };
+    return { defaultQuality: quality, defaultMode: mode, theme: getLocalTheme(), language: getLocalLang() };
   } catch {
-    return DEFAULT_DOWNLOAD_SETTINGS;
+    return { ...DEFAULT_DOWNLOAD_SETTINGS, theme: getLocalTheme(), language: getLocalLang() };
   }
 }
 function setLocalDownloadSettings(pref: DownloadSettingsPref): void {
   try {
-    localStorage.setItem(LOCAL_SETTINGS_KEY, JSON.stringify(pref));
+    localStorage.setItem(LOCAL_SETTINGS_KEY, JSON.stringify({ defaultQuality: pref.defaultQuality, defaultMode: pref.defaultMode }));
+    setLocalTheme(pref.theme);
+    setLocalLang(pref.language);
   } catch {
     /* storage blocked — the preference just doesn't stick */
   }
 }
+
+/** The install prompt the browser fires when the site is installable
+ *  as a PWA. Stored (not auto-shown) so the Install button appears only
+ *  when the browser really offers installation — never a fake button. */
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+};
 
 /** Index of the video matching a saved quality preference, falling back
  *  to the best available (index 0) when the preferred quality does not
@@ -197,11 +224,41 @@ function useDownloadSettings(): DownloadSettingsPref {
       return {
         defaultQuality: server.data.defaultQuality as QualityPref,
         defaultMode: server.data.defaultMode as DownloadModePref,
+        theme: (server.data.theme === "light" ? "light" : "dark") as Theme,
+        language: (server.data.language === "ur" ? "ur" : "en") as Lang,
       };
     }
     return DEFAULT_DOWNLOAD_SETTINGS;
   }
   return getLocalDownloadSettings();
+}
+
+/** Applies the site's SEO title/description/keywords (admin-editable in
+ *  Admin → Settings → SEO) to the document on load. The static meta tags
+ *  in index.html carry the same defaults, so the page is never bare. */
+function useSeo(): void {
+  useEffect(() => {
+    let cancelled = false;
+    api.getSiteSeo({}).then((seo) => {
+      if (cancelled) return;
+      document.title = seo.title;
+      const setMeta = (selector: string, content: string) => {
+        const el = document.querySelector<HTMLMetaElement>(selector);
+        if (el) el.setAttribute("content", content);
+      };
+      setMeta('meta[name="description"]', seo.description);
+      setMeta('meta[name="keywords"]', seo.keywords);
+      setMeta('meta[property="og:title"]', seo.title);
+      setMeta('meta[property="og:description"]', seo.description);
+      setMeta('meta[name="twitter:title"]', seo.title);
+      setMeta('meta[name="twitter:description"]', seo.description);
+    }).catch(() => {
+      /* offline — the static meta tags in index.html stay in place */
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 }
 
 const AD_SLOTS: { key: AdSlotKey; label: string; size: string }[] = [
@@ -238,6 +295,7 @@ function SavePanel({
   prepared: PreparedSave;
   onShare: () => void;
 }) {
+  const t = useT();
   const size = formatBytes(prepared.sizeBytes);
   return (
     <div
@@ -245,7 +303,7 @@ function SavePanel({
       style={{ borderRadius: "var(--radius)" }}
     >
       <p className="text-sm font-bold">
-        ✓ File is ready{size ? ` (${size})` : ""} — now save it using one of these options:
+        ✓ {t("save.ready")}{size ? ` (${size})` : ""}
       </p>
       <div className="mt-2 flex flex-col gap-2 sm:flex-row sm:flex-wrap">
         <a
@@ -254,7 +312,7 @@ function SavePanel({
           className="flex-1 bg-[var(--accent)] px-4 py-2.5 text-center text-sm font-extrabold text-[var(--accent-ink)]"
           style={{ borderRadius: "var(--radius)" }}
         >
-          ⬇ Download Now
+          {t("save.download_now")}
         </a>
         <button
           type="button"
@@ -262,7 +320,7 @@ function SavePanel({
           className="flex-1 border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-sm font-extrabold"
           style={{ borderRadius: "var(--radius)" }}
         >
-          📤 Share and Save
+          📤 {t("save.share")}
         </button>
         <a
           href={prepared.url}
@@ -271,11 +329,11 @@ function SavePanel({
           className="flex-1 border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-center text-sm font-extrabold"
           style={{ borderRadius: "var(--radius)" }}
         >
-          Open file in new tab
+          {t("save.open_tab")}
         </a>
       </div>
       <p className="mt-2 text-xs text-[var(--dim)]">
-        On a phone, “Share and Save” is the most reliable option — in the sheet that opens, choose “Save to Files” or your Gallery app. “Download Now” saves the file through your browser's download manager.
+        {t("save.hint")}
       </p>
     </div>
   );
@@ -308,6 +366,31 @@ function AdSlot({ label, sub, saved, tall }: { label: string; sub?: string; save
         <p className="text-xs text-[var(--dim)]">Your Google AdSense ad will appear here</p>
       )}
     </div>
+  );
+}
+
+/** The owner's Adsterra smart link, as a clearly labelled banner on the
+ *  Jimeng downloader page only — below the video result, never over or
+ *  above any Download button. Clicking opens it in a new tab; the
+ *  download flow is untouched. Renders nothing when the link is
+ *  disabled or removed, so there is never an empty box. */
+function SmartLinkBanner({ smartLink }: { smartLink: { url: string | null; enabled: boolean } | undefined }) {
+  const t = useT();
+  if (!smartLink?.url || !smartLink.enabled) return null;
+  return (
+    <a
+      href={smartLink.url}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="glass mt-4 flex items-center justify-center gap-2 border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-3 text-center text-sm font-bold"
+      style={{ borderRadius: "var(--radius)" }}
+    >
+      <span className="bg-[var(--surface)] px-2 py-0.5 text-[11px] font-extrabold tracking-[0.14em] text-[var(--dim)] uppercase" style={{ borderRadius: 999 }}>
+        {t("ads.sponsored")}
+      </span>
+      <span>{t("ads.sponsored_note")}</span>
+      <span aria-hidden="true">↗</span>
+    </a>
   );
 }
 
@@ -362,12 +445,13 @@ function Skeleton({ className = "" }: { className?: string }) {
 /** Feature strip from the reference: Lightning Fast, Secure & Safe,
  *  Fully Responsive, Modern Design, Free Forever. */
 function FeatureStrip() {
+  const t = useT();
   const items = [
-    { icon: "⚡", title: "Lightning Fast", sub: "Download" },
-    { icon: "🛡", title: "Secure & Safe", sub: "No Risk" },
-    { icon: "📱", title: "Fully Responsive", sub: "All Devices" },
-    { icon: "💎", title: "Modern Design", sub: "Premium Look" },
-    { icon: "⭐", title: "Free Forever", sub: "No Hidden Fees" },
+    { icon: "⚡", title: t("home.feat_1_title"), sub: t("home.feat_1_sub") },
+    { icon: "🛡", title: t("home.feat_2_title"), sub: t("home.feat_2_sub") },
+    { icon: "📱", title: t("home.feat_3_title"), sub: t("home.feat_3_sub") },
+    { icon: "💎", title: t("home.feat_4_title"), sub: t("home.feat_4_sub") },
+    { icon: "⭐", title: t("home.feat_5_title"), sub: t("home.feat_5_sub") },
   ];
   return (
     <div className="glass mt-8 grid grid-cols-2 gap-4 border border-[var(--border)] bg-[var(--surface)] px-4 py-5 sm:grid-cols-3 lg:grid-cols-5" style={{ borderRadius: "var(--radius)" }}>
@@ -386,16 +470,17 @@ function FeatureStrip() {
 
 /** Green brand banner shown above the footer links. */
 function BrandBanner() {
+  const t = useT();
   return (
     <div className="cta-gradient flex flex-col items-center justify-between gap-3 px-6 py-5 text-center sm:flex-row sm:text-left" style={{ borderRadius: "var(--radius)" }}>
       <div className="flex items-center gap-3">
         <span className="flex h-11 w-11 shrink-0 items-center justify-center bg-black/20 text-xl text-[var(--accent-ink)]" style={{ borderRadius: 12 }}>▶</span>
         <div>
-          <p className="text-xl font-extrabold text-[var(--accent-ink)]">Jimeng Video Downloader</p>
-          <p className="text-sm font-bold text-[var(--accent-ink)]/80">Your Ultimate Jimeng Download Tool</p>
+          <p className="text-xl font-extrabold text-[var(--accent-ink)]">{t("home.brand_title")}</p>
+          <p className="text-sm font-bold text-[var(--accent-ink)]/80">{t("home.brand_sub")}</p>
         </div>
       </div>
-      <p className="text-sm font-extrabold whitespace-nowrap text-[var(--accent-ink)]">Free · No Watermark · Original MP4</p>
+      <p className="text-sm font-extrabold whitespace-nowrap text-[var(--accent-ink)]">{t("home.brand_tag")}</p>
     </div>
   );
 }
@@ -418,7 +503,7 @@ function Logo({ compact = false }: { compact?: boolean }) {
         <path d="M15 11.5v17l14-8.5Z" fill={`url(#${gid})`} />
       </svg>
       <span className="flex flex-col leading-none">
-        <span className="text-lg font-extrabold tracking-wide text-white">JIMENG</span>
+        <span className="text-lg font-extrabold tracking-wide text-[var(--text)]">JIMENG</span>
         <span className="mt-0.5 text-[11px] font-extrabold tracking-[0.22em] text-[var(--accent)]">DOWNLOADER</span>
       </span>
     </span>
@@ -471,33 +556,34 @@ function HeroArt() {
 }
 
 const MENU_ITEMS: { view: View; label: string; icon: string; badge?: string }[] = [
-  { view: "home", label: "Home", icon: "🏠" },
-  { view: "jimeng", label: "Jimeng Downloader", icon: "🎬" },
-  { view: "history", label: "Download History", icon: "🕘" },
-  { view: "favorites", label: "Favourites", icon: "❤️" },
-  { view: "notifications", label: "Notifications", icon: "🔔" },
-  { view: "plans", label: "Plans", icon: "💎" },
-  { view: "download-settings", label: "Download Settings", icon: "⚙️" },
-  { view: "whatis", label: "What is Jimeng?", icon: "❓" },
-  { view: "howto", label: "How to Use", icon: "📖" },
-  { view: "faq", label: "FAQ", icon: "💬" },
-  { view: "help", label: "Help Center", icon: "🆘" },
-  { view: "tickets", label: "Support Tickets", icon: "🎫" },
-  { view: "report", label: "Report a Problem", icon: "⚠️" },
-  { view: "bulk", label: "Bulk Download", icon: "📦" },
-  { view: "sora", label: "Sora Downloader", icon: "🎬", badge: "Coming Soon" },
-  { view: "contact", label: "Contact", icon: "✉️" },
-  { view: "about", label: "About", icon: "ℹ️" },
-  { view: "privacy", label: "Privacy Policy", icon: "🔒" },
-  { view: "terms", label: "Terms of Service", icon: "📜" },
-  { view: "copyright", label: "Copyright Policy", icon: "©️" },
-  { view: "disclaimer", label: "Disclaimer", icon: "⚖️" },
+  { view: "home", label: "menu.home", icon: "🏠" },
+  { view: "jimeng", label: "menu.jimeng", icon: "🎬" },
+  { view: "history", label: "menu.history", icon: "🕘" },
+  { view: "favorites", label: "menu.favorites", icon: "❤️" },
+  { view: "notifications", label: "menu.notifications", icon: "🔔" },
+  { view: "plans", label: "menu.plans", icon: "💎" },
+  { view: "download-settings", label: "menu.download_settings", icon: "⚙️" },
+  { view: "whatis", label: "menu.whatis", icon: "❓" },
+  { view: "howto", label: "menu.howto", icon: "📖" },
+  { view: "faq", label: "menu.faq", icon: "💬" },
+  { view: "help", label: "menu.help", icon: "🆘" },
+  { view: "tickets", label: "menu.tickets", icon: "🎫" },
+  { view: "report", label: "menu.report", icon: "⚠️" },
+  { view: "bulk", label: "menu.bulk", icon: "📦" },
+  { view: "sora", label: "menu.sora", icon: "🎬", badge: "menu.coming_soon" },
+  { view: "contact", label: "menu.contact", icon: "✉️" },
+  { view: "about", label: "menu.about", icon: "ℹ️" },
+  { view: "privacy", label: "menu.privacy", icon: "🔒" },
+  { view: "terms", label: "menu.terms", icon: "📜" },
+  { view: "copyright", label: "menu.copyright", icon: "©️" },
+  { view: "disclaimer", label: "menu.disclaimer", icon: "⚖️" },
 ];
 
 /** Heart toggle for one history video. Shows the filled heart when the
  *  video is already a favourite; the server decides the state, so the
  *  button never lies about it. */
 function FavoriteButton({ downloadId, label }: { downloadId: number | null; label?: string }) {
+  const t = useT();
   const queryClient = useQueryClient();
   const favorites = useQuery({
     queryKey: ["favorites"],
@@ -518,16 +604,34 @@ function FavoriteButton({ downloadId, label }: { downloadId: number | null; labe
       disabled={mut.isPending}
       onClick={() => mut.mutate()}
       aria-pressed={isFav}
-      aria-label={isFav ? "Remove from favourites" : "Save to favourites"}
+      aria-label={isFav ? t("fav.aria_remove") : t("fav.aria_add")}
       className={`border px-3 py-1.5 text-xs font-extrabold disabled:opacity-50 ${isFav ? "border-[rgba(248,113,113,0.5)] text-[var(--err-text)]" : "border-[var(--border)]"}`}
       style={{ borderRadius: 8 }}
     >
-      {isFav ? "♥ Favourited" : "♡ Favourite"}
+      {isFav ? t("fav.remove") : t("fav.add")}
     </button>
   );
 }
 
+/** Phase 5 — outer shell: owns the theme + language state and provides
+ *  it (and the translation function) to the whole tree. localStorage is
+ *  the first-paint source (index.html sets data-theme before CSS
+ *  renders); the account value is applied by AppShell once it loads. */
 export function App() {
+  const [theme, setThemeState] = useState<Theme>(() => getLocalTheme());
+  const [lang, setLangState] = useState<Lang>(() => getLocalLang());
+  return (
+    <PrefsProvider value={{ theme, lang, setTheme: setThemeState, setLang: setLangState }}>
+      <LangProvider value={lang}>
+        <AppShell />
+      </LangProvider>
+    </PrefsProvider>
+  );
+}
+
+function AppShell() {
+  const t = useT();
+  const { theme, lang, setTheme, setLang } = usePrefs();
   const [view, setView] = useState<View>("home");
   const [menuOpen, setMenuOpen] = useState(false);
   const queryClient = useQueryClient();
@@ -611,6 +715,106 @@ export function App() {
   const notifications = useQuery({ queryKey: ["notifications"], queryFn: () => api.listNotifications({ limit: 50, token: getUserToken(), anonId: getAnonId() }) });
   const unreadCount = notifications.data?.unreadCount ?? 0;
   const dlSettings = useDownloadSettings();
+
+  // Phase 5 — SEO meta from the server (admin-editable in Settings).
+  useSeo();
+
+  // Phase 5 — theme: keep <html data-theme> in sync with the state.
+  // The first paint already applied the localStorage value from the
+  // inline script in index.html; this only runs on later changes.
+  useEffect(() => {
+    applyTheme(theme);
+  }, [theme]);
+
+  // Phase 5 — when a customer logs in, their account theme + language
+  // win over this browser's values (same rule as the download quality /
+  // mode preference). Runs once per login.
+  const prefsSyncedRef = useRef(false);
+  useEffect(() => {
+    if (!user || prefsSyncedRef.current) return;
+    prefsSyncedRef.current = true;
+    api.getDownloadSettings({ token: getUserToken() }).then((s) => {
+      const serverTheme = (s.theme === "light" ? "light" : "dark") as Theme;
+      const serverLang = (s.language === "ur" ? "ur" : "en") as Lang;
+      if (serverTheme !== getLocalTheme()) {
+        setTheme(serverTheme);
+        setLocalTheme(serverTheme);
+      }
+      if (serverLang !== getLocalLang()) {
+        setLang(serverLang);
+        setLocalLang(serverLang);
+      }
+    }).catch(() => {
+      /* offline — the browser values stay */
+    });
+  }, [user, setTheme, setLang]);
+
+  // Phase 5 — PWA install prompt: the browser fires
+  // beforeinstallprompt when the site is installable. We store the
+  // event (never auto-show it); the Install button renders only while
+  // it is set, so it never appears where installation is impossible.
+  const [installEvt, setInstallEvt] = useState<BeforeInstallPromptEvent | null>(null);
+  useEffect(() => {
+    const onPrompt = (e: Event) => {
+      e.preventDefault();
+      setInstallEvt(e as BeforeInstallPromptEvent);
+    };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    return () => window.removeEventListener("beforeinstallprompt", onPrompt);
+  }, []);
+
+  async function handleInstallApp() {
+    if (!installEvt) return;
+    try {
+      await installEvt.prompt();
+      await installEvt.userChoice;
+    } catch {
+      /* dismissed or unsupported — the button just stays hidden next time */
+    }
+    setInstallEvt(null);
+  }
+
+  /** Saves a theme change: localStorage right away (no flash), and the
+   *  account too when logged in. */
+  async function changeTheme(next: Theme) {
+    setTheme(next);
+    setLocalTheme(next);
+    applyTheme(next);
+    if (user) {
+      try {
+        await api.saveDownloadSettings({
+          defaultQuality: dlSettings.defaultQuality,
+          defaultMode: dlSettings.defaultMode,
+          theme: next,
+          language: lang,
+          token: getUserToken(),
+        });
+        queryClient.invalidateQueries({ queryKey: ["download-settings"] });
+      } catch {
+        /* offline — the browser value already applied */
+      }
+    }
+  }
+
+  /** Saves a language change the same way as the theme. */
+  async function changeLang(next: Lang) {
+    setLang(next);
+    setLocalLang(next);
+    if (user) {
+      try {
+        await api.saveDownloadSettings({
+          defaultQuality: dlSettings.defaultQuality,
+          defaultMode: dlSettings.defaultMode,
+          theme,
+          language: next,
+          token: getUserToken(),
+        });
+        queryClient.invalidateQueries({ queryKey: ["download-settings"] });
+      } catch {
+        /* offline — the browser value already applied */
+      }
+    }
+  }
 
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadNote, setDownloadNote] = useState<string | null>(null);
@@ -729,7 +933,7 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setMenuOpen(false)}
-                aria-label="Close menu"
+                aria-label={t("menu.close")}
                 className="flex h-10 w-10 items-center justify-center bg-[var(--surface-alt)] text-lg font-bold"
                 style={{ borderRadius: 10 }}
               >
@@ -752,8 +956,8 @@ export function App() {
                   <div className="flex items-center gap-3">
                     <span className="flex h-11 w-11 items-center justify-center bg-[var(--surface-alt)] text-xl" style={{ borderRadius: 999 }}>👤</span>
                     <div>
-                      <p className="text-base font-extrabold">Guest User</p>
-                      <p className="text-xs text-[var(--dim)]">Welcome!</p>
+                      <p className="text-base font-extrabold">{t("menu.guest")}</p>
+                      <p className="text-xs text-[var(--dim)]">{t("menu.welcome")}</p>
                     </div>
                   </div>
                   <button
@@ -762,10 +966,32 @@ export function App() {
                     className="cta-gradient mt-3 w-full px-4 py-2.5 text-sm font-extrabold"
                     style={{ borderRadius: "var(--radius)" }}
                   >
-                    🔑 Login / Register
+                    🔑 {t("menu.login_register")}
                   </button>
                 </div>
               )}
+              {/* Phase 5 — theme + language quick toggles (same controls as
+                  the header buttons and Download Settings). */}
+              <div className="mb-1 flex gap-2 border-b border-[var(--border)] px-3 pt-1 pb-3">
+                <button
+                  type="button"
+                  onClick={() => changeTheme(theme === "dark" ? "light" : "dark")}
+                  aria-label={theme === "dark" ? t("header.theme_to_light") : t("header.theme_to_dark")}
+                  className="glass flex-1 border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-extrabold"
+                  style={{ borderRadius: "var(--radius)" }}
+                >
+                  {theme === "dark" ? `☀️ ${t("settings.theme_light")}` : `🌙 ${t("settings.theme_dark")}`}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => changeLang(lang === "en" ? "ur" : "en")}
+                  aria-label={lang === "en" ? t("header.lang_to_ur") : t("header.lang_to_en")}
+                  className="glass flex-1 border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-extrabold"
+                  style={{ borderRadius: "var(--radius)" }}
+                >
+                  🌐 {lang === "en" ? t("settings.language_ur") : t("settings.language_en")}
+                </button>
+              </div>
               {MENU_ITEMS.map((item) => (
                 <button
                   key={item.view}
@@ -773,7 +999,7 @@ export function App() {
                   onClick={() => go(item.view)}
                   className={`flex items-center justify-between gap-2 px-3 py-3.5 text-left text-lg font-semibold ${view === item.view ? "text-[var(--accent)]" : ""}`}
                 >
-                  <span>{item.icon} {item.label}</span>
+                  <span>{item.icon} {t(item.label)}</span>
                   {item.view === "history" && historyCount > 0 && (
                     <span className="bg-[var(--accent)] px-2 py-0.5 text-xs font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>
                       {historyCount}
@@ -781,11 +1007,20 @@ export function App() {
                   )}
                   {item.badge && (
                     <span className="border border-[var(--border)] px-2 py-0.5 text-xs font-bold text-[var(--dim)]" style={{ borderRadius: 999 }}>
-                      {item.badge}
+                      {t(item.badge)}
                     </span>
                   )}
                 </button>
               ))}
+              {installEvt && (
+                <button
+                  type="button"
+                  onClick={handleInstallApp}
+                  className="mt-1 flex items-center justify-between gap-2 border-t border-[var(--border)] px-3 py-3.5 text-left text-lg font-semibold text-[var(--accent)]"
+                >
+                  <span>📲 {t("home.install_app")}</span>
+                </button>
+              )}
               {user && !admin && (
                 <>
                   <button
@@ -793,14 +1028,14 @@ export function App() {
                     onClick={() => go("myplan")}
                     className={`flex items-center justify-between gap-2 px-3 py-3.5 text-left text-lg font-semibold ${view === "myplan" ? "text-[var(--accent)]" : ""}`}
                   >
-                    <span>💎 My Plan</span>
+                    <span>💎 {t("menu.myplan")}</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => go("profile")}
                     className={`flex items-center justify-between gap-2 px-3 py-3.5 text-left text-lg font-semibold ${view === "profile" ? "text-[var(--accent)]" : ""}`}
                   >
-                    <span>👤 My Profile</span>
+                    <span>👤 {t("menu.profile")}</span>
                   </button>
                 </>
               )}
@@ -810,7 +1045,7 @@ export function App() {
                   onClick={handleLogout}
                   className="mt-1 flex items-center justify-between gap-2 border-t border-[var(--border)] px-3 py-3.5 text-left text-lg font-semibold text-[var(--err-text)]"
                 >
-                  <span>🚪 Logout</span>
+                  <span>🚪 {t("menu.logout")}</span>
                 </button>
               )}
               {user && !admin && (
@@ -819,7 +1054,7 @@ export function App() {
                   onClick={handleUserLogout}
                   className="mt-1 flex items-center justify-between gap-2 border-t border-[var(--border)] px-3 py-3.5 text-left text-lg font-semibold text-[var(--err-text)]"
                 >
-                  <span>🚪 Logout</span>
+                  <span>🚪 {t("menu.logout")}</span>
                 </button>
               )}
             </nav>
@@ -842,7 +1077,7 @@ export function App() {
             <button
               type="button"
               onClick={() => setMenuOpen(true)}
-              aria-label="Open menu"
+              aria-label={t("menu.open")}
               className="glass flex items-center gap-2 border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-extrabold"
               style={{ borderRadius: "var(--radius)" }}
             >
@@ -850,10 +1085,30 @@ export function App() {
             </button>
           </div>
           <div className="flex shrink-0 items-center gap-2">
+            {/* Phase 5 — theme + language toggles. */}
+            <button
+              type="button"
+              onClick={() => changeTheme(theme === "dark" ? "light" : "dark")}
+              aria-label={theme === "dark" ? t("header.theme_to_light") : t("header.theme_to_dark")}
+              className="glass flex items-center gap-2 border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-extrabold"
+              style={{ borderRadius: "var(--radius)" }}
+            >
+              <span aria-hidden="true">{theme === "dark" ? "☀️" : "🌙"}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => changeLang(lang === "en" ? "ur" : "en")}
+              aria-label={lang === "en" ? t("header.lang_to_ur") : t("header.lang_to_en")}
+              className="glass flex items-center gap-2 border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-extrabold"
+              style={{ borderRadius: "var(--radius)" }}
+            >
+              <span aria-hidden="true">🌐</span>
+              {lang === "en" ? "اردو" : "EN"}
+            </button>
             <button
               type="button"
               onClick={() => go("notifications")}
-              aria-label={unreadCount > 0 ? `Notifications — ${unreadCount} unread` : "Notifications"}
+              aria-label={unreadCount > 0 ? `${t("header.notifications")} — ${unreadCount} unread` : t("header.notifications")}
               className={`glass relative flex items-center gap-2 border px-3 py-2 text-sm font-extrabold ${view === "notifications" ? "border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
               style={{ borderRadius: "var(--radius)" }}
             >
@@ -867,11 +1122,11 @@ export function App() {
             <button
               type="button"
               onClick={() => go("history")}
-              aria-label="Open download history"
+              aria-label={t("header.history")}
               className={`glass flex items-center gap-2 border px-4 py-2 text-sm font-extrabold ${view === "history" ? "border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
               style={{ borderRadius: "var(--radius)" }}
             >
-              🕘 History
+              🕘 {t("header.history")}
               <span className="flex h-5 min-w-5 items-center justify-center bg-[var(--accent)] px-1 text-xs font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>
                 {historyCount}
               </span>
@@ -886,22 +1141,22 @@ export function App() {
               <HeroArt />
               <div className="relative">
                 <p className="inline-block border border-[var(--accent)] bg-[rgba(0,233,154,0.08)] px-4 py-1.5 text-xs font-extrabold tracking-[0.18em] text-[var(--accent)]" style={{ borderRadius: 999 }}>
-                  SEEDANCE 2.0 · JIMENG AI
+                  {t("home.badge")}
                 </p>
                 <h1 className="mx-auto mt-4 max-w-3xl text-4xl font-extrabold leading-tight sm:text-5xl">
-                  Jimeng Video Downloader — <span className="text-gradient">No Watermark</span>
+                  {t("home.title_a")} <span className="text-gradient">{t("home.title_b")}</span>
                 </h1>
                 <p className="mx-auto mt-3 max-w-2xl text-base text-[var(--dim)] sm:text-lg">
-                  Choose a downloader below — paste a public link and download the original MP4. Free, no login required.
+                  {t("home.subtitle")}
                 </p>
-                <p className="mx-auto mt-4 text-sm font-semibold text-[var(--dim)]">Jimeng is live now — more downloaders coming soon.</p>
+                <p className="mx-auto mt-4 text-sm font-semibold text-[var(--dim)]">{t("home.live_note")}</p>
                 {meQuery.data?.ok && meQuery.data.user && (
                   <p className="mt-3 text-sm font-semibold text-[var(--accent)]">
                     {meQuery.data.plan
-                      ? `💎 ${meQuery.data.plan.planName} plan — ${meQuery.data.plan.remaining} of ${meQuery.data.plan.limitTotal} downloads left (until ${new Date(meQuery.data.plan.expiresAt).toLocaleDateString()})`
+                      ? t("home.plan_left", { plan: meQuery.data.plan.planName, remaining: String(meQuery.data.plan.remaining), total: String(meQuery.data.plan.limitTotal), date: new Date(meQuery.data.plan.expiresAt).toLocaleDateString() })
                       : meQuery.data.freeDailyLimit === 0
-                        ? "Free plan — unlimited downloads today."
-                        : `Free plan — ${meQuery.data.freeRemaining} of ${meQuery.data.freeDailyLimit} free downloads left today.`}
+                        ? t("home.plan_free_unlimited")
+                        : t("home.plan_free_left", { remaining: String(meQuery.data.freeRemaining), limit: String(meQuery.data.freeDailyLimit) })}
                   </p>
                 )}
               </div>
@@ -912,9 +1167,9 @@ export function App() {
 
               {/* Choose a downloader */}
               <section>
-                <h2 className="text-2xl font-extrabold">Choose a downloader</h2>
+                <h2 className="text-2xl font-extrabold">{t("home.choose_title")}</h2>
                 <p className="mt-1 text-sm text-[var(--dim)]">
-                  Pick a platform below — paste a public link and download the original video. Free, no login required.
+                  {t("home.choose_sub")}
                 </p>
                 <div className="mt-4 grid gap-4 sm:grid-cols-2">
                   <div className="glass card-hover flex flex-col border border-[rgba(0,233,154,0.35)] bg-[var(--surface)] p-5 shadow-[0_0_45px_rgba(0,233,154,0.10)]" style={{ borderRadius: "var(--radius)" }}>
@@ -922,9 +1177,9 @@ export function App() {
                       <span className="text-3xl" aria-hidden="true">🎬</span>
                       <StatusPill tone="green" label="● LIVE" pulse />
                     </div>
-                    <h3 className="mt-3 text-xl font-extrabold">Jimeng Video Downloader</h3>
+                    <h3 className="mt-3 text-xl font-extrabold">{t("home.jimeng_title")}</h3>
                     <p className="mt-1 flex-1 text-sm leading-relaxed text-[var(--dim)]">
-                      Paste a public Jimeng share link and download the original MP4 — no watermark. Single video, or Bulk up to 10 videos at once.
+                      {t("home.jimeng_desc")}
                     </p>
                     <button
                       type="button"
@@ -932,17 +1187,17 @@ export function App() {
                       className="cta-gradient mt-4 w-full px-5 py-3 text-base font-extrabold"
                       style={{ borderRadius: "var(--radius)" }}
                     >
-                      Open Downloader →
+                      {t("home.open_downloader")}
                     </button>
                   </div>
                   <div className="glass flex flex-col border border-[var(--border)] bg-[var(--surface)] p-5" style={{ borderRadius: "var(--radius)" }}>
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-3xl" aria-hidden="true">🎥</span>
-                      <StatusPill tone="amber" label="Coming Soon" />
+                      <StatusPill tone="amber" label={t("menu.coming_soon")} />
                     </div>
-                    <h3 className="mt-3 text-xl font-extrabold">Sora Downloader</h3>
+                    <h3 className="mt-3 text-xl font-extrabold">{t("home.sora_title")}</h3>
                     <p className="mt-1 flex-1 text-sm leading-relaxed text-[var(--dim)]">
-                      Download videos from Sora. We are still verifying a working method, so there is no tool here yet — nothing fake, nothing half-finished.
+                      {t("home.sora_desc")}
                     </p>
                     <button
                       type="button"
@@ -950,7 +1205,7 @@ export function App() {
                       className="mt-4 w-full cursor-not-allowed border border-[var(--border)] bg-[var(--surface-alt)] px-5 py-3 text-base font-extrabold text-[var(--dim)]"
                       style={{ borderRadius: "var(--radius)" }}
                     >
-                      Coming Soon
+                      {t("menu.coming_soon")}
                     </button>
                   </div>
                 </div>
@@ -963,14 +1218,14 @@ export function App() {
               <SectionCard>
                 <h2 className="flex items-center gap-2 text-lg font-extrabold">
                   <span className="flex h-6 w-6 items-center justify-center bg-[var(--accent)] text-sm font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>?</span>
-                  Need help?
+                  {t("home.need_help")}
                 </h2>
                 <div className="mt-3 flex flex-col">
                   <button type="button" onClick={() => go("howto")} className="flex items-center justify-between border-b border-[var(--border)] py-2.5 text-left text-sm font-bold text-[var(--accent)]">
-                    <span>📖 How to Use</span><span aria-hidden="true">›</span>
+                    <span>📖 {t("menu.howto")}</span><span aria-hidden="true">›</span>
                   </button>
                   <button type="button" onClick={() => go("faq")} className="flex items-center justify-between py-2.5 text-left text-sm font-bold text-[var(--accent)]">
-                    <span>💬 FAQ</span><span aria-hidden="true">›</span>
+                    <span>💬 {t("menu.faq")}</span><span aria-hidden="true">›</span>
                   </button>
                 </div>
               </SectionCard>
@@ -984,12 +1239,12 @@ export function App() {
 
             {/* How it works (design) */}
             <section className="mt-10">
-              <h2 className="text-2xl font-extrabold">🚀 How it works</h2>
+              <h2 className="text-2xl font-extrabold">{t("home.how_title")}</h2>
               <div className="mt-4 flex flex-col gap-4 lg:flex-row lg:items-stretch">
                 {[
-                  { n: "1", icon: "🎬", title: "Choose a downloader", text: "Pick Jimeng from the downloaders above." },
-                  { n: "2", icon: "📋", title: "Paste your link", text: "Paste a public share link in the box." },
-                  { n: "3", icon: "⬇", title: "Preview & download", text: "Enjoy your video!" },
+                  { n: "1", icon: "🎬", title: t("home.how_1_title"), text: t("home.how_1_text") },
+                  { n: "2", icon: "📋", title: t("home.how_2_title"), text: t("home.how_2_text") },
+                  { n: "3", icon: "⬇", title: t("home.how_3_title"), text: t("home.how_3_text") },
                 ].map((step, i) => (
                   <div key={step.n} className="flex flex-1 items-center gap-4">
                     <div className="glass flex flex-1 items-center gap-3 border border-[var(--border)] bg-[var(--surface)] p-4" style={{ borderRadius: "var(--radius)" }}>
@@ -1040,7 +1295,7 @@ export function App() {
         {view === "profile" && !userChecked && (
           <main className="mx-auto max-w-3xl py-16 text-center">
             <span className="spinner" aria-hidden="true" />
-            <p className="mt-3 text-base text-[var(--dim)]">Loading…</p>
+            <p className="mt-3 text-base text-[var(--dim)]">{t("common.loading")}</p>
           </main>
         )}
         {view === "profile" && userChecked && !user && (
@@ -1061,7 +1316,7 @@ export function App() {
         {view === "auth" && !userChecked && (
           <main className="mx-auto max-w-3xl py-16 text-center">
             <span className="spinner" aria-hidden="true" />
-            <p className="mt-3 text-base text-[var(--dim)]">Loading…</p>
+            <p className="mt-3 text-base text-[var(--dim)]">{t("common.loading")}</p>
           </main>
         )}
         {view === "auth" && userChecked && !user && !admin && (
@@ -1093,7 +1348,7 @@ export function App() {
         {view === "myplan" && !userChecked && (
           <main className="mx-auto max-w-3xl py-16 text-center">
             <span className="spinner" aria-hidden="true" />
-            <p className="mt-3 text-base text-[var(--dim)]">Loading…</p>
+            <p className="mt-3 text-base text-[var(--dim)]">{t("common.loading")}</p>
           </main>
         )}
         {view === "myplan" && userChecked && !user && (
@@ -1119,6 +1374,7 @@ export function App() {
             onGoPlans={() => go("plans")}
             onGoHistory={() => go("history")}
             sidebarAdSaved={Boolean(settings.data?.adSlots.sidebar)}
+            smartLink={settings.data?.smartLink}
           />
         )}
         {view === "bulk" && (
@@ -1132,12 +1388,13 @@ export function App() {
             onGoPlans={() => go("plans")}
             onGoHistory={() => go("history")}
             sidebarAdSaved={Boolean(settings.data?.adSlots.sidebar)}
+            smartLink={settings.data?.smartLink}
           />
         )}
         {view === "admin" && !adminChecked && (
           <main className="mx-auto max-w-3xl py-16 text-center">
             <span className="spinner" aria-hidden="true" />
-            <p className="mt-3 text-base text-[var(--dim)]">Loading…</p>
+            <p className="mt-3 text-base text-[var(--dim)]">{t("common.loading")}</p>
           </main>
         )}
         {view === "admin" && adminChecked && !admin && (
@@ -1160,28 +1417,28 @@ export function App() {
         <footer className="mt-10 border-t border-[var(--border)] pt-6 text-center">
           <BrandBanner />
           <nav aria-label="Footer" className="mt-6 flex flex-wrap justify-center gap-x-6 gap-y-2 text-sm font-bold">
-            <button type="button" onClick={() => go("jimeng")} className="py-1">Downloader</button>
-            <button type="button" onClick={() => go("history")} className="py-1">History</button>
-            <button type="button" onClick={() => go("plans")} className="py-1">Plans</button>
-            <button type="button" onClick={() => go("howto")} className="py-1">How to Use</button>
-            <button type="button" onClick={() => go("faq")} className="py-1">FAQ</button>
-            <button type="button" onClick={() => go("help")} className="py-1">Help Center</button>
-            <button type="button" onClick={() => go("tickets")} className="py-1">Support Tickets</button>
-            <button type="button" onClick={() => go("report")} className="py-1">Report a Problem</button>
-            <button type="button" onClick={() => go("bulk")} className="py-1">Bulk Download</button>
-            <button type="button" onClick={() => go("about")} className="py-1">About</button>
-            <button type="button" onClick={() => go("privacy")} className="py-1">Privacy Policy</button>
-            <button type="button" onClick={() => go("terms")} className="py-1">Terms of Service</button>
-            <button type="button" onClick={() => go("copyright")} className="py-1">Copyright Policy</button>
-            <button type="button" onClick={() => go("disclaimer")} className="py-1">Disclaimer</button>
-            <button type="button" onClick={() => go("contact")} className="py-1">Contact</button>
+            <button type="button" onClick={() => go("jimeng")} className="py-1">{t("menu.jimeng")}</button>
+            <button type="button" onClick={() => go("history")} className="py-1">{t("menu.history")}</button>
+            <button type="button" onClick={() => go("plans")} className="py-1">{t("menu.plans")}</button>
+            <button type="button" onClick={() => go("howto")} className="py-1">{t("menu.howto")}</button>
+            <button type="button" onClick={() => go("faq")} className="py-1">{t("menu.faq")}</button>
+            <button type="button" onClick={() => go("help")} className="py-1">{t("menu.help")}</button>
+            <button type="button" onClick={() => go("tickets")} className="py-1">{t("menu.tickets")}</button>
+            <button type="button" onClick={() => go("report")} className="py-1">{t("menu.report")}</button>
+            <button type="button" onClick={() => go("bulk")} className="py-1">{t("menu.bulk")}</button>
+            <button type="button" onClick={() => go("about")} className="py-1">{t("menu.about")}</button>
+            <button type="button" onClick={() => go("privacy")} className="py-1">{t("menu.privacy")}</button>
+            <button type="button" onClick={() => go("terms")} className="py-1">{t("menu.terms")}</button>
+            <button type="button" onClick={() => go("copyright")} className="py-1">{t("menu.copyright")}</button>
+            <button type="button" onClick={() => go("disclaimer")} className="py-1">{t("menu.disclaimer")}</button>
+            <button type="button" onClick={() => go("contact")} className="py-1">{t("menu.contact")}</button>
           </nav>
           {/* Bottom banner ad slot (design: below the footer links) */}
           <div className="mt-6">
             <AdSlot label="Advertisement · Bottom Banner 728 × 90" saved={Boolean(settings.data?.adSlots.bottom)} />
           </div>
           <p className="mt-4 pb-2 text-xs text-[var(--dim)] italic">
-            Personal use only. All video copyrights belong to their creators and ByteDance / Jimeng AI. This tool is not affiliated with Jimeng.
+            {t("home.footer_note")}
           </p>
         </footer>
       </div>
@@ -1199,13 +1456,14 @@ type DownloadFlowProps = {
 };
 
 function HistoryPage({ downloading, prepared, downloadNote, onDownload, onShare, onGoHome }: DownloadFlowProps) {
+  const t = useT();
   const history = useQuery({ queryKey: ["history"], queryFn: () => api.listHistory({ limit: 30, token: getUserToken(), anonId: getAnonId() }) });
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="🕘" title="Your Download History" subtitle="View and manage your downloaded videos" />
+      <PageHero icon="🕘" title={t("history.title")} subtitle={t("history.subtitle")} />
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm font-bold text-[var(--dim)]">
-          {history.data ? `${history.data.items.length} video${history.data.items.length === 1 ? "" : "s"} saved` : "Loading…"}
+          {history.data ? t("history.count", { n: String(history.data.items.length), s: history.data.items.length === 1 ? "" : "s" }) : t("common.loading")}
         </p>
         {history.data && history.data.items.length > 0 && <ClearHistoryButton />}
       </div>
@@ -1224,9 +1482,9 @@ function HistoryPage({ downloading, prepared, downloadNote, onDownload, onShare,
       {history.data && history.data.items.length === 0 && (
         <SectionCard className="py-12 text-center">
           <p className="text-6xl" aria-hidden="true">🎬</p>
-          <h2 className="mt-4 text-xl font-extrabold">No downloads yet</h2>
+          <h2 className="mt-4 text-xl font-extrabold">{t("history.empty_title")}</h2>
           <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
-            As soon as you fetch your first video it will be saved here — even after you close and reopen the page.
+            {t("history.empty_text")}
           </p>
           <button
             type="button"
@@ -1234,7 +1492,7 @@ function HistoryPage({ downloading, prepared, downloadNote, onDownload, onShare,
             className="cta-gradient mt-5 px-6 py-3 text-base font-extrabold"
             style={{ borderRadius: "var(--radius)" }}
           >
-            ⬇ Go to Downloader
+            {t("history.go_downloader")}
           </button>
         </SectionCard>
       )}
@@ -1249,12 +1507,12 @@ function HistoryPage({ downloading, prepared, downloadNote, onDownload, onShare,
                 <div className="flex h-20 w-16 shrink-0 items-center justify-center bg-[var(--surface-alt)] text-2xl" style={{ borderRadius: 10 }}>🎬</div>
               )}
               <div className="min-w-0 flex-1">
-                <p className="truncate text-base font-extrabold">{item.title || "Jimeng video"}</p>
+                <p className="truncate text-base font-extrabold">{item.title || t("dl.jimeng_video")}</p>
                 <p className="truncate text-xs text-[var(--dim)]">{item.sourceUrl}</p>
                 <p className="text-xs text-[var(--dim)]">{new Date(item.createdAt).toLocaleString()}</p>
                 <div className="mt-2 flex flex-wrap gap-2">
                   <button type="button" disabled={downloading === `h-${item.id}`} onClick={() => onDownload(item.videoUrl, "jimeng-no-watermark.mp4", `h-${item.id}`)} className="bg-[var(--accent)] px-4 py-1.5 text-xs font-extrabold text-[var(--accent-ink)] disabled:opacity-50" style={{ borderRadius: 8 }}>
-                    {downloading === `h-${item.id}` ? "Preparing file…" : "⬇ Download"}
+                    {downloading === `h-${item.id}` ? t("dl.preparing") : t("history.download")}
                   </button>
                   <FavoriteButton downloadId={item.id} />
                   <DeleteHistoryButton id={item.id} />
@@ -1278,6 +1536,7 @@ function HistoryPage({ downloading, prepared, downloadNote, onDownload, onShare,
 /* ------------------------------------------------------------------ */
 
 function FavouritesPage({ downloading, prepared, downloadNote, onDownload, onShare, onGoHome }: DownloadFlowProps) {
+  const t = useT();
   const queryClient = useQueryClient();
   const favorites = useQuery({ queryKey: ["favorites"], queryFn: () => api.listFavorites({ limit: 50, token: getUserToken(), anonId: getAnonId() }) });
   const removeMut = useMutation({
@@ -1286,9 +1545,9 @@ function FavouritesPage({ downloading, prepared, downloadNote, onDownload, onSha
   });
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="❤️" title="Your Favourites" subtitle="Videos you saved with the heart button" />
+      <PageHero icon="❤️" title={t("favorites.title")} subtitle={t("favorites.subtitle")} />
       <p className="text-sm font-bold text-[var(--dim)]">
-        {favorites.data ? `${favorites.data.items.length} favourite${favorites.data.items.length === 1 ? "" : "s"}` : "Loading…"}
+        {favorites.data ? t("favorites.count", { n: String(favorites.data.items.length), s: favorites.data.items.length === 1 ? "" : "s" }) : t("common.loading")}
       </p>
       {favorites.isPending && (
         <div className="flex flex-col gap-3">
@@ -1299,9 +1558,9 @@ function FavouritesPage({ downloading, prepared, downloadNote, onDownload, onSha
       {favorites.data && favorites.data.items.length === 0 && (
         <SectionCard className="py-12 text-center">
           <p className="text-6xl" aria-hidden="true">❤️</p>
-          <h2 className="mt-4 text-xl font-extrabold">No favourites yet</h2>
+          <h2 className="mt-4 text-xl font-extrabold">{t("favorites.empty_title")}</h2>
           <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
-            Tap the “♡ Favourite” button on any video result or history item and it will be saved here for quick access.
+            {t("favorites.hint")}
           </p>
           <button
             type="button"
@@ -1309,7 +1568,7 @@ function FavouritesPage({ downloading, prepared, downloadNote, onDownload, onSha
             className="cta-gradient mt-5 px-6 py-3 text-base font-extrabold"
             style={{ borderRadius: "var(--radius)" }}
           >
-            ⬇ Go to Downloader
+            {t("history.go_downloader")}
           </button>
         </SectionCard>
       )}
@@ -1324,13 +1583,13 @@ function FavouritesPage({ downloading, prepared, downloadNote, onDownload, onSha
                 <div className="flex h-20 w-16 shrink-0 items-center justify-center bg-[var(--surface-alt)] text-2xl" style={{ borderRadius: 10 }}>🎬</div>
               )}
               <div className="min-w-0 flex-1">
-                <p className="truncate text-base font-extrabold">{item.title || "Jimeng video"}</p>
+                <p className="truncate text-base font-extrabold">{item.title || t("dl.jimeng_video")}</p>
                 <p className="truncate text-xs text-[var(--dim)]">{item.qualityLabel}</p>
                 <p className="truncate text-xs text-[var(--dim)]">{item.sourceUrl}</p>
-                <p className="text-xs text-[var(--dim)]">Saved {new Date(item.createdAt).toLocaleString()}</p>
+                <p className="text-xs text-[var(--dim)]">{t("favorites.saved", { date: new Date(item.createdAt).toLocaleString() })}</p>
                 <div className="mt-2 flex flex-wrap gap-2">
                   <button type="button" disabled={downloading === `f-${item.id}`} onClick={() => onDownload(item.videoUrl, slugFilename(item.title, "jimeng-no-watermark.mp4"), `f-${item.id}`)} className="bg-[var(--accent)] px-4 py-1.5 text-xs font-extrabold text-[var(--accent-ink)] disabled:opacity-50" style={{ borderRadius: 8 }}>
-                    {downloading === `f-${item.id}` ? "Preparing file…" : "⬇ Download again"}
+                    {downloading === `f-${item.id}` ? t("dl.preparing") : t("history.download_again")}
                   </button>
                   <button
                     type="button"
@@ -1339,7 +1598,7 @@ function FavouritesPage({ downloading, prepared, downloadNote, onDownload, onSha
                     className="border border-[rgba(248,113,113,0.5)] px-3 py-1.5 text-xs font-extrabold text-[var(--err-text)] disabled:opacity-50"
                     style={{ borderRadius: 8 }}
                   >
-                    ♥ Remove
+                    {t("favorites.remove")}
                   </button>
                 </div>
               </div>
@@ -1361,6 +1620,7 @@ function FavouritesPage({ downloading, prepared, downloadNote, onDownload, onSha
 /* ------------------------------------------------------------------ */
 
 function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (u: MeUser) => void }) {
+  const t = useT();
   const queryClient = useQueryClient();
   const me = useQuery({ queryKey: ["me"], queryFn: () => api.me({ token: getUserToken() }) });
   const favorites = useQuery({ queryKey: ["favorites"], queryFn: () => api.listFavorites({ limit: 50, token: getUserToken(), anonId: getAnonId() }) });
@@ -1375,15 +1635,15 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
       if (res.ok) {
         onUserChanged({ ...user, name: next });
         queryClient.invalidateQueries({ queryKey: ["me"] });
-        setNameMsg("Name updated ✓");
+        setNameMsg(t("profile.name_updated"));
         setNameError(null);
       } else {
-        setNameError(res.error ?? "Could not update the name.");
+        setNameError(res.error ?? t("profile.name_failed"));
         setNameMsg(null);
       }
     },
     onError: () => {
-      setNameError("No response from the server. Please try again in a moment.");
+      setNameError(t("common.error_server"));
       setNameMsg(null);
     },
   });
@@ -1397,18 +1657,18 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
     mutationFn: () => api.changeUserPassword({ currentPassword: currentPw, newPassword: newPw, token: getUserToken() }),
     onSuccess: (res) => {
       if (res.ok) {
-        setPwMsg("Password changed ✓ — your other sessions were signed out.");
+        setPwMsg(t("profile.pw_changed"));
         setPwError(null);
         setCurrentPw("");
         setNewPw("");
         setConfirmPw("");
       } else {
-        setPwError(res.error ?? "Could not change the password.");
+        setPwError(res.error ?? t("profile.pw_failed"));
         setPwMsg(null);
       }
     },
     onError: () => {
-      setPwError("No response from the server. Please try again in a moment.");
+      setPwError(t("common.error_server"));
       setPwMsg(null);
     },
   });
@@ -1416,17 +1676,17 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
   function handlePasswordSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!currentPw || !newPw) {
-      setPwError("Enter your current password and a new password.");
+      setPwError(t("profile.pw_missing"));
       setPwMsg(null);
       return;
     }
     if (newPw.length < 8) {
-      setPwError("The new password must be at least 8 characters.");
+      setPwError(t("profile.pw_short"));
       setPwMsg(null);
       return;
     }
     if (newPw !== confirmPw) {
-      setPwError("The new passwords do not match.");
+      setPwError(t("profile.pw_mismatch"));
       setPwMsg(null);
       return;
     }
@@ -1437,7 +1697,7 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="👤" title="My Profile" subtitle="Your account details and settings" />
+      <PageHero icon="👤" title={t("menu.profile")} subtitle={t("profile.subtitle")} />
       <SectionCard className="flex items-center gap-4">
         <span className="flex h-14 w-14 shrink-0 items-center justify-center bg-[var(--accent)] text-2xl font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>
           {user.name.charAt(0).toUpperCase()}
@@ -1446,32 +1706,32 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
           <p className="truncate text-lg font-extrabold">{user.name}</p>
           <p className="truncate text-sm text-[var(--dim)]">{user.email}</p>
           {data?.joinedAt && (
-            <p className="text-xs text-[var(--dim)]">Joined {new Date(data.joinedAt).toLocaleDateString()}</p>
+            <p className="text-xs text-[var(--dim)]">{t("profile.joined_date", { date: new Date(data.joinedAt).toLocaleDateString() })}</p>
           )}
         </div>
         <span className="ml-auto shrink-0">
-          <StatusPill tone={data?.plan ? "green" : "gray"} label={data?.plan ? data.plan.planName : "Free Plan"} />
+          <StatusPill tone={data?.plan ? "green" : "gray"} label={data?.plan ? data.plan.planName : t("plans.free_plan")} />
         </span>
       </SectionCard>
 
       {data?.ok && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <StatCard value={String(data.downloadsToday)} label="Downloads today" />
-          <StatCard value={String(data.downloadsTotal)} label="Total downloads" />
+          <StatCard value={String(data.downloadsToday)} label={t("myplan.downloads_today")} />
+          <StatCard value={String(data.downloadsTotal)} label={t("myplan.downloads_total")} />
           <StatCard value={String(favorites.data?.items.length ?? 0)} label="Favourites" />
-          <StatCard value={data.plan ? new Date(data.plan.expiresAt).toLocaleDateString() : data.freeDailyLimit === 0 ? "—" : `${data.freeDailyLimit}/day`} label={data.plan ? "Plan expires" : "Free daily limit"} />
+          <StatCard value={data.plan ? new Date(data.plan.expiresAt).toLocaleDateString() : data.freeDailyLimit === 0 ? "—" : `${data.freeDailyLimit}/day`} label={data.plan ? t("myplan.expires_label") : t("myplan.free_limit_label")} />
         </div>
       )}
 
       <SectionCard>
-        <h2 className="text-lg font-extrabold">Edit name</h2>
-        <p className="mt-1 text-sm text-[var(--dim)]">Your email cannot be changed.</p>
+        <h2 className="text-lg font-extrabold">{t("profile.edit_name")}</h2>
+        <p className="mt-1 text-sm text-[var(--dim)]">{t("profile.email_fixed")}</p>
         <div className="mt-3 flex flex-col gap-2 sm:flex-row">
           <input
-            aria-label="Your name"
+            aria-label={t("auth.name_label")}
             value={name}
             onChange={(e) => { setName(e.target.value); if (nameError) setNameError(null); if (nameMsg) setNameMsg(null); }}
-            placeholder="Your name"
+            placeholder={t("auth.name_label")}
             maxLength={100}
             className="min-w-0 flex-1 border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
             style={{ borderRadius: "var(--radius)" }}
@@ -1483,7 +1743,7 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
             className="bg-[var(--accent)] px-5 py-2 font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
             style={{ borderRadius: "var(--radius)" }}
           >
-            {nameMut.isPending ? "Saving…" : "Save name"}
+            {nameMut.isPending ? t("common.saving") : t("profile.save_name")}
           </button>
         </div>
         {nameMsg && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{nameMsg}</p>}
@@ -1491,11 +1751,11 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
       </SectionCard>
 
       <SectionCard>
-        <h2 className="text-lg font-extrabold">Change password</h2>
+        <h2 className="text-lg font-extrabold">{t("profile.change_password")}</h2>
         <p className="mt-1 text-sm text-[var(--dim)]">Your other sessions will be signed out; this session stays logged in.</p>
         <form onSubmit={handlePasswordSubmit} className="mt-3 flex flex-col gap-3">
           <div>
-            <label htmlFor="profile-current-pw" className="text-sm font-bold">Current password</label>
+            <label htmlFor="profile-current-pw" className="text-sm font-bold">{t("profile.current_password")}</label>
             <input
               id="profile-current-pw"
               type="password"
@@ -1508,7 +1768,7 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
             />
           </div>
           <div>
-            <label htmlFor="profile-new-pw" className="text-sm font-bold">New password</label>
+            <label htmlFor="profile-new-pw" className="text-sm font-bold">{t("profile.new_password")}</label>
             <input
               id="profile-new-pw"
               type="password"
@@ -1521,7 +1781,7 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
             />
           </div>
           <div>
-            <label htmlFor="profile-confirm-pw" className="text-sm font-bold">Confirm new password</label>
+            <label htmlFor="profile-confirm-pw" className="text-sm font-bold">{t("profile.confirm_password")}</label>
             <input
               id="profile-confirm-pw"
               type="password"
@@ -1557,6 +1817,8 @@ function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (
 /* ------------------------------------------------------------------ */
 
 function DownloadSettingsPage() {
+  const t = useT();
+  const { theme, lang, setTheme, setLang } = usePrefs();
   const queryClient = useQueryClient();
   const loggedIn = Boolean(getUserToken());
   const server = useQuery({
@@ -1566,6 +1828,8 @@ function DownloadSettingsPage() {
   });
   const [quality, setQuality] = useState<QualityPref>(() => getLocalDownloadSettings().defaultQuality);
   const [mode, setMode] = useState<DownloadModePref>(() => getLocalDownloadSettings().defaultMode);
+  const [themeSel, setThemeSel] = useState<Theme>(theme);
+  const [langSel, setLangSel] = useState<Lang>(lang);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const didInit = useRef(false);
@@ -1576,18 +1840,25 @@ function DownloadSettingsPage() {
       didInit.current = true;
       setQuality(server.data.defaultQuality as QualityPref);
       setMode(server.data.defaultMode as DownloadModePref);
+      setThemeSel(server.data.theme === "light" ? "light" : "dark");
+      setLangSel(server.data.language === "ur" ? "ur" : "en");
     }
   }, [loggedIn, server.data]);
 
   const saveMut = useMutation({
-    mutationFn: () => api.saveDownloadSettings({ defaultQuality: quality, defaultMode: mode, token: getUserToken() }),
+    mutationFn: () => api.saveDownloadSettings({ defaultQuality: quality, defaultMode: mode, theme: themeSel, language: langSel, token: getUserToken() }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["download-settings"] });
-      setSavedMsg("Settings saved ✓ — they will apply to your next video.");
+      setTheme(themeSel);
+      setLang(langSel);
+      setLocalTheme(themeSel);
+      setLocalLang(langSel);
+      applyTheme(themeSel);
+      setSavedMsg(t("settings.saved_account"));
       setSaveError(null);
     },
     onError: () => {
-      setSaveError("No response from the server. Please try again in a moment.");
+      setSaveError(t("common.error_server"));
       setSavedMsg(null);
     },
   });
@@ -1598,18 +1869,21 @@ function DownloadSettingsPage() {
     if (loggedIn) {
       saveMut.mutate();
     } else {
-      setLocalDownloadSettings({ defaultQuality: quality, defaultMode: mode });
-      setSavedMsg("Settings saved in this browser ✓ — they will apply to your next video.");
+      setLocalDownloadSettings({ defaultQuality: quality, defaultMode: mode, theme: themeSel, language: langSel });
+      setTheme(themeSel);
+      setLang(langSel);
+      applyTheme(themeSel);
+      setSavedMsg(t("settings.saved_browser"));
     }
   }
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="⚙️" title="Download Settings" subtitle="Choose how your videos download by default" />
+      <PageHero icon="⚙️" title={t("menu.download_settings")} subtitle={t("settings.subtitle")} />
       <SectionCard>
         <div>
-          <label htmlFor="settings-quality" className="text-sm font-bold">Default quality</label>
-          <p className="mt-0.5 text-xs text-[var(--dim)]">Pre-selected when a video is fetched. If a video does not offer your chosen quality, the best available is used instead.</p>
+          <label htmlFor="settings-quality" className="text-sm font-bold">{t("settings.quality")}</label>
+          <p className="mt-0.5 text-xs text-[var(--dim)]">{t("settings.quality_hint")}</p>
           <select
             id="settings-quality"
             value={quality}
@@ -1623,8 +1897,8 @@ function DownloadSettingsPage() {
           </select>
         </div>
         <div className="mt-5">
-          <label htmlFor="settings-mode" className="text-sm font-bold">Default mode</label>
-          <p className="mt-0.5 text-xs text-[var(--dim)]">Which mode opens when you tap “Jimeng Downloader”. The Bulk menu item always opens Bulk mode.</p>
+          <label htmlFor="settings-mode" className="text-sm font-bold">{t("settings.mode")}</label>
+          <p className="mt-0.5 text-xs text-[var(--dim)]">{t("settings.mode_hint")}</p>
           <select
             id="settings-mode"
             value={mode}
@@ -1632,14 +1906,40 @@ function DownloadSettingsPage() {
             className="mt-2 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-sm font-semibold"
             style={{ borderRadius: "var(--radius)" }}
           >
-            <option value="single">Single — 1 video</option>
-            <option value="bulk">Bulk — up to 10 videos</option>
+            <option value="single">{t("dl.single")}</option>
+            <option value="bulk">{t("settings.mode_bulk")}</option>
+          </select>
+        </div>
+        <div className="mt-5">
+          <label htmlFor="settings-theme" className="text-sm font-bold">{t("settings.theme")}</label>
+          <p className="mt-0.5 text-xs text-[var(--dim)]">{t("settings.theme_hint")}</p>
+          <select
+            id="settings-theme"
+            value={themeSel}
+            onChange={(e) => setThemeSel(e.target.value as Theme)}
+            className="mt-2 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-sm font-semibold"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            <option value="dark">{t("settings.theme_dark")}</option>
+            <option value="light">{t("settings.theme_light")}</option>
+          </select>
+        </div>
+        <div className="mt-5">
+          <label htmlFor="settings-language" className="text-sm font-bold">{t("settings.language")}</label>
+          <p className="mt-0.5 text-xs text-[var(--dim)]">{t("settings.language_hint")}</p>
+          <select
+            id="settings-language"
+            value={langSel}
+            onChange={(e) => setLangSel(e.target.value as Lang)}
+            className="mt-2 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-sm font-semibold"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            <option value="en">{t("settings.language_en")}</option>
+            <option value="ur">{t("settings.language_ur")}</option>
           </select>
         </div>
         <p className="mt-4 text-xs text-[var(--dim)]">
-          {loggedIn
-            ? "These settings are saved on your account, so they follow you to any device."
-            : "You are not logged in, so these settings are saved in this browser only. Log in to keep them on your account."}
+          {loggedIn ? t("settings.note_account") : t("settings.note_browser")}
         </p>
         {savedMsg && <p className="mt-3 text-sm font-semibold text-[var(--accent)]" role="status">{savedMsg}</p>}
         {saveError && <p className="mt-3 text-sm font-semibold text-[var(--err-text)]" role="alert">{saveError}</p>}
@@ -1650,7 +1950,7 @@ function DownloadSettingsPage() {
           className="cta-gradient mt-4 w-full px-5 py-2.5 font-extrabold disabled:opacity-50"
           style={{ borderRadius: "var(--radius)" }}
         >
-          {saveMut.isPending ? "Saving…" : "Save settings"}
+          {saveMut.isPending ? t("common.saving") : t("settings.save")}
         </button>
       </SectionCard>
     </main>
@@ -1664,6 +1964,7 @@ function DownloadSettingsPage() {
 /* ------------------------------------------------------------------ */
 
 function NotificationsPage() {
+  const t = useT();
   const queryClient = useQueryClient();
   const notifications = useQuery({
     queryKey: ["notifications"],
@@ -1687,7 +1988,7 @@ function NotificationsPage() {
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="🔔" title="Notifications" subtitle="Payment, plan and download updates" />
+      <PageHero icon="🔔" title={t("menu.notifications")} subtitle={t("notif.subtitle")} />
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm font-bold text-[var(--dim)]">
           {notifications.data
@@ -1703,7 +2004,7 @@ function NotificationsPage() {
             onClick={() => readAllMut.mutate()}
             className="text-sm font-bold text-[var(--accent)] disabled:opacity-50"
           >
-            Mark all as read
+            {t("notif.mark_all")}
           </button>
         )}
       </div>
@@ -1716,9 +2017,9 @@ function NotificationsPage() {
       {notifications.data && items.length === 0 && (
         <SectionCard className="py-12 text-center">
           <p className="text-6xl" aria-hidden="true">🔔</p>
-          <h2 className="mt-4 text-xl font-extrabold">No notifications yet</h2>
+          <h2 className="mt-4 text-xl font-extrabold">{t("notif.empty_title")}</h2>
           <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
-            You will see a notification here when a payment is received, a plan is activated or ends, your free daily limit is reached, or the admin replies to one of your support tickets.
+            {t("notif.empty_text")}
           </p>
         </SectionCard>
       )}
@@ -1736,7 +2037,7 @@ function NotificationsPage() {
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2">
                   <p className="text-base font-extrabold">{n.title}</p>
-                  {!n.read && <StatusPill tone="green" label="● New" pulse />}
+                  {!n.read && <StatusPill tone="green" label={t("notif.new")} pulse />}
                 </div>
                 <p className="mt-1 text-sm leading-relaxed text-[var(--dim)]">{n.message}</p>
                 <p className="mt-1 text-xs text-[var(--dim)]">{new Date(n.createdAt).toLocaleString()}</p>
@@ -1749,7 +2050,7 @@ function NotificationsPage() {
                       className="border border-[var(--border)] px-3 py-1.5 text-xs font-extrabold disabled:opacity-50"
                       style={{ borderRadius: 8 }}
                     >
-                      Mark as read
+                      {t("notif.mark_read")}
                     </button>
                   )}
                   <button
@@ -1759,7 +2060,7 @@ function NotificationsPage() {
                     className="border border-[rgba(248,113,113,0.5)] px-3 py-1.5 text-xs font-extrabold text-[var(--err-text)] disabled:opacity-50"
                     style={{ borderRadius: 8 }}
                   >
-                    Delete
+                    {t("notif.delete")}
                   </button>
                 </div>
               </div>
@@ -1791,6 +2092,7 @@ type JimengDownloaderPageProps = DownloadFlowProps & {
   onGoPlans: () => void;
   onGoHistory: () => void;
   sidebarAdSaved: boolean;
+  smartLink: { url: string | null; enabled: boolean } | undefined;
 };
 
 /** Safe download filename from a video title (falls back when empty). */
@@ -1849,7 +2151,9 @@ function JimengDownloaderPage({
   onGoPlans,
   onGoHistory,
   sidebarAdSaved,
+  smartLink,
 }: JimengDownloaderPageProps) {
+  const t = useT();
   const queryClient = useQueryClient();
   const [mode, setMode] = useState<"single" | "bulk">(initialMode);
   const dlSettings = useDownloadSettings();
@@ -1883,14 +2187,14 @@ function JimengDownloaderPage({
       setResult({
         ok: false, sourceUrl: "", title: "", coverUrl: null, videos: [], images: [],
         usedCustomApi: false, note: null, downloadId: null,
-        error: "No response from the server. Please try again in a moment.",
+        error: t("common.error_server"),
       });
     },
   });
 
   function handleResolve() {
     if (!linkText.trim()) {
-      setLinkError("First paste a Jimeng share link in the box above, then tap this button.");
+      setLinkError(t("dl.link_empty"));
       return;
     }
     setLinkError(null);
@@ -1903,10 +2207,10 @@ function JimengDownloaderPage({
       if (text) {
         setLinkText(text);
         setLinkError(null);
-        setPasteMsg("Link pasted ✓");
-      } else setPasteMsg("Clipboard is empty — copy the link from Jimeng first.");
+        setPasteMsg(t("dl.pasted"));
+      } else setPasteMsg(t("dl.clipboard_empty"));
     } catch {
-      setPasteMsg("Auto-paste didn't work — long-press in the box or press Ctrl+V to paste.");
+      setPasteMsg(t("dl.paste_failed"));
     }
   }
 
@@ -1925,7 +2229,7 @@ function JimengDownloaderPage({
   async function handleBulk() {
     const lines = bulkText.split("\n").map((l) => l.trim()).filter(Boolean);
     if (lines.length === 0) {
-      setBulkTextError("First paste Jimeng links in the box — one link per line.");
+      setBulkTextError(t("dl.bulk_empty"));
       return;
     }
     setBulkTextError(null);
@@ -1954,7 +2258,7 @@ function JimengDownloaderPage({
                   result: {
                     ok: false, sourceUrl: line, title: "", coverUrl: null, videos: [], images: [],
                     usedCustomApi: false, note: null, downloadId: null,
-                    error: "No response from the server. Please try again in a moment.",
+                    error: t("common.error_server"),
                   },
                 }
               : it,
@@ -1989,9 +2293,9 @@ function JimengDownloaderPage({
       if (prep.ok && prep.downloadUrl) {
         return { ok: true, downloadUrl: prep.downloadUrl, sizeBytes: prep.sizeBytes };
       }
-      return { ok: false, error: prep.error ?? "The file could not be prepared.", limitReached: prep.limitReached };
+      return { ok: false, error: prep.error ?? t("dl.prepare_failed"), limitReached: prep.limitReached };
     } catch {
-      return { ok: false, error: "No response from the server.", limitReached: false };
+      return { ok: false, error: t("dl.no_response_short"), limitReached: false };
     }
   }
 
@@ -2008,8 +2312,8 @@ function JimengDownloaderPage({
       if (!entry) continue;
       const { it, i } = entry;
       const video = it.result!.videos[it.selectedVideo]!;
-      const name = it.result!.title || `Video ${i + 1}`;
-      setBatchStatus(`Downloading ${n + 1}/${targets.length}… ${name}`);
+      const name = it.result!.title || t("dl.jimeng_video") + ` ${i + 1}`;
+      setBatchStatus(t("dl.downloading_n", { n: String(n + 1), total: String(targets.length), name }));
       const prep = await prepareOne(video.url);
       if (!prep.ok) {
         failed.push(`${name}: ${prep.error}`);
@@ -2029,9 +2333,11 @@ function JimengDownloaderPage({
     setBatchStatus(null);
     setBatchSummary(
       [
-        `Download All finished: ${okCount} of ${targets.length} video${targets.length === 1 ? "" : "s"} started.`,
-        failed.length > 0 ? `Could not start ${failed.length}: ${failed.slice(0, 3).join(" · ")}${failed.length > 3 ? ` (and ${failed.length - 3} more)` : ""}` : null,
-        "If a download did not start in your browser, use that video's own Download button below.",
+        t("dl.batch_done", { ok: String(okCount), total: String(targets.length), s: targets.length === 1 ? "" : "s" }),
+        failed.length > 0
+          ? t("dl.batch_failed", { n: String(failed.length), list: failed.slice(0, 3).join(" · ") }) + (failed.length > 3 ? ` ${t("dl.and_more", { n: String(failed.length - 3) })}` : "")
+          : null,
+        t("dl.batch_fallback"),
       ].filter(Boolean).join(" "),
     );
     if (hitLimit) onGoPlans();
@@ -2052,8 +2358,8 @@ function JimengDownloaderPage({
       if (!entry) continue;
       const { it, i } = entry;
       const video = it.result!.videos[it.selectedVideo]!;
-      const name = it.result!.title || `Video ${i + 1}`;
-      setZipStatus(`Preparing ${n + 1}/${targets.length}… ${name}`);
+      const name = it.result!.title || t("dl.jimeng_video") + ` ${i + 1}`;
+      setZipStatus(t("dl.zip_preparing_n", { n: String(n + 1), total: String(targets.length), name }));
       const prep = await prepareOne(video.url);
       if (!prep.ok) {
         failed.push(`${name}: ${prep.error}`);
@@ -2074,19 +2380,19 @@ function JimengDownloaderPage({
         );
         added++;
       } catch {
-        failed.push(`${name}: the prepared file could not be read.`);
+        failed.push(t("dl.zip_failed_read", { name }));
       }
     }
     if (added === 0) {
       setZipRunning(false);
       setZipStatus(null);
       setZipSummary(
-        `ZIP could not be created — none of the videos could be prepared. ${failed.slice(0, 3).join(" · ")}`,
+        `${t("dl.zip_none")} ${failed.slice(0, 3).join(" · ")}`,
       );
       if (hitLimit) onGoPlans();
       return;
     }
-    setZipStatus(`Zipping ${added} video${added === 1 ? "" : "s"}…`);
+    setZipStatus(t("dl.zipping", { n: String(added), s: added === 1 ? "" : "s" }));
     try {
       // MP4s are already compressed, so STORE keeps zipping fast and light.
       const zipBlob = await zip.generateAsync({ type: "blob", compression: "STORE" });
@@ -2095,12 +2401,14 @@ function JimengDownloaderPage({
       window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
       setZipSummary(
         [
-          `ZIP ready with ${added} video${added === 1 ? "" : "s"} — if the download did not start, tap “Download ZIP” again.`,
-          failed.length > 0 ? `Skipped ${failed.length}: ${failed.slice(0, 3).join(" · ")}${failed.length > 3 ? ` (and ${failed.length - 3} more)` : ""}` : null,
+          t("dl.zip_ready", { n: String(added), s: added === 1 ? "" : "s" }),
+          failed.length > 0
+            ? t("dl.zip_skipped", { n: String(failed.length), list: failed.slice(0, 3).join(" · ") }) + (failed.length > 3 ? ` ${t("dl.and_more", { n: String(failed.length - 3) })}` : "")
+            : null,
         ].filter(Boolean).join(" "),
       );
     } catch {
-      setZipSummary("The ZIP could not be created — please try again, or use the individual Download buttons below.");
+      setZipSummary(t("dl.zip_failed"));
     }
     queryClient.invalidateQueries({ queryKey: ["me"] });
     queryClient.invalidateQueries({ queryKey: ["history"] });
@@ -2114,14 +2422,14 @@ function JimengDownloaderPage({
   return (
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
       <main className="flex min-w-0 flex-col gap-6">
-        <PageHero icon="🎬" title="Jimeng Downloader" subtitle="Paste a public Jimeng share link and download the original MP4 — no watermark" />
+        <PageHero icon="🎬" title={t("menu.jimeng")} subtitle={t("dl.subtitle")} />
         <p className="mx-auto inline-flex items-center gap-2 border border-[rgba(251,191,36,0.4)] bg-[var(--warn-bg)] px-4 py-2 text-sm font-bold text-[var(--warn-text)]" style={{ borderRadius: 999 }}>
-          ⚠ Only Published (Public) videos work. Private drafts cannot be downloaded.
+          {t("dl.public_only")}
         </p>
 
         <SectionCard className="border-[rgba(0,233,154,0.35)] shadow-[0_0_45px_rgba(0,233,154,0.10)]">
           {/* Single / Bulk mode toggle */}
-          <div className="flex gap-2" role="tablist" aria-label="Download mode">
+          <div className="flex gap-2" role="tablist" aria-label={t("dl.download_mode")}>
             <button
               type="button"
               role="tab"
@@ -2130,7 +2438,7 @@ function JimengDownloaderPage({
               className={`flex-1 px-4 py-2.5 text-sm font-extrabold ${mode === "single" ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "border border-[var(--border)] bg-[var(--surface)]"}`}
               style={{ borderRadius: "var(--radius)" }}
             >
-              Single — 1 video
+              {t("dl.single")}
             </button>
             <button
               type="button"
@@ -2140,23 +2448,23 @@ function JimengDownloaderPage({
               className={`flex-1 px-4 py-2.5 text-sm font-extrabold ${mode === "bulk" ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "border border-[var(--border)] bg-[var(--surface)]"}`}
               style={{ borderRadius: "var(--radius)" }}
             >
-              Bulk — up to {BULK_MAX_LINKS} videos
+              {t("dl.bulk", { n: String(BULK_MAX_LINKS) })}
             </button>
           </div>
 
           {mode === "single" && (
             <>
               <h2 className="mt-5 flex items-center gap-2 text-xl font-extrabold">
-                <span className="text-[var(--accent)]">🔗</span> Paste your Jimeng share link
+                <span className="text-[var(--accent)]">🔗</span> {t("dl.paste_heading")}
               </h2>
               <p className="mt-1 text-sm text-[var(--dim)]">
-                Open the video in Jimeng → tap Share → Link → Copy
+                {t("dl.paste_hint")}
               </p>
               <div className="mt-3 flex flex-col gap-2 sm:flex-row">
                 <textarea
                   {...FIELDS.resolveLink.text}
                   id="jimeng-link"
-                  aria-label="Jimeng share link"
+                  aria-label={t("dl.link_aria")}
                   value={linkText}
                   onChange={(e) => { setLinkText(e.target.value); if (linkError) setLinkError(null); }}
                   placeholder="https://jimeng.jianying.com/s/xxxxx"
@@ -2166,15 +2474,15 @@ function JimengDownloaderPage({
                 />
                 <div className="flex gap-2 sm:flex-col">
                   <button type="button" onClick={handlePaste} className="glass flex-1 border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-2 text-sm font-bold sm:flex-none" style={{ borderRadius: "var(--radius)" }}>
-                    📋 Paste
+                    {t("dl.paste")}
                   </button>
                   <button type="button" onClick={() => { setLinkText(""); setResult(null); setLinkError(null); }} className="flex-1 border border-[var(--border)] px-4 py-2 text-sm font-bold text-[var(--dim)] sm:flex-none" style={{ borderRadius: "var(--radius)" }}>
-                    🗑 Clear
+                    {t("dl.clear")}
                   </button>
                 </div>
               </div>
               <p className="mt-2 text-xs text-[var(--dim)]">
-                Tip: you can also paste Jimeng's full share text — the link is extracted from it automatically.
+                {t("dl.tip_share_text")}
               </p>
               {linkError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{linkError}</p>}
               <button
@@ -2184,14 +2492,14 @@ function JimengDownloaderPage({
                 className="cta-gradient mt-3 w-full px-5 py-3.5 text-lg font-extrabold disabled:opacity-50"
                 style={{ borderRadius: "var(--radius)" }}
               >
-                {resolve.isPending ? "Fetching video…" : "⬇ Get Video — No Watermark"}
+                {resolve.isPending ? t("dl.fetching") : t("dl.get_video")}
               </button>
               <p className="mt-3 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-center text-sm font-semibold text-[var(--dim)]">
-                <span><span className="text-[var(--accent)]">✓</span> Free to start</span>
+                <span><span className="text-[var(--accent)]">✓</span> {t("dl.free_start")}</span>
                 <span aria-hidden="true" className="text-[var(--border)]">|</span>
-                <span><span className="text-[var(--accent)]">⚡</span> Original MP4</span>
+                <span><span className="text-[var(--accent)]">⚡</span> {t("dl.original_mp4")}</span>
                 <span aria-hidden="true" className="text-[var(--border)]">|</span>
-                <span><span className="text-[var(--accent)]">✓</span> No login required</span>
+                <span><span className="text-[var(--accent)]">✓</span> {t("dl.no_login")}</span>
               </p>
               {pasteMsg && <p className="mt-2 text-sm text-[var(--dim)]">{pasteMsg}</p>}
 
@@ -2202,9 +2510,9 @@ function JimengDownloaderPage({
                   {result.note && <p className="mt-1 font-normal">{result.note}</p>}
                   {result.sourceUrl && (
                     <p className="mt-2 break-all font-normal">
-                      This link was found in your text: <span className="font-mono text-xs">{result.sourceUrl}</span>
+                      {t("dl.link_found")} <span className="font-mono text-xs">{result.sourceUrl}</span>
                       <br />
-                      If this link looks incomplete (especially the last part), copy the full share text from the Jimeng app again and paste it here.
+                      {t("dl.link_incomplete")}
                     </p>
                   )}
                 </div>
@@ -2213,8 +2521,8 @@ function JimengDownloaderPage({
                 <div className="mt-5">
                   <div className="flex flex-col items-center gap-1 text-center">
                     <span className="flex h-12 w-12 items-center justify-center bg-[var(--accent)] text-2xl font-extrabold text-[var(--accent-ink)] shadow-[0_0_28px_rgba(0,233,154,0.4)]" style={{ borderRadius: 999 }}>✓</span>
-                    <h3 className="mt-1 text-2xl font-extrabold">Download Ready!</h3>
-                    <p className="text-sm text-[var(--dim)]">Your video is ready to download</p>
+                    <h3 className="mt-1 text-2xl font-extrabold">{t("dl.ready")}</h3>
+                    <p className="text-sm text-[var(--dim)]">{t("dl.ready_sub")}</p>
                   </div>
                   {result.note && <p className="mt-3 mb-2 text-sm text-[var(--dim)]">{result.note}</p>}
                   <video
@@ -2235,12 +2543,12 @@ function JimengDownloaderPage({
                   />
                   {chosenVideo.width && chosenVideo.height && (
                     <p className="mt-1 text-center text-xs text-[var(--dim)]">
-                      Actual file size: {chosenVideo.width} × {chosenVideo.height}px — full frame, no cropping. Any black bars at the edges in the preview come from the player, not the video.
+                      {t("dl.file_size", { w: String(chosenVideo.width), h: String(chosenVideo.height) })}
                     </p>
                   )}
                   {result.title && <p className="mt-2 text-sm font-semibold">{result.title}</p>}
 
-                  <p className="mt-4 text-sm font-bold">Choose quality / file:</p>
+                  <p className="mt-4 text-sm font-bold">{t("dl.choose_quality")}</p>
                   <div className="mt-2 flex flex-col gap-2" role="radiogroup" aria-label="Video quality options">
                     {result.videos.map((v, i) => (
                       <button
@@ -2268,7 +2576,7 @@ function JimengDownloaderPage({
                     className="cta-gradient mt-3 w-full px-5 py-3 text-base font-extrabold disabled:opacity-50"
                     style={{ borderRadius: "var(--radius)" }}
                   >
-                    {downloading === "main" ? "Preparing file…" : "⬇ Download MP4 — No Watermark"}
+                    {downloading === "main" ? t("dl.preparing") : t("dl.download_mp4")}
                   </button>
                   {downloadNote && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{downloadNote}</p>}
                   {prepared?.tag === "main" && (
@@ -2281,7 +2589,7 @@ function JimengDownloaderPage({
                       className="flex-1 border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-sm font-extrabold"
                       style={{ borderRadius: "var(--radius)" }}
                     >
-                      ↻ Download Another
+                      {t("dl.download_another")}
                     </button>
                     <button
                       type="button"
@@ -2289,24 +2597,24 @@ function JimengDownloaderPage({
                       className="flex-1 border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-sm font-extrabold"
                       style={{ borderRadius: "var(--radius)" }}
                     >
-                      🕘 Saved to History — view it
+                      {t("dl.saved_history")}
                     </button>
                     <FavoriteButton downloadId={result.downloadId} label={chosenVideo.label} />
                   </div>
                   <p className="mt-3 flex items-center justify-center gap-2 border border-[rgba(0,233,154,0.35)] bg-[rgba(0,233,154,0.08)] px-4 py-2.5 text-sm font-bold text-[var(--accent)]" style={{ borderRadius: "var(--radius)" }}>
-                    ✓ Tip: Save this video for offline viewing!
+                    {t("dl.tip_offline")}
                   </p>
                   <p className="mt-2 text-xs text-[var(--dim)]">
-                    When you tap Download, the file is first prepared on this site's server, then the Save buttons above will appear — tap one of them. You can also often long-press the playing video to get a “Download video” option.
+                    {t("dl.how_save")}
                   </p>
 
                   {result.images.length > 0 && (
                     <>
-                      <p className="mt-5 text-sm font-bold">Images / cover from this link:</p>
+                      <p className="mt-5 text-sm font-bold">{t("dl.images_from_link")}</p>
                       <div className="mt-2 grid grid-cols-2 gap-3 sm:grid-cols-3">
                         {result.images.map((img, i) => (
                           <figure key={img.url} className="border border-[var(--border)] p-2" style={{ borderRadius: "var(--radius)" }}>
-                            <img src={img.url} alt={`Jimeng image ${i + 1}`} className="h-28 w-full bg-[var(--surface-alt)] object-contain" loading="lazy" />
+                            <img src={img.url} alt={t("dl.image_alt", { n: String(i + 1) })} className="h-28 w-full bg-[var(--surface-alt)] object-contain" loading="lazy" />
                             <button
                               type="button"
                               disabled={downloading === `img-${i}`}
@@ -2314,7 +2622,7 @@ function JimengDownloaderPage({
                               className="mt-2 w-full bg-[var(--surface-alt)] px-3 py-1.5 text-sm font-bold disabled:opacity-50"
                               style={{ borderRadius: "var(--radius)" }}
                             >
-                              {downloading === `img-${i}` ? "…" : "⬇ Image download"}
+                              {downloading === `img-${i}` ? "…" : t("dl.image_download")}
                             </button>
                           </figure>
                         ))}
@@ -2329,12 +2637,12 @@ function JimengDownloaderPage({
               {result?.ok && !chosenVideo && result.images.length > 0 && (
                 <div className="mt-5">
                   {result.note && <p className="mb-2 text-sm text-[var(--dim)]">{result.note}</p>}
-                  <p className="text-sm font-semibold">No video was found for this link — this is an image post. The images are below:</p>
+                  <p className="text-sm font-semibold">{t("dl.no_video")}</p>
                   {result.title && <p className="mt-2 text-sm font-semibold">{result.title}</p>}
                   <div className="mt-3 grid grid-cols-2 gap-3 sm:grid-cols-3">
                     {result.images.map((img, i) => (
                       <figure key={img.url} className="border border-[var(--border)] p-2" style={{ borderRadius: "var(--radius)" }}>
-                        <img src={img.url} alt={`Jimeng image ${i + 1}`} className="h-28 w-full bg-[var(--surface-alt)] object-contain" loading="lazy" />
+                        <img src={img.url} alt={t("dl.image_alt", { n: String(i + 1) })} className="h-28 w-full bg-[var(--surface-alt)] object-contain" loading="lazy" />
                         <button
                           type="button"
                           disabled={downloading === `img-${i}`}
@@ -2342,7 +2650,7 @@ function JimengDownloaderPage({
                           className="mt-2 w-full bg-[var(--surface-alt)] px-3 py-1.5 text-sm font-bold disabled:opacity-50"
                           style={{ borderRadius: "var(--radius)" }}
                         >
-                          {downloading === `img-${i}` ? "…" : "⬇ Image download"}
+                          {downloading === `img-${i}` ? "…" : t("dl.image_download")}
                         </button>
                       </figure>
                     ))}
@@ -2353,6 +2661,7 @@ function JimengDownloaderPage({
                   )}
                 </div>
               )}
+              {result?.ok && <SmartLinkBanner smartLink={smartLink} />}
             </>
           )}
 
@@ -2360,13 +2669,13 @@ function JimengDownloaderPage({
             <>
               <div className="mt-5 flex flex-col items-center gap-1 border-2 border-dashed border-[var(--ad-border)] bg-[var(--surface-alt)] px-4 py-5 text-center" style={{ borderRadius: "var(--radius)" }}>
                 <span className="text-4xl" aria-hidden="true">☁️</span>
-                <p className="text-base font-extrabold">Upload or Paste Multiple Links</p>
-                <p className="text-sm text-[var(--dim)]">Supports multiple Jimeng links — one per line, up to {BULK_MAX_LINKS} at a time. Links are resolved one by one and each video gets its own download button below. Every successful video is also saved to History.</p>
+                <p className="text-base font-extrabold">{t("dl.bulk_intro_title")}</p>
+                <p className="text-sm text-[var(--dim)]">{t("dl.bulk_intro_text", { n: String(BULK_MAX_LINKS) })}</p>
               </div>
-              <label htmlFor="bulk-links" className="mt-4 block text-sm font-bold">Jimeng links — one per line</label>
+              <label htmlFor="bulk-links" className="mt-4 block text-sm font-bold">{t("dl.bulk_label")}</label>
               <textarea
                 id="bulk-links"
-                aria-label="Bulk Jimeng links, one per line"
+                aria-label={t("dl.bulk_links_aria")}
                 value={bulkText}
                 onChange={(e) => { setBulkText(e.target.value); if (bulkTextError) setBulkTextError(null); }}
                 placeholder={"https://jimeng.jianying.com/s/xxxxx\nhttps://jimeng.jianying.com/s/yyyyy"}
@@ -2382,12 +2691,12 @@ function JimengDownloaderPage({
                 className="cta-gradient mt-3 w-full px-5 py-3 text-base font-extrabold disabled:opacity-50"
                 style={{ borderRadius: "var(--radius)" }}
               >
-                {bulkRunning ? "Resolving links…" : `⬇ Fetch All Videos (up to ${BULK_MAX_LINKS})`}
+                {bulkRunning ? t("dl.fetching_videos") : t("dl.fetch_all_n", { n: String(BULK_MAX_LINKS) })}
               </button>
               {items.length > 0 && (
                 <div className="mt-4" role="status">
                   <div className="flex justify-between text-sm font-bold">
-                    <span>{bulkRunning ? `Working… ${doneCount}/${items.length} done` : `Done: ${doneCount}/${items.length} videos fetched.`}</span>
+                    <span>{bulkRunning ? t("dl.progress_working", { done: String(doneCount), total: String(items.length) }) : t("dl.progress_done", { done: String(doneCount), total: String(items.length) })}</span>
                     <span>{Math.round((doneCount / Math.max(1, items.length)) * 100)}%</span>
                   </div>
                   <div className="mt-1 h-3 w-full overflow-hidden bg-[var(--surface-alt)]" style={{ borderRadius: 999 }}>
@@ -2404,7 +2713,7 @@ function JimengDownloaderPage({
                     className="flex-1 bg-[var(--accent)] px-4 py-3 text-sm font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
                     style={{ borderRadius: "var(--radius)" }}
                   >
-                    {batchRunning ? (batchStatus ?? "Downloading…") : `⬇ Download All (${doneCount})`}
+                    {batchRunning ? (batchStatus ?? t("dl.downloading")) : t("dl.download_all_n", { n: String(doneCount) })}
                   </button>
                   <button
                     type="button"
@@ -2413,7 +2722,7 @@ function JimengDownloaderPage({
                     className="flex-1 border border-[var(--accent)] bg-[var(--surface)] px-4 py-3 text-sm font-extrabold text-[var(--accent)] disabled:opacity-50"
                     style={{ borderRadius: "var(--radius)" }}
                   >
-                    {zipRunning ? (zipStatus ?? "Preparing ZIP…") : `🗜 Download ZIP (${doneCount})`}
+                    {zipRunning ? (zipStatus ?? t("dl.preparing_zip")) : t("dl.download_zip_n", { n: String(doneCount) })}
                   </button>
                 </div>
               )}
@@ -2421,7 +2730,7 @@ function JimengDownloaderPage({
               {zipSummary && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{zipSummary}</p>}
               {(batchRunning || zipRunning) && (
                 <p className="mt-2 text-xs text-[var(--dim)]">
-                  Each video counts toward your free daily limit. If a download does not start in your browser, use that video's own Download button below.
+                  {t("dl.limit_note")}
                 </p>
               )}
               {downloadNote && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{downloadNote}</p>}
@@ -2440,13 +2749,13 @@ function JimengDownloaderPage({
                         <div className="min-w-0 flex-1">
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <p className="min-w-0 flex-1 truncate text-xs text-[var(--dim)]">{item.line}</p>
-                            {item.status === "waiting" && <StatusPill tone="gray" label="⏳ Waiting" />}
-                            {item.status === "working" && <StatusPill tone="amber" label="Fetching…" pulse />}
-                            {item.status === "done" && <StatusPill tone="green" label="✓ Done" />}
-                            {item.status === "error" && <StatusPill tone="red" label="✕ Error" />}
+                            {item.status === "waiting" && <StatusPill tone="gray" label={t("dl.status_waiting")} />}
+                            {item.status === "working" && <StatusPill tone="amber" label={t("dl.status_fetching")} pulse />}
+                            {item.status === "done" && <StatusPill tone="green" label={t("dl.status_done")} />}
+                            {item.status === "error" && <StatusPill tone="red" label={t("dl.status_error")} />}
                           </div>
-                          {item.status === "waiting" && <p className="mt-1 text-sm font-semibold text-[var(--dim)]">Waiting for its turn…</p>}
-                          {item.status === "working" && <p className="mt-1 text-sm font-semibold">Fetching video…</p>}
+                          {item.status === "waiting" && <p className="mt-1 text-sm font-semibold text-[var(--dim)]">{t("dl.waiting_turn")}</p>}
+                          {item.status === "working" && <p className="mt-1 text-sm font-semibold">{t("dl.fetching")}</p>}
                           {item.status === "error" && item.result && !item.result.ok && (
                             <p className="mt-1 text-sm font-semibold text-[var(--err-text)]">{item.result.error}</p>
                           )}
@@ -2456,11 +2765,11 @@ function JimengDownloaderPage({
                               {video ? (
                                 <>
                                   <label className="mt-2 block text-xs font-bold text-[var(--dim)]" htmlFor={`bulk-quality-${i}`}>
-                                    Export quality
+                                    {t("dl.choose_quality_bulk")}
                                   </label>
                                   <select
                                     id={`bulk-quality-${i}`}
-                                    aria-label={`Export quality for video ${i + 1}`}
+                                    aria-label={t("dl.export_quality_for", { n: String(i + 1) })}
                                     value={item.selectedVideo}
                                     onChange={(e) => {
                                       const next = Number(e.target.value);
@@ -2488,14 +2797,14 @@ function JimengDownloaderPage({
                                     className="mt-1.5 bg-[var(--accent)] px-3 py-1.5 text-xs font-bold text-[var(--accent-ink)] disabled:opacity-50"
                                     style={{ borderRadius: 8 }}
                                   >
-                                    {downloading === tag ? "Preparing file…" : "⬇ Download MP4 — No Watermark"}
+                                    {downloading === tag ? t("dl.preparing") : t("dl.download_mp4")}
                                   </button>
                                   <span className="mt-1.5 inline-block">
                                     <FavoriteButton downloadId={item.result.downloadId} label={video.label} />
                                   </span>
                                 </>
                               ) : (
-                                <p className="mt-1 text-sm font-semibold">No video was found for this link (it may be an image post) — paste it in Single mode to see the images.</p>
+                                <p className="mt-1 text-sm font-semibold">{t("dl.no_video_bulk")}</p>
                               )}
                             </>
                           )}
@@ -2508,6 +2817,7 @@ function JimengDownloaderPage({
                   );
                 })}
               </ul>
+              {items.length > 0 && <SmartLinkBanner smartLink={smartLink} />}
             </>
           )}
         </SectionCard>
@@ -2541,11 +2851,11 @@ function JimengDownloaderPage({
         <SectionCard>
           <h2 className="flex items-center gap-2 text-lg font-extrabold">
             <span className="flex h-6 w-6 items-center justify-center bg-[var(--accent)] text-sm font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>?</span>
-            Need help?
+            {t("home.need_help")}
           </h2>
           <div className="mt-3 flex flex-col">
             <button type="button" onClick={() => onGoHistory()} className="flex items-center justify-between border-b border-[var(--border)] py-2.5 text-left text-sm font-bold text-[var(--accent)]">
-              <span>🕘 Download History</span><span aria-hidden="true">›</span>
+              <span>{t("menu.history")}</span><span aria-hidden="true">›</span>
             </button>
             <p className="py-2.5 text-sm text-[var(--dim)]">Tip: on a phone, open the playing video's ⋮ menu → Share → Save to save it straight to your gallery.</p>
           </div>
@@ -2555,9 +2865,10 @@ function JimengDownloaderPage({
   );
 }
 function WhatIsJimengPage() {
+  const t = useT();
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="❓" title="What is Jimeng?" subtitle="ByteDance's AI video platform — and how this downloader works with it" />
+      <PageHero icon="❓" title={t("menu.whatis")} subtitle={t("page.whatis_sub")} />
       <SectionCard className="flex flex-col items-center gap-4 text-center sm:flex-row sm:text-left">
         <span className="flex h-24 w-24 shrink-0 items-center justify-center border border-[rgba(0,233,154,0.4)] bg-[rgba(0,233,154,0.08)] shadow-[0_0_40px_rgba(0,233,154,0.20)]" style={{ borderRadius: 24 }}>
           <Logo />
@@ -2601,6 +2912,7 @@ function WhatIsJimengPage() {
 }
 
 function HowToPage() {
+  const t = useT();
   const steps = [
     { n: "1", icon: "🔗", title: "Copy Link", text: "Open Jimeng app, share video, and copy the link." },
     { n: "2", icon: "📋", title: "Paste Link", text: "Paste the link in our downloader box." },
@@ -2608,7 +2920,7 @@ function HowToPage() {
   ];
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="📖" title="How to Use Jimeng Downloader" subtitle="Three easy steps — copy, paste, download" />
+      <PageHero icon="📖" title={t("page.howto_title")} subtitle={t("page.howto_sub")} />
       <div className="grid gap-4 sm:grid-cols-3">
         {steps.map((step) => (
           <SectionCard key={step.n} className="card-hover text-center">
@@ -2629,15 +2941,16 @@ function HowToPage() {
       </SectionCard>
       <SectionCard>
         <h2 className="text-lg font-extrabold">Good to know</h2>
-        <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">Another easy method that works on phones: open the playing video in the preview → tap the <strong>three dots (⋮)</strong> on the video → <strong>Share</strong> → then <strong>Save</strong> at the end — the video goes straight to your gallery, with no watermark.</p>
+        <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">Another easy method that works on phones: open the playing video in the preview → tap the <strong>three dots (⋮)</strong> on the video → <strong>Share</strong> → then <strong>{t("common.save")}</strong> at the end — the video goes straight to your gallery, with no watermark.</p>
         <p className="mt-3 text-sm leading-relaxed text-[var(--dim)]">If a link doesn't work, the reason is usually that the video is still a draft/private, or the share link has expired — copy a fresh link from Jimeng and try again. Avatar (cast template) links also work, but they are usually only valid for 48 hours — copy one and paste it here right away.</p>
-        <p className="mt-3 text-sm leading-relaxed text-[var(--dim)]">To fetch several videos at once, open <strong>Bulk Download</strong> from the menu — paste one link per line and they will all be fetched one by one.</p>
+        <p className="mt-3 text-sm leading-relaxed text-[var(--dim)]">To fetch several videos at once, open <strong>{t("menu.bulk")}</strong> from the menu — paste one link per line and they will all be fetched one by one.</p>
       </SectionCard>
     </main>
   );
 }
 
 function FaqPage() {
+  const t = useT();
   const [open, setOpen] = useState<number | null>(0);
   const faqs: { q: string; a: string }[] = [
     {
@@ -2675,7 +2988,7 @@ function FaqPage() {
   ];
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="💬" title="Frequently Asked Questions" subtitle="Everything you need to know about the downloader" />
+      <PageHero icon="💬" title={t("page.faq_title")} subtitle={t("page.faq_sub")} />
       <SectionCard>
         <div className="flex flex-col">
           {faqs.map((f, i) => (
@@ -2701,9 +3014,10 @@ function FaqPage() {
 }
 
 function SoraPage({ onGoHome }: { onGoHome: () => void }) {
+  const t = useT();
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="🎬" title="Sora Downloader" subtitle="Download videos from Sora — coming soon" />
+      <PageHero icon="🎬" title={t("menu.sora")} subtitle={t("page.sora_sub")} />
       <SectionCard className="py-10 text-center">
         <span className="mx-auto flex h-20 w-20 items-center justify-center border border-[rgba(251,191,36,0.45)] bg-[var(--warn-bg)] text-4xl" style={{ borderRadius: 999 }}>🎬</span>
         <p className="mt-5 inline-block border border-[rgba(251,191,36,0.45)] bg-[var(--warn-bg)] px-3 py-1 text-xs font-extrabold tracking-wide text-[var(--warn-text)] uppercase" style={{ borderRadius: 999 }}>
@@ -2721,7 +3035,7 @@ function SoraPage({ onGoHome }: { onGoHome: () => void }) {
           className="cta-gradient mt-6 px-6 py-3 font-extrabold"
           style={{ borderRadius: "var(--radius)" }}
         >
-          Go to Jimeng Downloader
+          {t("page.sora_cta")}
         </button>
       </SectionCard>
     </main>
@@ -2729,6 +3043,7 @@ function SoraPage({ onGoHome }: { onGoHome: () => void }) {
 }
 
 function ClearHistoryButton() {
+  const t = useT();
   const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);
   const mut = useMutation({
@@ -2736,17 +3051,18 @@ function ClearHistoryButton() {
     onSuccess: () => { queryClient.invalidateQueries({ queryKey: ["history"] }); setConfirming(false); },
   });
   if (!confirming)
-    return <button type="button" onClick={() => setConfirming(true)} className="text-sm font-bold text-[var(--err-text)]">Clear all history</button>;
+    return <button type="button" onClick={() => setConfirming(true)} className="text-sm font-bold text-[var(--err-text)]">{t("history.clear_all")}</button>;
   return (
     <span className="flex items-center gap-2 text-sm">
-      Are you sure?
-      <button type="button" disabled={mut.isPending} onClick={() => mut.mutate()} className="font-bold text-[var(--err-text)]">Yes, clear it</button>
-      <button type="button" onClick={() => setConfirming(false)} className="font-bold text-[var(--dim)]">No</button>
+      {t("history.confirm_clear")}
+      <button type="button" disabled={mut.isPending} onClick={() => mut.mutate()} className="font-bold text-[var(--err-text)]">{t("history.confirm_yes")}</button>
+      <button type="button" onClick={() => setConfirming(false)} className="font-bold text-[var(--dim)]">{t("history.confirm_no")}</button>
     </span>
   );
 }
 
 function DeleteHistoryButton({ id }: { id: number }) {
+  const t = useT();
   const queryClient = useQueryClient();
   const mut = useMutation({
     mutationFn: () => api.deleteHistoryItem({ id }),
@@ -2754,7 +3070,7 @@ function DeleteHistoryButton({ id }: { id: number }) {
   });
   return (
     <button type="button" disabled={mut.isPending} onClick={() => mut.mutate()} className="border border-[rgba(248,113,113,0.5)] px-3 py-1.5 text-xs font-extrabold text-[var(--err-text)]" style={{ borderRadius: 8 }}>
-      🗑 Delete
+      {t("history.delete")}
     </button>
   );
 }
@@ -2860,6 +3176,7 @@ function AdsSetup({ settings }: { settings: ApiResponse<typeof api, "getSettings
         title="Advertisement Settings"
         subtitle="Once your AdSense is approved, paste each slot's code here and save it. No publisher ID is pre-filled — only add your own code."
       />
+      <SmartLinkEditor settings={settings} />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {AD_SLOTS.map((slot) => (
           <AdSlotEditor key={slot.key} slot={slot.key} label={slot.label} size={slot.size} saved={Boolean(settings?.adSlots[slot.key])} />
@@ -2931,10 +3248,109 @@ function AdSlotEditor({ slot, label, size, saved }: { slot: AdSlotKey; label: st
   );
 }
 
+function SmartLinkEditor({ settings }: { settings: ApiResponse<typeof api, "getSettings"> | undefined }) {
+  const queryClient = useQueryClient();
+  const [url, setUrl] = useState("");
+  const [enabled, setEnabled] = useState(true);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [urlError, setUrlError] = useState<string | null>(null);
+  const init = useRef(false);
+
+  // Prefill from the saved value once it loads — the default link is
+  // seeded server-side, so this shows the live link on first open.
+  useEffect(() => {
+    if (settings?.smartLink && !init.current) {
+      init.current = true;
+      setUrl(settings.smartLink.url ?? "");
+      setEnabled(settings.smartLink.enabled);
+    }
+  }, [settings]);
+
+  const save = useMutation({
+    mutationFn: async () => {
+      const res = await api.saveSmartLink({ url, enabled, token: getToken() });
+      if (!res.ok) throw new Error(res.error ?? "Could not save the smart link.");
+      return res;
+    },
+    onSuccess: () => { setMsg("Smart link saved ✓"); queryClient.invalidateQueries({ queryKey: ["settings"] }); },
+    onError: (error) => setMsg(error.message),
+  });
+  const clear = useMutation({
+    mutationFn: () => api.clearSmartLink({ token: getToken() }),
+    onSuccess: () => { setMsg("Smart link removed."); setUrl(""); setEnabled(true); queryClient.invalidateQueries({ queryKey: ["settings"] }); },
+  });
+
+  function handleSave() {
+    const trimmed = url.trim();
+    if (!trimmed) {
+      setUrlError("First paste the smart link URL, then save.");
+      return;
+    }
+    try {
+      const u = new URL(trimmed);
+      if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("bad protocol");
+    } catch {
+      setUrlError("That is not a valid link. Paste the full smart link URL starting with https://");
+      return;
+    }
+    setUrlError(null);
+    save.mutate();
+  }
+
+  const saved = Boolean(settings?.smartLink.url);
+  return (
+    <section className="glass border border-[var(--border)] bg-[var(--admin-card)] p-5" style={{ borderRadius: "var(--radius)" }}>
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <p className="text-base font-extrabold">🔗 Smart Link <span className="text-sm font-semibold text-[var(--admin-dim)]">· Adsterra</span></p>
+        {saved && settings?.smartLink.enabled
+          ? <StatusPill tone="green" label="✓ Showing on the downloader page" />
+          : saved
+            ? <StatusPill tone="gray" label="Saved but disabled" />
+            : <StatusPill tone="gray" label="No smart link" />}
+      </div>
+      <p className="mt-2 text-sm text-[var(--admin-dim)]">
+        One sponsored link, shown as a clearly labelled banner below the video result on the Jimeng downloader page. It opens in a new tab and never touches the download buttons.
+      </p>
+      <label htmlFor="smart-link-url" className="mt-3 block text-sm font-bold">Smart link URL</label>
+      <input
+        {...FIELDS.saveSmartLink.url}
+        id="smart-link-url"
+        value={url}
+        onChange={(e) => { setUrl(e.target.value); if (urlError) setUrlError(null); }}
+        placeholder="https://…"
+        className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 font-mono text-sm break-all"
+        style={{ borderRadius: "var(--radius)" }}
+      />
+      {urlError && <p className="mt-1.5 text-sm font-semibold text-[var(--err-text)]" role="alert">{urlError}</p>}
+      <label className="mt-3 flex cursor-pointer items-center gap-2 text-sm font-bold">
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => setEnabled(e.target.checked)}
+          className="h-4 w-4 accent-[var(--accent)]"
+        />
+        Show the banner on the downloader page
+      </label>
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button type="button" disabled={save.isPending} onClick={handleSave} className="bg-[var(--accent)] px-4 py-2 text-sm font-extrabold text-[var(--accent-ink)] disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+          {save.isPending ? "Saving…" : "Save smart link"}
+        </button>
+        {saved && (
+          <button type="button" disabled={clear.isPending} onClick={() => clear.mutate()} className="border border-[var(--border)] px-4 py-2 text-sm font-bold text-[var(--err-text)]" style={{ borderRadius: "var(--radius)" }}>
+            Remove smart link
+          </button>
+        )}
+      </div>
+      {msg && <p className="mt-2 text-sm font-semibold text-[var(--accent)]">{msg}</p>}
+    </section>
+  );
+}
+
 function AboutPage() {
+  const t = useT();
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="ℹ️" title="About — Jimeng Video Downloader" subtitle="A free tool for saving your own public Jimeng videos, clean" />
+      <PageHero icon="ℹ️" title={t("page.about_title")} subtitle={t("page.about_sub")} />
       <SectionCard>
         <h2 className="text-lg font-extrabold">What is this tool?</h2>
         <p className="mt-2 text-base leading-relaxed">
@@ -2970,6 +3386,7 @@ function AboutPage() {
 }
 
 function PrivacyPage() {
+  const t = useT();
   const topics: { icon: string; title: string; body: string }[] = [
     {
       icon: "🔗",
@@ -3004,7 +3421,7 @@ function PrivacyPage() {
   ];
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="🔒" title="Privacy Policy" subtitle="How this site handles your links, keys and messages" />
+      <PageHero icon="🔒" title={t("menu.privacy")} subtitle={t("page.privacy_sub")} />
       {topics.map((t) => (
         <SectionCard key={t.title}>
           <h2 className="flex items-center gap-2 text-lg font-extrabold">
@@ -3018,6 +3435,7 @@ function PrivacyPage() {
 }
 
 function ContactPage() {
+  const t = useT();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [message, setMessage] = useState("");
@@ -3042,12 +3460,12 @@ function ContactPage() {
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="✉️" title="Contact Us" subtitle="We are here to help you!" />
+      <PageHero icon="✉️" title={t("page.contact_title")} subtitle={t("page.contact_sub")} />
       <div className="grid gap-4 sm:grid-cols-2">
         <SectionCard className="flex items-start gap-3">
           <span className="flex h-11 w-11 shrink-0 items-center justify-center bg-[rgba(0,233,154,0.12)] text-xl" style={{ borderRadius: 12 }}>✉️</span>
           <div>
-            <p className="text-base font-extrabold">Email</p>
+            <p className="text-base font-extrabold">{t("profile.email")}</p>
             <p className="mt-1 text-sm leading-relaxed text-[var(--dim)]">Send a message with the form below — we reply to the email address you enter.</p>
           </div>
         </SectionCard>
@@ -3069,16 +3487,16 @@ function ContactPage() {
             <input {...FIELDS.submitContact.name} id="contact-name" aria-label="Your name" value={name} onChange={(e) => setName(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
           </div>
           <div>
-            <label htmlFor="contact-email" className="text-sm font-bold">Email</label>
-            <input {...FIELDS.submitContact.email} id="contact-email" aria-label="Email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+            <label htmlFor="contact-email" className="text-sm font-bold">{t("profile.email")}</label>
+            <input {...FIELDS.submitContact.email} id="contact-email" aria-label={t("auth.email")} type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
           </div>
           <div>
-            <label htmlFor="contact-message" className="text-sm font-bold">Message</label>
+            <label htmlFor="contact-message" className="text-sm font-bold">{t("tickets.message")}</label>
             <textarea {...FIELDS.submitContact.message} id="contact-message" aria-label="Message" value={message} onChange={(e) => setMessage(e.target.value)} rows={5} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
           </div>
           {formError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{formError}</p>}
           <button type="submit" disabled={mut.isPending} className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
-            {mut.isPending ? "Sending…" : "Send message"}
+            {mut.isPending ? t("plans.sending") : t("contact.send")}
           </button>
         </form>
       </SectionCard>
@@ -3114,13 +3532,17 @@ const REPORT_ISSUES: { value: string; label: string }[] = [
   { value: "Other", label: "Other" },
 ];
 
-function ticketStatusPill(status: string) {
-  if (status === "open") return <StatusPill tone="amber" label="● Open" pulse />;
-  if (status === "answered") return <StatusPill tone="green" label="✓ Answered" />;
-  return <StatusPill tone="gray" label="Closed" />;
+/** Ticket status pill. The user pages pass their translate function so
+ *  the label follows the site language; the admin panel (English only)
+ *  calls it without one and gets the English labels. */
+function ticketStatusPill(status: string, t?: (key: string) => string) {
+  if (status === "open") return <StatusPill tone="amber" label={t ? `● ${t("tickets.open")}` : "● Open"} pulse />;
+  if (status === "answered") return <StatusPill tone="green" label={t ? `✓ ${t("tickets.answered")}` : "✓ Answered"} />;
+  return <StatusPill tone="gray" label={t ? t("tickets.closed") : "Closed"} />;
 }
 
 function HelpCenterPage() {
+  const t = useT();
   const [query, setQuery] = useState("");
   const [openId, setOpenId] = useState<number | null>(null);
   const articles = useQuery({ queryKey: ["help-articles"], queryFn: () => api.listHelpArticles({}) });
@@ -3137,16 +3559,16 @@ function HelpCenterPage() {
   const categories = [...new Set(all.map((a) => a.category))];
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="🆘" title="Help Center" subtitle="Answers about downloading, limits, plans and your account" />
+      <PageHero icon="🆘" title={t("menu.help")} subtitle={t("help.subtitle")} />
       <SectionCard>
-        <label htmlFor="help-search" className="text-sm font-bold">Search the Help Center</label>
+        <label htmlFor="help-search" className="text-sm font-bold">{t("help.search_label")}</label>
         <input
           id="help-search"
-          aria-label="Search help articles"
+          aria-label={t("help.search_aria")}
           type="search"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder="Type a question — e.g. “link not working”"
+          placeholder={t("help.search_example")}
           className="mt-2 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-base"
           style={{ borderRadius: "var(--radius)" }}
         />
@@ -3176,13 +3598,13 @@ function HelpCenterPage() {
       {articles.data && filtered.length === 0 && (
         <SectionCard className="py-12 text-center">
           <p className="text-6xl" aria-hidden="true">🔍</p>
-          <h2 className="mt-4 text-xl font-extrabold">No articles found</h2>
+          <h2 className="mt-4 text-xl font-extrabold">{t("help.no_results_title")}</h2>
           <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
-            Nothing matches “{query.trim()}”. Try different words, or open a support ticket and ask us directly.
+            {t("help.no_results_text", { q: query.trim() })}
           </p>
           {query.trim() && (
             <button type="button" onClick={() => setQuery("")} className="mt-4 text-sm font-bold text-[var(--accent)]">
-              Show all articles
+              {t("help.show_all")}
             </button>
           )}
         </SectionCard>
@@ -3217,6 +3639,7 @@ function HelpCenterPage() {
 }
 
 function SupportTicketsPage() {
+  const t = useT();
   const queryClient = useQueryClient();
   const [subject, setSubject] = useState("");
   const [category, setCategory] = useState("download");
@@ -3247,7 +3670,7 @@ function SupportTicketsPage() {
         queryClient.invalidateQueries({ queryKey: ["my-tickets"] });
         setSelectedId(data.ticketId);
       } else {
-        setFormError(data.error ?? "Could not open the ticket — please try again.");
+        setFormError(data.error ?? t("tickets.create_failed"));
       }
     },
     onError: (error) => setFormError(error.message),
@@ -3296,37 +3719,37 @@ function SupportTicketsPage() {
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="🎫" title="Support Tickets" subtitle="Ask us anything — we reply here, and you get a notification" />
+      <PageHero icon="🎫" title={t("menu.tickets")} subtitle={t("tickets.subtitle")} />
       {selectedId === null ? (
         <>
           <SectionCard>
-            <h2 className="text-lg font-extrabold">Open a new ticket</h2>
+            <h2 className="text-lg font-extrabold">{t("tickets.new_title")}</h2>
             <form className="mt-4 flex flex-col gap-3" onSubmit={handleCreate}>
               <div>
-                <label htmlFor="ticket-subject" className="text-sm font-bold">Subject</label>
-                <input {...FIELDS.createTicket.subject} id="ticket-subject" aria-label="Ticket subject" value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="e.g. My download stopped at 90%" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+                <label htmlFor="ticket-subject" className="text-sm font-bold">{t("tickets.subject")}</label>
+                <input {...FIELDS.createTicket.subject} id="ticket-subject" aria-label={t("tickets.subject_aria")} value={subject} onChange={(e) => setSubject(e.target.value)} placeholder={t("tickets.subject_ph")} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
               </div>
               <div>
-                <label htmlFor="ticket-category" className="text-sm font-bold">Category</label>
-                <select id="ticket-category" aria-label="Ticket category" value={category} onChange={(e) => setCategory(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }}>
+                <label htmlFor="ticket-category" className="text-sm font-bold">{t("tickets.category")}</label>
+                <select id="ticket-category" aria-label={t("tickets.category_aria")} value={category} onChange={(e) => setCategory(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }}>
                   {TICKET_CATEGORIES.map((c) => (
                     <option key={c.value} value={c.value}>{c.label}</option>
                   ))}
                 </select>
               </div>
               <div>
-                <label htmlFor="ticket-message" className="text-sm font-bold">Message</label>
-                <textarea {...FIELDS.createTicket.message} id="ticket-message" aria-label="Ticket message" value={message} onChange={(e) => setMessage(e.target.value)} rows={4} placeholder="Describe the problem — what happened, and which link it was about?" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+                <label htmlFor="ticket-message" className="text-sm font-bold">{t("tickets.message")}</label>
+                <textarea {...FIELDS.createTicket.message} id="ticket-message" aria-label={t("tickets.message_aria")} value={message} onChange={(e) => setMessage(e.target.value)} rows={4} placeholder={t("tickets.message_ph")} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
               </div>
               {formError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{formError}</p>}
               <button type="submit" disabled={createMut.isPending} className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
-                {createMut.isPending ? "Opening…" : "Open ticket"}
+                {createMut.isPending ? t("tickets.opening") : t("tickets.open_btn")}
               </button>
             </form>
           </SectionCard>
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-extrabold">My tickets</h2>
-            <p className="text-sm font-bold text-[var(--dim)]">{tickets.data ? `${items.length} ticket${items.length === 1 ? "" : "s"}` : "Loading…"}</p>
+            <h2 className="text-lg font-extrabold">{t("tickets.my_tickets")}</h2>
+            <p className="text-sm font-bold text-[var(--dim)]">{tickets.data ? t("tickets.count", { n: String(items.length), s: items.length === 1 ? "" : "s" }) : t("common.loading")}</p>
           </div>
           {tickets.isPending && (
             <div className="flex flex-col gap-3">
@@ -3337,23 +3760,23 @@ function SupportTicketsPage() {
           {tickets.data && items.length === 0 && (
             <SectionCard className="py-12 text-center">
               <p className="text-6xl" aria-hidden="true">🎫</p>
-              <h2 className="mt-4 text-xl font-extrabold">No tickets yet</h2>
+              <h2 className="mt-4 text-xl font-extrabold">{t("tickets.no_tickets_title")}</h2>
               <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
-                Open a ticket above and the admin will reply here. You will also get a notification when a reply arrives.
+                {t("tickets.no_tickets_text")}
               </p>
             </SectionCard>
           )}
           <ul className="flex flex-col gap-3">
-            {items.map((t) => (
-              <li key={t.id} className="glass card-hover border border-[var(--border)] bg-[var(--surface)] p-4" style={{ borderRadius: "var(--radius)" }}>
-                <button type="button" onClick={() => setSelectedId(t.id)} className="flex w-full flex-wrap items-center justify-between gap-2 text-left">
+            {items.map((ticket) => (
+              <li key={ticket.id} className="glass card-hover border border-[var(--border)] bg-[var(--surface)] p-4" style={{ borderRadius: "var(--radius)" }}>
+                <button type="button" onClick={() => setSelectedId(ticket.id)} className="flex w-full flex-wrap items-center justify-between gap-2 text-left">
                   <span className="min-w-0">
-                    <span className="block truncate text-base font-extrabold">#{t.id} — {t.subject}</span>
+                    <span className="block truncate text-base font-extrabold">#{ticket.id} — {ticket.subject}</span>
                     <span className="mt-1 block text-xs text-[var(--dim)]">
-                      {TICKET_CATEGORIES.find((c) => c.value === t.category)?.label ?? t.category} · {new Date(t.createdAt).toLocaleString()}
+                      {TICKET_CATEGORIES.find((c) => c.value === ticket.category)?.label ?? ticket.category} · {new Date(ticket.createdAt).toLocaleString()}
                     </span>
                   </span>
-                  {ticketStatusPill(t.status)}
+                  {ticketStatusPill(ticket.status, t)}
                 </button>
               </li>
             ))}
@@ -3361,7 +3784,7 @@ function SupportTicketsPage() {
         </>
       ) : (
         <>
-          <button type="button" onClick={() => setSelectedId(null)} className="self-start text-sm font-bold text-[var(--accent)]">← Back to my tickets</button>
+          <button type="button" onClick={() => setSelectedId(null)} className="self-start text-sm font-bold text-[var(--accent)]">{t("tickets.back")}</button>
           {detail.isPending && (
             <div className="flex flex-col gap-3">
               <Skeleton className="h-24" />
@@ -3373,10 +3796,10 @@ function SupportTicketsPage() {
               <SectionCard>
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <h2 className="text-lg font-extrabold">#{ticket.id} — {ticket.subject}</h2>
-                  {ticketStatusPill(ticket.status)}
+                  {ticketStatusPill(ticket.status, t)}
                 </div>
                 <p className="mt-1 text-xs text-[var(--dim)]">
-                  {TICKET_CATEGORIES.find((c) => c.value === ticket.category)?.label ?? ticket.category} · Opened {new Date(ticket.createdAt).toLocaleString()}
+                  {TICKET_CATEGORIES.find((c) => c.value === ticket.category)?.label ?? ticket.category} · {t("tickets.opened", { date: new Date(ticket.createdAt).toLocaleString() })}
                 </p>
               </SectionCard>
               <ul className="flex flex-col gap-3">
@@ -3387,7 +3810,7 @@ function SupportTicketsPage() {
                     style={{ borderRadius: "var(--radius)" }}
                   >
                     <p className="text-xs font-extrabold tracking-wide text-[var(--accent)] uppercase">
-                      {m.authorRole === "admin" ? "🛡 Admin" : "👤 You"}
+                      {m.authorRole === "admin" ? t("tickets.admin_label") : t("tickets.you_label")}
                     </p>
                     <p className="mt-1 text-base leading-relaxed whitespace-pre-line">{m.message}</p>
                     <p className="mt-1 text-xs text-[var(--dim)]">{new Date(m.createdAt).toLocaleString()}</p>
@@ -3396,17 +3819,17 @@ function SupportTicketsPage() {
               </ul>
               {messages.length === 0 && (
                 <SectionCard className="py-8 text-center">
-                  <p className="text-sm text-[var(--dim)]">No messages in this ticket yet.</p>
+                  <p className="text-sm text-[var(--dim)]">{t("tickets.no_messages")}</p>
                 </SectionCard>
               )}
               <SectionCard>
-                <h2 className="text-lg font-extrabold">Reply</h2>
+                <h2 className="text-lg font-extrabold">{t("tickets.reply")}</h2>
                 <form
                   className="mt-3 flex flex-col gap-3"
                   onSubmit={(e) => {
                     e.preventDefault();
                     if (!reply.trim()) {
-                      setReplyError("Write a reply first.");
+                      setReplyError(t("tickets.reply_empty"));
                       return;
                     }
                     setReplyError(null);
@@ -3415,27 +3838,27 @@ function SupportTicketsPage() {
                 >
                   <textarea
                     {...FIELDS.replyTicket.message}
-                    aria-label="Your reply"
+                    aria-label={t("tickets.reply_aria")}
                     value={reply}
                     onChange={(e) => setReply(e.target.value)}
                     rows={4}
-                    placeholder="Write your reply…"
+                    placeholder={t("tickets.reply_ph")}
                     className="w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
                     style={{ borderRadius: "var(--radius)" }}
                   />
                   {replyError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{replyError}</p>}
                   <div className="flex flex-wrap gap-2">
                     <button type="submit" disabled={replyMut.isPending} className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
-                      {replyMut.isPending ? "Sending…" : "Send reply"}
+                      {replyMut.isPending ? t("common.sending") : t("tickets.send_reply")}
                     </button>
                     {ticket.status !== "closed" && (
                       <button type="button" disabled={closeMut.isPending} onClick={() => closeMut.mutate()} className="border border-[rgba(248,113,113,0.5)] px-5 py-2.5 font-extrabold text-[var(--err-text)] disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
-                        Close ticket
+                        {t("tickets.close")}
                       </button>
                     )}
                   </div>
                   {ticket.status === "closed" && (
-                    <p className="text-sm text-[var(--dim)]">This ticket is closed. Sending a reply reopens it.</p>
+                    <p className="text-sm text-[var(--dim)]">{t("tickets.closed_note")}</p>
                   )}
                 </form>
               </SectionCard>
@@ -3443,9 +3866,9 @@ function SupportTicketsPage() {
           )}
           {!detail.isPending && !ticket && (
             <SectionCard className="py-12 text-center">
-              <h2 className="text-xl font-extrabold">Ticket not found</h2>
-              <p className="mx-auto mt-2 max-w-sm text-sm text-[var(--dim)]">This ticket does not exist or belongs to another browser.</p>
-              <button type="button" onClick={() => setSelectedId(null)} className="mt-4 text-sm font-bold text-[var(--accent)]">Back to my tickets</button>
+              <h2 className="text-xl font-extrabold">{t("tickets.not_found_title")}</h2>
+              <p className="mx-auto mt-2 max-w-sm text-sm text-[var(--dim)]">{t("tickets.not_found_text")}</p>
+              <button type="button" onClick={() => setSelectedId(null)} className="mt-4 text-sm font-bold text-[var(--accent)]">{t("tickets.back_plain")}</button>
             </SectionCard>
           )}
         </>
@@ -3455,6 +3878,7 @@ function SupportTicketsPage() {
 }
 
 function ReportProblemPage({ onTicketCreated }: { onTicketCreated: () => void }) {
+  const t = useT();
   const [issue, setIssue] = useState(REPORT_ISSUES[0]?.value ?? "Download failed");
   const [description, setDescription] = useState("");
   const [link, setLink] = useState("");
@@ -3473,7 +3897,7 @@ function ReportProblemPage({ onTicketCreated }: { onTicketCreated: () => void })
         setLink("");
         queryClient.invalidateQueries({ queryKey: ["my-tickets"] });
       } else {
-        setFormError(data.error ?? "Could not send the report — please try again.");
+        setFormError(data.error ?? t("report.send_failed"));
       }
     },
     onError: (error) => setFormError(error.message),
@@ -3482,7 +3906,7 @@ function ReportProblemPage({ onTicketCreated }: { onTicketCreated: () => void })
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!description.trim()) {
-      setFormError("Please describe the problem, then send.");
+      setFormError(t("report.describe_first"));
       return;
     }
     setFormError(null);
@@ -3491,41 +3915,41 @@ function ReportProblemPage({ onTicketCreated }: { onTicketCreated: () => void })
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="⚠️" title="Report a Problem" subtitle="Tell us what went wrong — it opens a real support ticket" />
+      <PageHero icon="⚠️" title={t("menu.report")} subtitle={t("report.subtitle")} />
       {createdId !== null ? (
         <SectionCard className="py-10 text-center">
           <p className="text-6xl" aria-hidden="true">✓</p>
-          <h2 className="mt-4 text-xl font-extrabold">Report received — ticket #{createdId}</h2>
+          <h2 className="mt-4 text-xl font-extrabold">{t("report.received_title", { id: String(createdId) })}</h2>
           <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
-            Your problem was saved as a support ticket. The admin will reply there, and you will get a notification when a reply arrives.
+            {t("report.received_text")}
           </p>
           <button type="button" onClick={onTicketCreated} className="cta-gradient mt-5 px-6 py-3 font-extrabold" style={{ borderRadius: "var(--radius)" }}>
-            View my tickets
+            {t("report.view_tickets")}
           </button>
         </SectionCard>
       ) : (
         <SectionCard>
-          <p className="text-base text-[var(--dim)]">Something failed, the wrong video came back, or a file still had a watermark? Describe it below — include the Jimeng link if you have it, so we can check the same video.</p>
+          <p className="text-base text-[var(--dim)]">{t("report.intro")}</p>
           <form className="mt-4 flex flex-col gap-3" onSubmit={handleSubmit}>
             <div>
-              <label htmlFor="report-issue" className="text-sm font-bold">What went wrong?</label>
-              <select id="report-issue" aria-label="What went wrong" value={issue} onChange={(e) => setIssue(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }}>
+              <label htmlFor="report-issue" className="text-sm font-bold">{t("report.issue")}</label>
+              <select id="report-issue" aria-label={t("report.issue_aria")} value={issue} onChange={(e) => setIssue(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }}>
                 {REPORT_ISSUES.map((r) => (
                   <option key={r.value} value={r.value}>{r.label}</option>
                 ))}
               </select>
             </div>
             <div>
-              <label htmlFor="report-description" className="text-sm font-bold">Description</label>
-              <textarea {...FIELDS.createTicket.message} id="report-description" aria-label="Problem description" value={description} onChange={(e) => setDescription(e.target.value)} rows={5} placeholder="What happened? What did you expect to happen?" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+              <label htmlFor="report-description" className="text-sm font-bold">{t("report.description_label")}</label>
+              <textarea {...FIELDS.createTicket.message} id="report-description" aria-label={t("report.description_aria")} value={description} onChange={(e) => setDescription(e.target.value)} rows={5} placeholder={t("report.description_ph")} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
             </div>
             <div>
-              <label htmlFor="report-link" className="text-sm font-bold">Jimeng link (optional)</label>
-              <input id="report-link" aria-label="Jimeng link (optional)" value={link} onChange={(e) => setLink(e.target.value)} placeholder="https://jimeng.jianying.com/s/xxxxx" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+              <label htmlFor="report-link" className="text-sm font-bold">{t("report.link")}</label>
+              <input id="report-link" aria-label={t("report.link_aria")} value={link} onChange={(e) => setLink(e.target.value)} placeholder="https://jimeng.jianying.com/s/xxxxx" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
             </div>
             {formError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{formError}</p>}
             <button type="submit" disabled={createMut.isPending} className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
-              {createMut.isPending ? "Sending…" : "Send report"}
+              {createMut.isPending ? t("common.sending") : t("report.send_btn")}
             </button>
           </form>
         </SectionCard>
@@ -3535,6 +3959,7 @@ function ReportProblemPage({ onTicketCreated }: { onTicketCreated: () => void })
 }
 
 function TermsPage() {
+  const t = useT();
   const topics: { icon: string; title: string; body: string }[] = [
     {
       icon: "📜",
@@ -3569,7 +3994,7 @@ function TermsPage() {
   ];
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="📜" title="Terms of Service" subtitle="The rules for using Jimeng Video Downloader" />
+      <PageHero icon="📜" title={t("menu.terms")} subtitle={t("page.terms_sub")} />
       {topics.map((t) => (
         <SectionCard key={t.title}>
           <h2 className="flex items-center gap-2 text-lg font-extrabold">
@@ -3583,6 +4008,7 @@ function TermsPage() {
 }
 
 function CopyrightPage() {
+  const t = useT();
   const topics: { icon: string; title: string; body: string }[] = [
     {
       icon: "©️",
@@ -3612,7 +4038,7 @@ function CopyrightPage() {
   ];
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="©️" title="Copyright Policy" subtitle="Respecting creators and their rights" />
+      <PageHero icon="©️" title={t("menu.copyright")} subtitle={t("page.copyright_sub")} />
       {topics.map((t) => (
         <SectionCard key={t.title}>
           <h2 className="flex items-center gap-2 text-lg font-extrabold">
@@ -3626,6 +4052,7 @@ function CopyrightPage() {
 }
 
 function DisclaimerPage() {
+  const t = useT();
   const topics: { icon: string; title: string; body: string }[] = [
     {
       icon: "ℹ️",
@@ -3655,7 +4082,7 @@ function DisclaimerPage() {
   ];
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="⚖️" title="Disclaimer" subtitle="What this site is — and is not — responsible for" />
+      <PageHero icon="⚖️" title={t("menu.disclaimer")} subtitle={t("page.disclaimer_sub")} />
       {topics.map((t) => (
         <SectionCard key={t.title}>
           <h2 className="flex items-center gap-2 text-lg font-extrabold">
@@ -3682,6 +4109,7 @@ function formatPrice(cents: number): string {
  * ------------------------------------------------------------------------- */
 
 function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => void; onAdminLoggedIn: (a: AdminUser) => void }) {
+  const t = useT();
   const [mode, setMode] = useState<"login" | "register">("login");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -3721,7 +4149,7 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
           setUserToken(data.token);
           onLoggedIn(data.user);
         } else {
-          setError(data.error ?? "Could not create the account — please try again.");
+          setError(data.error ?? t("auth.create_failed"));
         }
       } else {
         // Unified login: admin credentials open the Admin Panel directly,
@@ -3742,11 +4170,11 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
           setTotpCode("");
           setError(null);
         } else {
-          setError(data.error ?? "Incorrect email or password.");
+          setError(data.error ?? t("auth.wrong"));
         }
       }
     } catch {
-      setError("No response from the server. Please try again in a moment.");
+      setError(t("common.error_server"));
     }
     setBusy(false);
   }
@@ -3755,9 +4183,9 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
     <main className="mx-auto flex max-w-md flex-col gap-5">
       <div className="animate-fade-up pt-4 text-center sm:pt-8">
         <span className="inline-block"><Logo /></span>
-        <h1 className="text-gradient mt-4 text-3xl font-extrabold">{mode === "login" ? "Login" : "Create an account"}</h1>
+        <h1 className="text-gradient mt-4 text-3xl font-extrabold">{mode === "login" ? t("auth.login") : t("auth.create_title")}</h1>
         <p className="mx-auto mt-2 max-w-sm text-base text-[var(--dim)]">
-          Downloads are free and need no login. An account is only needed if you want to buy a monthly plan for more downloads.
+          {t("auth.subtitle")}
         </p>
       </div>
       <SectionCard>
@@ -3772,28 +4200,28 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
               className={`flex-1 border px-4 py-2 text-sm font-extrabold ${mode === m ? "border-[var(--accent)] bg-[var(--surface-alt)] text-[var(--accent)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
               style={{ borderRadius: "var(--radius)" }}
             >
-              {m === "login" ? "Login" : "Register"}
+              {m === "login" ? t("auth.login") : t("auth.register")}
             </button>
           ))}
         </div>
         <form onSubmit={handleSubmit} className="mt-4 flex flex-col gap-3">
           {mode === "register" && (
             <div>
-              <label htmlFor="auth-name" className="text-sm font-bold">Your name</label>
+              <label htmlFor="auth-name" className="text-sm font-bold">{t("auth.name_label")}</label>
               <input
                 {...FIELDS.register.name}
                 id="auth-name"
                 autoComplete="name"
                 value={name}
                 onChange={(e) => { setName(e.target.value); if (error) setError(null); }}
-                placeholder="Your name"
+                placeholder={t("auth.name_label")}
                 className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
                 style={{ borderRadius: "var(--radius)" }}
               />
             </div>
           )}
           <div>
-            <label htmlFor="auth-email" className="text-sm font-bold">Email</label>
+            <label htmlFor="auth-email" className="text-sm font-bold">{t("profile.email")}</label>
             <input
               {...(mode === "register" ? FIELDS.register.email : FIELDS.login.email)}
               id="auth-email"
@@ -3807,7 +4235,7 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
             />
           </div>
           <div>
-            <label htmlFor="auth-password" className="text-sm font-bold">Password</label>
+            <label htmlFor="auth-password" className="text-sm font-bold">{t("auth.password")}</label>
             <input
               {...(mode === "register" ? FIELDS.register.password : FIELDS.login.password)}
               id="auth-password"
@@ -3815,14 +4243,14 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
               autoComplete={mode === "register" ? "new-password" : "current-password"}
               value={password}
               onChange={(e) => { setPassword(e.target.value); if (error) setError(null); }}
-              placeholder={mode === "register" ? "At least 8 characters" : "Your password"}
+              placeholder={mode === "register" ? t("auth.password_ph_register") : t("auth.password_ph_login")}
               className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
               style={{ borderRadius: "var(--radius)" }}
             />
           </div>
           {totpRequired && mode === "login" && (
             <div>
-              <label htmlFor="auth-totp" className="text-sm font-bold">Two-factor code</label>
+              <label htmlFor="auth-totp" className="text-sm font-bold">{t("auth.totp_label")}</label>
               <input
                 id="auth-totp"
                 inputMode="numeric"
@@ -3830,19 +4258,19 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
                 maxLength={6}
                 value={totpCode}
                 onChange={(e) => { setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6)); if (error) setError(null); }}
-                placeholder="6-digit code"
+                placeholder={t("auth.totp_ph")}
                 className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-center text-xl font-extrabold tracking-[0.4em]"
                 style={{ borderRadius: "var(--radius)" }}
               />
               <p className="mt-1 text-xs text-[var(--dim)]">
-                Two-factor authentication is on for this admin account — enter the 6-digit code from your authenticator app.
+                {t("auth.totp_hint")}
               </p>
               <button
                 type="button"
                 onClick={() => { setTotpRequired(false); setTotpCode(""); setError(null); }}
                 className="mt-1 text-xs font-bold text-[var(--accent)]"
               >
-                ← Back to email &amp; password
+                {t("auth.totp_back")}
               </button>
             </div>
           )}
@@ -3853,7 +4281,7 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
             className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50"
             style={{ borderRadius: "var(--radius)" }}
           >
-            {busy ? "Please wait…" : totpRequired ? "Verify code" : mode === "login" ? "🔑 Log in" : "Create my account"}
+            {busy ? t("auth.please_wait") : totpRequired ? t("auth.verify_code") : mode === "login" ? t("auth.login_btn") : t("auth.register_btn")}
           </button>
         </form>
       </SectionCard>
@@ -3862,6 +4290,7 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
 }
 
 function PlansPage({ user, onNeedLogin }: { user: MeUser | null; onNeedLogin: () => void }) {
+  const t = useT();
   const queryClient = useQueryClient();
   const plans = useQuery({ queryKey: ["plans"], queryFn: () => api.listPlans({}) });
   const me = useQuery({ queryKey: ["me"], queryFn: () => api.me({ token: getUserToken() }) });
@@ -3887,38 +4316,38 @@ function PlansPage({ user, onNeedLogin }: { user: MeUser | null; onNeedLogin: ()
       if (data.ok && data.request) {
         setBuyMsg(
           data.duplicate
-            ? `You already have a pending request for the ${data.request.planName} plan — the admin will activate it after receiving your payment.`
-            : `Request sent for the ${data.request.planName} plan (${formatPrice(data.request.priceCents)}). Payment coming soon — the admin will activate your plan after receiving the payment.`,
+            ? t("plans.request_duplicate", { plan: data.request.planName })
+            : t("plans.request_sent_new", { plan: data.request.planName, price: formatPrice(data.request.priceCents) }),
         );
         queryClient.invalidateQueries({ queryKey: ["my-requests"] });
       } else {
-        setBuyError(data.error ?? "Could not send the request — please try again.");
+        setBuyError(data.error ?? t("plans.request_failed"));
       }
     } catch {
-      setBuyError("No response from the server. Please try again in a moment.");
+      setBuyError(t("common.error_server"));
     }
     setBuyingId(null);
   }
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="💎" title="Choose Your Plan" subtitle="Get more downloads and enjoy premium features" />
+      <PageHero icon="💎" title={t("plans.title")} subtitle={t("plans.subtitle")} />
       <p className="text-center text-base text-[var(--dim)]">
-        Downloading is free up to the daily limit. Need more? Buy a monthly plan — a plan gives you a fixed number of downloads for its duration (for example 1,000 videos in 30 days). When the plan runs out or expires, you fall back to the free daily limit automatically.
+        {t("plans.intro")}
       </p>
       <div>
         {!user && (
           <p className="mt-3 border border-[var(--accent)] bg-[var(--surface-alt)] p-3 text-sm font-semibold" style={{ borderRadius: "var(--radius)" }}>
-            To buy a plan you need an account —{" "}
+            {t("plans.need_account_a")}{" "}
             <button type="button" onClick={onNeedLogin} className="font-extrabold text-[var(--accent)]">
-              log in or register
+              {t("plans.need_account_b")}
             </button>{" "}
-            first. Downloads themselves stay free and need no login.
+            {t("plans.need_account_c")}
           </p>
         )}
         {me.data?.ok && me.data.plan && (
           <p className="mt-3 border border-[var(--accent)] bg-[var(--surface-alt)] p-3 text-sm font-semibold" style={{ borderRadius: "var(--radius)" }}>
-            💎 Your current plan: {me.data.plan.planName} — {me.data.plan.remaining} of {me.data.plan.limitTotal} downloads left, until {new Date(me.data.plan.expiresAt).toLocaleDateString()}.
+            {t("plans.current_line", { plan: me.data.plan.planName, remaining: String(me.data.plan.remaining), total: String(me.data.plan.limitTotal), date: new Date(me.data.plan.expiresAt).toLocaleDateString() })}
           </p>
         )}
       </div>
@@ -3934,26 +4363,26 @@ function PlansPage({ user, onNeedLogin }: { user: MeUser | null; onNeedLogin: ()
           <Skeleton className="h-64" />
         </div>
       )}
-      {plans.isError && <p className="text-sm font-semibold text-[var(--err-text)]">Could not load the plans — please try again in a moment.</p>}
+      {plans.isError && <p className="text-sm font-semibold text-[var(--err-text)]">{t("plans.load_error")}</p>}
       {plans.data && plans.data.plans.length === 0 && (
-        <p className="text-sm text-[var(--dim)]">No plans are available right now — please check back later.</p>
+        <p className="text-sm text-[var(--dim)]">{t("plans.none")}</p>
       )}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {/* Free plan — always available; downloads need no account. */}
         <div className="glass card-hover relative flex flex-col border border-[var(--border)] bg-[var(--surface)] p-5" style={{ borderRadius: "var(--radius)" }}>
-          <h2 className="text-xl font-extrabold">Free Plan</h2>
+          <h2 className="text-xl font-extrabold">{t("plans.free_title")}</h2>
           <p className="mt-1 text-3xl font-extrabold">$0.00</p>
-          <p className="text-sm text-[var(--dim)]">forever</p>
+          <p className="text-sm text-[var(--dim)]">{t("plans.forever")}</p>
           <p className="mt-3 text-base font-bold">
-            {me.data?.ok ? (me.data.freeDailyLimit === 0 ? "Unlimited downloads" : `${me.data.freeDailyLimit} Downloads/Day`) : "10 Downloads/Day"}
+            {me.data?.ok ? (me.data.freeDailyLimit === 0 ? t("plans.free_unlimited") : t("plans.per_day", { n: String(me.data.freeDailyLimit) })) : t("plans.per_day", { n: "10" })}
           </p>
           <ul className="mt-3 space-y-1.5 text-sm">
-            <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> No Watermark</li>
-            <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> Original MP4</li>
-            <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> No login required</li>
+            <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> {t("plans.no_watermark")}</li>
+            <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> {t("dl.original_mp4")}</li>
+            <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> {t("dl.no_login")}</li>
           </ul>
           <button type="button" disabled className="mt-4 w-full border border-[var(--accent)] bg-[rgba(0,233,154,0.10)] px-5 py-2.5 font-extrabold text-[var(--accent)]" style={{ borderRadius: "var(--radius)" }}>
-            {me.data?.plan ? "Free Plan" : "Current Plan"}
+            {me.data?.plan ? t("plans.free_title") : t("plans.current_plan")}
           </button>
         </div>
         {plans.data?.plans.map((plan) => {
@@ -3962,18 +4391,18 @@ function PlansPage({ user, onNeedLogin }: { user: MeUser | null; onNeedLogin: ()
           return (
             <div key={plan.id} className={`glass card-hover relative flex flex-col border bg-[var(--surface)] p-5 ${isPopular ? "border-[var(--accent)] shadow-[0_0_35px_rgba(0,233,154,0.18)]" : "border-[var(--border)]"}`} style={{ borderRadius: "var(--radius)" }}>
               {isPopular && (
-                <span className="absolute -top-3 left-1/2 -translate-x-1/2 bg-[var(--accent)] px-3 py-1 text-xs font-extrabold whitespace-nowrap text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>⭐ Most Popular</span>
+                <span className="absolute -top-3 left-1/2 -translate-x-1/2 bg-[var(--accent)] px-3 py-1 text-xs font-extrabold whitespace-nowrap text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>{t("plans.most_popular")}</span>
               )}
               <h2 className="text-xl font-extrabold">{plan.name}</h2>
               <p className="mt-1 text-3xl font-extrabold">{formatPrice(plan.priceCents)}</p>
-              <p className="text-sm text-[var(--dim)]">for {plan.durationDays} days</p>
-              <p className="mt-3 text-base font-bold">{plan.downloadLimit.toLocaleString()} video downloads</p>
+              <p className="text-sm text-[var(--dim)]">{t("plans.for_days", { n: String(plan.durationDays) })}</p>
+              <p className="mt-3 text-base font-bold">{t("plans.videos", { n: plan.downloadLimit.toLocaleString() })}</p>
               {plan.description && <p className="mt-1 text-sm text-[var(--dim)]">{plan.description}</p>}
               <ul className="mt-3 space-y-1.5 text-sm">
-                <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> No Watermark</li>
-                <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> Original MP4 quality</li>
-                <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> Fast server-side download</li>
-                <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> Falls back to Free when used up</li>
+                <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> {t("plans.no_watermark")}</li>
+                <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> {t("plans.original_quality")}</li>
+                <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> {t("plans.fast_download")}</li>
+                <li className="flex items-center gap-2"><span className="text-[var(--accent)]">✓</span> {t("plans.fallback")}</li>
               </ul>
               <button
                 type="button"
@@ -3982,7 +4411,7 @@ function PlansPage({ user, onNeedLogin }: { user: MeUser | null; onNeedLogin: ()
                 className="cta-gradient mt-4 w-full px-5 py-2.5 font-extrabold disabled:opacity-50"
                 style={{ borderRadius: "var(--radius)" }}
               >
-                {isCurrent ? "Current Plan" : buyingId === plan.id ? "Sending…" : "Buy"}
+                {isCurrent ? t("plans.current_plan") : buyingId === plan.id ? t("plans.sending") : t("plans.buy")}
               </button>
             </div>
           );
@@ -3991,15 +4420,15 @@ function PlansPage({ user, onNeedLogin }: { user: MeUser | null; onNeedLogin: ()
 
       {user && requests.data && requests.data.requests.length > 0 && (
         <SectionCard>
-          <h2 className="text-lg font-extrabold">Your purchase requests</h2>
+          <h2 className="text-lg font-extrabold">{t("plans.requests_title")}</h2>
           <ul className="mt-3 flex flex-col gap-2">
             {requests.data.requests.map((r) => (
               <li key={r.id} className="flex flex-wrap items-center justify-between gap-2 border border-[var(--border)] p-3 text-sm" style={{ borderRadius: "var(--radius)" }}>
                 <span className="font-bold">{r.planName} — {formatPrice(r.priceCents)}</span>
-                {r.status === "pending" && <StatusPill tone="amber" label="⏳ Pending" />}
-                {r.status === "paid" && <StatusPill tone="green" label="✓ Paid" />}
-                {r.status === "activated" && <StatusPill tone="green" label="✓ Active" />}
-                {r.status === "rejected" && <StatusPill tone="red" label="✕ Rejected" />}
+                {r.status === "pending" && <StatusPill tone="amber" label={t("plans.status_pending")} />}
+                {r.status === "paid" && <StatusPill tone="green" label={t("plans.status_paid")} />}
+                {r.status === "activated" && <StatusPill tone="green" label={t("plans.status_active")} />}
+                {r.status === "rejected" && <StatusPill tone="red" label={t("plans.status_rejected")} />}
                 <span className="text-xs text-[var(--dim)]">{new Date(r.createdAt).toLocaleString()}</span>
               </li>
             ))}
@@ -4011,13 +4440,14 @@ function PlansPage({ user, onNeedLogin }: { user: MeUser | null; onNeedLogin: ()
 }
 
 function MyPlanPage({ user, onGoPlans }: { user: MeUser; onGoPlans: () => void }) {
+  const t = useT();
   const me = useQuery({ queryKey: ["me"], queryFn: () => api.me({ token: getUserToken() }) });
   const requests = useQuery({ queryKey: ["my-requests"], queryFn: () => api.myRequests({ token: getUserToken() }) });
   const data = me.data;
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
-      <PageHero icon="💎" title="My Plan" subtitle="Your account dashboard" />
+      <PageHero icon="💎" title={t("menu.myplan")} subtitle={t("myplan.subtitle")} />
       <SectionCard className="flex items-center gap-4">
         <span className="flex h-14 w-14 shrink-0 items-center justify-center bg-[var(--accent)] text-2xl font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>
           {user.name.charAt(0).toUpperCase()}
@@ -4027,30 +4457,30 @@ function MyPlanPage({ user, onGoPlans }: { user: MeUser; onGoPlans: () => void }
           <p className="truncate text-sm text-[var(--dim)]">{user.email}</p>
         </div>
         <span className="ml-auto shrink-0">
-          <StatusPill tone={data?.plan ? "green" : "gray"} label={data?.plan ? data.plan.planName : "Free Plan"} />
+          <StatusPill tone={data?.plan ? "green" : "gray"} label={data?.plan ? data.plan.planName : t("plans.free_plan")} />
         </span>
       </SectionCard>
 
       {data?.ok && (
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-          <StatCard value={String(data.downloadsToday)} label="Downloads today" />
-          <StatCard value={String(data.downloadsTotal)} label="Total downloads" />
-          <StatCard value={data.plan ? String(data.plan.remaining) : data.freeDailyLimit === 0 ? "∞" : String(data.freeRemaining)} label="Downloads left" />
+          <StatCard value={String(data.downloadsToday)} label={t("myplan.downloads_today")} />
+          <StatCard value={String(data.downloadsTotal)} label={t("myplan.downloads_total")} />
+          <StatCard value={data.plan ? String(data.plan.remaining) : data.freeDailyLimit === 0 ? "∞" : String(data.freeRemaining)} label={t("myplan.downloads_left")} />
           <StatCard value={data.plan ? new Date(data.plan.expiresAt).toLocaleDateString() : data.freeDailyLimit === 0 ? "—" : `${data.freeDailyLimit}/day`} label={data.plan ? "Plan expires" : "Free daily limit"} />
         </div>
       )}
 
-      {me.isPending && <p className="text-sm text-[var(--dim)]">Loading…</p>}
+      {me.isPending && <p className="text-sm text-[var(--dim)]">{t("common.loading")}</p>}
       {data?.ok && data.plan && (
         <SectionCard>
-          <h2 className="text-lg font-extrabold">💎 {data.plan.planName} plan</h2>
+          <h2 className="text-lg font-extrabold">{t("myplan.plan_title", { plan: data.plan.planName })}</h2>
           <p className="mt-1 text-sm text-[var(--dim)]">
-            {formatPrice(data.plan.priceCents)} · {data.plan.durationDays} days · started {new Date(data.plan.startsAt).toLocaleDateString()}
+            {t("myplan.plan_meta", { price: formatPrice(data.plan.priceCents), days: String(data.plan.durationDays), date: new Date(data.plan.startsAt).toLocaleDateString() })}
           </p>
           <div className="mt-4">
             <div className="flex justify-between text-sm font-bold">
-              <span>{data.plan.limitUsed.toLocaleString()} of {data.plan.limitTotal.toLocaleString()} downloads used</span>
-              <span>{data.plan.remaining.toLocaleString()} left</span>
+              <span>{t("myplan.used", { used: data.plan.limitUsed.toLocaleString(), total: data.plan.limitTotal.toLocaleString() })}</span>
+              <span>{t("myplan.left", { remaining: data.plan.remaining.toLocaleString() })}</span>
             </div>
             <div className="mt-1 h-3 w-full overflow-hidden bg-[var(--surface-alt)]" style={{ borderRadius: 999 }}>
               <div
@@ -4060,7 +4490,7 @@ function MyPlanPage({ user, onGoPlans }: { user: MeUser; onGoPlans: () => void }
             </div>
           </div>
           <p className="mt-3 text-sm">
-            Expires on <strong>{new Date(data.plan.expiresAt).toLocaleDateString()}</strong> — or earlier, when the {data.plan.limitTotal.toLocaleString()} downloads are used up. After that you fall back to the free daily limit automatically.
+            {t("myplan.expires_text", { date: new Date(data.plan.expiresAt).toLocaleDateString(), total: data.plan.limitTotal.toLocaleString() })}
           </p>
           <button
             type="button"
@@ -4068,21 +4498,21 @@ function MyPlanPage({ user, onGoPlans }: { user: MeUser; onGoPlans: () => void }
             className="mt-4 bg-[var(--accent)] px-5 py-2.5 font-extrabold text-[var(--accent-ink)]"
             style={{ borderRadius: "var(--radius)" }}
           >
-            View all plans
+            {t("myplan.view_plans")}
           </button>
         </SectionCard>
       )}
       {data?.ok && !data.plan && (
         <SectionCard>
-          <h2 className="text-lg font-extrabold">Free plan</h2>
+          <h2 className="text-lg font-extrabold">{t("myplan.free_title")}</h2>
           <p className="mt-2 text-base">
-            You are on the free plan —{" "}
+            {t("myplan.free_prefix")}{" "}
             {data.freeDailyLimit === 0
-              ? "unlimited downloads today."
-              : `${data.freeRemaining} of ${data.freeDailyLimit} free downloads left today.`}
+              ? t("myplan.free_unlimited_text")
+              : t("myplan.free_left_text", { remaining: String(data.freeRemaining), limit: String(data.freeDailyLimit) })}
           </p>
           <p className="mt-2 text-sm text-[var(--dim)]">
-            Downloads today: {data.downloadsToday} · Total downloads: {data.downloadsTotal}. Need more than the daily limit? A monthly plan gives you up to 10,000 downloads.
+            {t("myplan.free_more", { today: String(data.downloadsToday), total: String(data.downloadsTotal) })}
           </p>
           <button
             type="button"
@@ -4090,22 +4520,22 @@ function MyPlanPage({ user, onGoPlans }: { user: MeUser; onGoPlans: () => void }
             className="mt-4 bg-[var(--accent)] px-5 py-2.5 font-extrabold text-[var(--accent-ink)]"
             style={{ borderRadius: "var(--radius)" }}
           >
-            See plans
+            {t("myplan.see_plans")}
           </button>
         </SectionCard>
       )}
 
       {requests.data && requests.data.requests.length > 0 && (
         <SectionCard>
-          <h2 className="text-lg font-extrabold">Your purchase requests</h2>
+          <h2 className="text-lg font-extrabold">{t("plans.requests_title")}</h2>
           <ul className="mt-3 flex flex-col gap-2">
             {requests.data.requests.map((r) => (
               <li key={r.id} className="flex flex-wrap items-center justify-between gap-2 border border-[var(--border)] p-3 text-sm" style={{ borderRadius: "var(--radius)" }}>
                 <span className="font-bold">{r.planName} — {formatPrice(r.priceCents)}</span>
-                {r.status === "pending" && <StatusPill tone="amber" label="⏳ Pending" />}
-                {r.status === "paid" && <StatusPill tone="green" label="✓ Paid" />}
-                {r.status === "activated" && <StatusPill tone="green" label="✓ Active" />}
-                {r.status === "rejected" && <StatusPill tone="red" label="✕ Rejected" />}
+                {r.status === "pending" && <StatusPill tone="amber" label={t("plans.status_pending")} />}
+                {r.status === "paid" && <StatusPill tone="green" label={t("plans.status_paid")} />}
+                {r.status === "activated" && <StatusPill tone="green" label={t("plans.status_active")} />}
+                {r.status === "rejected" && <StatusPill tone="red" label={t("plans.status_rejected")} />}
                 <span className="text-xs text-[var(--dim)]">{new Date(r.createdAt).toLocaleString()}</span>
               </li>
             ))}
@@ -4251,7 +4681,7 @@ function AdminPanel({ admin, onLoggedOut }: { admin: AdminUser; onLoggedOut: () 
             type="button"
             onClick={() => goTab(t.key)}
             aria-current={tab === t.key ? "page" : undefined}
-            className={`flex items-center gap-3 px-4 py-3 text-left text-base font-bold ${tab === t.key ? "cta-gradient text-[var(--accent-ink)] shadow-[0_8px_24px_rgba(0,233,154,0.30)]" : "text-[var(--admin-dim)] hover:bg-white/5 hover:text-white"}`}
+            className={`flex items-center gap-3 px-4 py-3 text-left text-base font-bold ${tab === t.key ? "cta-gradient text-[var(--accent-ink)] shadow-[0_8px_24px_rgba(0,233,154,0.30)]" : "text-[var(--admin-dim)] hover:bg-[var(--hover-bg)] hover:text-[var(--text)]"}`}
             style={{ borderRadius: 12 }}
           >
             <span aria-hidden="true" className="text-lg">{t.icon}</span>
@@ -4263,7 +4693,7 @@ function AdminPanel({ admin, onLoggedOut }: { admin: AdminUser; onLoggedOut: () 
         <button
           type="button"
           onClick={onLoggedOut}
-          className="flex w-full items-center gap-3 px-4 py-3 text-left text-base font-bold text-[var(--err-text)] hover:bg-white/5"
+          className="flex w-full items-center gap-3 px-4 py-3 text-left text-base font-bold text-[var(--err-text)] hover:bg-[var(--hover-bg)]"
           style={{ borderRadius: 12 }}
         >
           <span aria-hidden="true" className="text-lg">🚪</span> Logout
@@ -4292,7 +4722,7 @@ function AdminPanel({ admin, onLoggedOut }: { admin: AdminUser; onLoggedOut: () 
                 type="button"
                 onClick={() => setDrawerOpen(false)}
                 aria-label="Close menu"
-                className="flex h-10 w-10 items-center justify-center bg-white/5 text-lg font-bold"
+                className="flex h-10 w-10 items-center justify-center bg-[var(--hover-bg)] text-lg font-bold"
                 style={{ borderRadius: 10 }}
               >
                 ✕
@@ -4350,7 +4780,7 @@ function AdminPanel({ admin, onLoggedOut }: { admin: AdminUser; onLoggedOut: () 
                       type="button"
                       role="menuitem"
                       onClick={onLoggedOut}
-                      className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm font-bold text-[var(--err-text)] hover:bg-white/5"
+                      className="flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm font-bold text-[var(--err-text)] hover:bg-[var(--hover-bg)]"
                       style={{ borderRadius: 10 }}
                     >
                       🚪 Logout
@@ -4936,7 +5366,7 @@ function CustomersAdmin() {
                   type="button"
                   onClick={() => { setOpenId(openId === c.id ? null : c.id); setConfirmDeleteId(null); }}
                   aria-expanded={openId === c.id}
-                  className="border border-[var(--border)] px-4 py-2 text-sm font-bold hover:bg-white/5"
+                  className="border border-[var(--border)] px-4 py-2 text-sm font-bold hover:bg-[var(--hover-bg)]"
                   style={{ borderRadius: "var(--radius)" }}
                 >
                   {openId === c.id ? "Hide details ▲" : "View details ▼"}
@@ -5276,7 +5706,7 @@ function PlansAdmin() {
               <button
                 type="button"
                 onClick={() => startEdit(p)}
-                className="border border-[var(--border)] px-4 py-2 text-sm font-bold hover:bg-white/5"
+                className="border border-[var(--border)] px-4 py-2 text-sm font-bold hover:bg-[var(--hover-bg)]"
                 style={{ borderRadius: "var(--radius)" }}
               >
                 Edit
@@ -5284,7 +5714,7 @@ function PlansAdmin() {
               <button
                 type="button"
                 onClick={() => handleToggleActive(p)}
-                className="border border-[var(--border)] px-4 py-2 text-sm font-bold hover:bg-white/5"
+                className="border border-[var(--border)] px-4 py-2 text-sm font-bold hover:bg-[var(--hover-bg)]"
                 style={{ borderRadius: "var(--radius)" }}
               >
                 {p.active ? "Deactivate" : "Activate"}
@@ -5934,6 +6364,44 @@ function AdminSettings({ admin }: { admin: AdminUser }) {
 
   const initial = (admin.name?.trim()?.[0] ?? "A").toUpperCase();
 
+  // Phase 5 — SEO: the title/description/keywords served in the HTML
+  // meta tags and the sitemap. Stored in the settings table.
+  const seoSettings = useQuery({ queryKey: ["seo-settings"], queryFn: () => api.getSeoSettings({ token: getToken() }) });
+  const [seoTitle, setSeoTitle] = useState("");
+  const [seoDescription, setSeoDescription] = useState("");
+  const [seoKeywords, setSeoKeywords] = useState("");
+  const [seoMsg, setSeoMsg] = useState<string | null>(null);
+  const [seoError, setSeoError] = useState<string | null>(null);
+  const [seoBusy, setSeoBusy] = useState(false);
+  const seoInit = useRef(false);
+
+  useEffect(() => {
+    if (seoSettings.data && !seoInit.current) {
+      seoInit.current = true;
+      setSeoTitle(seoSettings.data.title);
+      setSeoDescription(seoSettings.data.description);
+      setSeoKeywords(seoSettings.data.keywords);
+    }
+  }, [seoSettings.data]);
+
+  async function handleSaveSeo() {
+    if (!seoTitle.trim()) {
+      setSeoError("Enter a site title.");
+      return;
+    }
+    setSeoError(null);
+    setSeoMsg(null);
+    setSeoBusy(true);
+    try {
+      await api.saveSeoSettings({ title: seoTitle.trim(), description: seoDescription.trim(), keywords: seoKeywords.trim(), token: getToken() });
+      setSeoMsg("SEO settings saved — the site title, meta description and sitemap now use the new text.");
+      queryClient.invalidateQueries({ queryKey: ["seo-settings"] });
+    } catch {
+      setSeoError("No response from the server. Please try again in a moment.");
+    }
+    setSeoBusy(false);
+  }
+
   return (
     <div className="flex flex-col gap-5">
       <AdminPageHead
@@ -5975,6 +6443,65 @@ function AdminSettings({ admin }: { admin: AdminUser }) {
         </div>
         {limitError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{limitError}</p>}
         {limitMsg && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{limitMsg}</p>}
+      </SectionCard>
+
+      <SectionCard className="bg-[var(--admin-card)]">
+        <h2 className="text-lg font-extrabold">SEO — search title & description</h2>
+        <p className="mt-1 text-sm text-[var(--admin-dim)]">
+          These words appear in Google search results and when the site is shared on social media. They are also used by the sitemap at /sitemap.xml. Keep the title under 60 characters and the description under 160.
+        </p>
+        <div className="mt-4 flex flex-col gap-3">
+          <div>
+            <label htmlFor="seo-title" className="text-sm font-bold">Site title</label>
+            <input
+              {...FIELDS.saveSeoSettings.title}
+              id="seo-title"
+              type="text"
+              value={seoTitle}
+              onChange={(e) => { setSeoTitle(e.target.value); if (seoError) setSeoError(null); }}
+              placeholder="Jimeng Video Downloader — No Watermark"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          <div>
+            <label htmlFor="seo-description" className="text-sm font-bold">Meta description</label>
+            <textarea
+              {...FIELDS.saveSeoSettings.description}
+              id="seo-description"
+              rows={3}
+              value={seoDescription}
+              onChange={(e) => { setSeoDescription(e.target.value); if (seoError) setSeoError(null); }}
+              placeholder="Download Jimeng AI videos without a watermark — free, no login required."
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          <div>
+            <label htmlFor="seo-keywords" className="text-sm font-bold">Keywords (comma-separated)</label>
+            <input
+              {...FIELDS.saveSeoSettings.keywords}
+              id="seo-keywords"
+              type="text"
+              value={seoKeywords}
+              onChange={(e) => { setSeoKeywords(e.target.value); if (seoError) setSeoError(null); }}
+              placeholder="jimeng downloader, jimeng video download, no watermark"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          {seoError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{seoError}</p>}
+          {seoMsg && <p className="text-sm font-semibold text-[var(--accent)]" role="status">{seoMsg}</p>}
+          <button
+            type="button"
+            disabled={seoBusy || seoSettings.isPending}
+            onClick={handleSaveSeo}
+            className="bg-[var(--accent)] px-4 py-2 text-sm font-extrabold text-[var(--accent-ink)] disabled:opacity-50 self-start"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {seoBusy ? "Saving…" : "Save SEO settings"}
+          </button>
+        </div>
       </SectionCard>
 
       <SectionCard className="bg-[var(--admin-card)]">
@@ -6854,7 +7381,7 @@ function ReportsAdmin() {
               {data.days.map((d: ReportDay) => (
                 <li key={d.date} className="flex items-center gap-3 text-sm">
                   <span className="w-24 shrink-0 font-bold text-[var(--admin-dim)]">{d.date}</span>
-                  <span className="h-5 min-w-0 flex-1 overflow-hidden rounded-full bg-white/5" aria-hidden="true">
+                  <span className="h-5 min-w-0 flex-1 overflow-hidden rounded-full bg-[var(--hover-bg)]" aria-hidden="true">
                     <span
                       className="block h-full rounded-full bg-[var(--accent)]"
                       style={{ width: `${Math.max(d.downloads > 0 ? 2 : 0, (d.downloads / maxDownloads) * 100)}%` }}

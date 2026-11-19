@@ -47,6 +47,51 @@
   --space-muted: var(--dim);
   --space-border: var(--border);
   --space-accent: var(--accent);
+  /* Hover wash for list rows / admin tabs (white on dark). */
+  --hover-bg: rgba(255, 255, 255, 0.05);
+}
+
+/* Phase 5 — light theme. Same green accent (darkened for contrast on
+   white), same glassmorphism, same radius. Applied by
+   <html data-theme="light">; the first-paint script in index.html sets
+   the attribute before CSS renders, so the page never flashes dark. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #edf2f6;
+  --surface: rgba(255, 255, 255, 0.86);
+  --surface-alt: rgba(214, 226, 235, 0.6);
+  --text: #0c1d2c;
+  --dim: #51687d;
+  --border: rgba(12, 45, 70, 0.16);
+  --accent: #009e6b;
+  --accent-2: #00875c;
+  --accent-ink: #ffffff;
+  --warn-bg: rgba(180, 110, 0, 0.12);
+  --warn-text: #92600a;
+  --err-bg: rgba(220, 38, 38, 0.10);
+  --err-text: #b91c1c;
+  --ad-border: rgba(12, 45, 70, 0.30);
+  --hover-bg: rgba(12, 45, 70, 0.06);
+  --admin-sidebar: #e6edf2;
+  --admin-card: #ffffff;
+  --admin-dim: #51687d;
+  --admin-accent-2: #00875c;
+}
+
+:root[data-theme="light"] body {
+  background:
+    radial-gradient(1100px 520px at 12% -8%, rgba(0, 158, 107, 0.10), transparent 60%),
+    radial-gradient(900px 460px at 88% -6%, rgba(0, 180, 216, 0.08), transparent 60%),
+    var(--bg);
+}
+
+:root[data-theme="light"] .glass {
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7), 0 8px 28px rgba(12, 45, 70, 0.12);
+}
+
+:root[data-theme="light"] ::selection {
+  background: rgba(0, 158, 107, 0.28);
+  color: #0c1d2c;
 }
 
 body {
