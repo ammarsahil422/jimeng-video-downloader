@@ -57,6 +57,42 @@ export type NotificationItem = {
   createdAt: string;
 };
 
+export type HelpArticleItem = {
+  id: number;
+  title: string;
+  body: string;
+  category: string;
+  createdAt: string;
+};
+
+export type TicketCategory =
+  | "billing"
+  | "download"
+  | "account"
+  | "problem"
+  | "other";
+
+export type TicketItem = {
+  id: number;
+  subject: string;
+  category: string;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type TicketMessageItem = {
+  id: number;
+  authorRole: string;
+  message: string;
+  createdAt: string;
+};
+
+export type AdminTicketItem = TicketItem & {
+  customerName: string;
+  customerEmail: string;
+};
+
 export type DownloadQualityPref = "best" | "original" | "720p" | "480p" | "360p";
 export type DownloadModePref = "single" | "bulk";
 
@@ -314,6 +350,77 @@ export interface Actions {
     token?: string;
     anonId?: string;
   }) => Promise<{ ok: true }>;
+  listHelpArticles: (args: Record<string, never>) => Promise<{
+    articles: HelpArticleItem[];
+  }>;
+  createHelpArticle: (args: {
+    title: string;
+    category: string;
+    body: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null; id: number | null }>;
+  updateHelpArticle: (args: {
+    id: number;
+    title?: string;
+    category?: string;
+    body?: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  deleteHelpArticle: (args: {
+    id: number;
+    token?: string;
+  }) => Promise<{ ok: true }>;
+  createTicket: (args: {
+    subject: string;
+    category: TicketCategory;
+    message: string;
+    link?: string;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ ok: boolean; error: string | null; ticketId: number | null }>;
+  listMyTickets: (args: {
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ tickets: TicketItem[] }>;
+  getTicket: (args: {
+    id: number;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{
+    ticket: TicketItem | null;
+    messages: TicketMessageItem[];
+  }>;
+  replyTicket: (args: {
+    id: number;
+    message: string;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  closeTicket: (args: {
+    id: number;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  listAllTickets: (args: { token?: string }) => Promise<{
+    tickets: AdminTicketItem[];
+  }>;
+  getAdminTicket: (args: {
+    id: number;
+    token?: string;
+  }) => Promise<{
+    ticket: AdminTicketItem | null;
+    messages: TicketMessageItem[];
+  }>;
+  replyTicketAdmin: (args: {
+    id: number;
+    message: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  setTicketStatus: (args: {
+    id: number;
+    status: "open" | "closed";
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
   logout: (args: { token?: string }) => Promise<{ ok: true }>;
   myRequests: (args: { token?: string }) => Promise<{
     requests: {

@@ -27,6 +27,10 @@ const FIELDS = {
   markNotificationRead: { id: {} },
   markAllNotificationsRead: {},
   deleteNotification: { id: {} },
+  createTicket: { subject: {}, message: {} },
+  replyTicket: { message: {} },
+  replyTicketAdmin: { message: {} },
+  createHelpArticle: { title: {}, category: {}, body: {} },
 } as const;
 
 type ResolveResult = ApiResponse<typeof api, "resolveLink">;
@@ -48,6 +52,12 @@ type View =
   | "whatis"
   | "howto"
   | "faq"
+  | "help"
+  | "tickets"
+  | "report"
+  | "terms"
+  | "copyright"
+  | "disclaimer"
   | "bulk"
   | "sora"
   | "about"
@@ -470,11 +480,17 @@ const MENU_ITEMS: { view: View; label: string; icon: string; badge?: string }[] 
   { view: "whatis", label: "What is Jimeng?", icon: "❓" },
   { view: "howto", label: "How to Use", icon: "📖" },
   { view: "faq", label: "FAQ", icon: "💬" },
+  { view: "help", label: "Help Center", icon: "🆘" },
+  { view: "tickets", label: "Support Tickets", icon: "🎫" },
+  { view: "report", label: "Report a Problem", icon: "⚠️" },
   { view: "bulk", label: "Bulk Download", icon: "📦" },
   { view: "sora", label: "Sora Downloader", icon: "🎬", badge: "Coming Soon" },
   { view: "contact", label: "Contact", icon: "✉️" },
   { view: "about", label: "About", icon: "ℹ️" },
   { view: "privacy", label: "Privacy Policy", icon: "🔒" },
+  { view: "terms", label: "Terms of Service", icon: "📜" },
+  { view: "copyright", label: "Copyright Policy", icon: "©️" },
+  { view: "disclaimer", label: "Disclaimer", icon: "⚖️" },
 ];
 
 /** Heart toggle for one history video. Shows the filled heart when the
@@ -1133,6 +1149,12 @@ export function App() {
         {view === "about" && <AboutPage />}
         {view === "privacy" && <PrivacyPage />}
         {view === "contact" && <ContactPage />}
+        {view === "help" && <HelpCenterPage />}
+        {view === "tickets" && <SupportTicketsPage />}
+        {view === "report" && <ReportProblemPage onTicketCreated={() => go("tickets")} />}
+        {view === "terms" && <TermsPage />}
+        {view === "copyright" && <CopyrightPage />}
+        {view === "disclaimer" && <DisclaimerPage />}
 
         <footer className="mt-10 border-t border-[var(--border)] pt-6 text-center">
           <BrandBanner />
@@ -1142,9 +1164,15 @@ export function App() {
             <button type="button" onClick={() => go("plans")} className="py-1">Plans</button>
             <button type="button" onClick={() => go("howto")} className="py-1">How to Use</button>
             <button type="button" onClick={() => go("faq")} className="py-1">FAQ</button>
+            <button type="button" onClick={() => go("help")} className="py-1">Help Center</button>
+            <button type="button" onClick={() => go("tickets")} className="py-1">Support Tickets</button>
+            <button type="button" onClick={() => go("report")} className="py-1">Report a Problem</button>
             <button type="button" onClick={() => go("bulk")} className="py-1">Bulk Download</button>
             <button type="button" onClick={() => go("about")} className="py-1">About</button>
             <button type="button" onClick={() => go("privacy")} className="py-1">Privacy Policy</button>
+            <button type="button" onClick={() => go("terms")} className="py-1">Terms of Service</button>
+            <button type="button" onClick={() => go("copyright")} className="py-1">Copyright Policy</button>
+            <button type="button" onClick={() => go("disclaimer")} className="py-1">Disclaimer</button>
             <button type="button" onClick={() => go("contact")} className="py-1">Contact</button>
           </nav>
           {/* Bottom banner ad slot (design: below the footer links) */}
@@ -1654,7 +1682,7 @@ function NotificationsPage() {
   });
   const items = notifications.data?.items ?? [];
   const unreadCount = notifications.data?.unreadCount ?? 0;
-  const typeIcon: Record<string, string> = { payment: "💳", plan: "💎", limit: "⚠️" };
+  const typeIcon: Record<string, string> = { payment: "💳", plan: "💎", limit: "⚠️", support: "🎫" };
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
@@ -1689,7 +1717,7 @@ function NotificationsPage() {
           <p className="text-6xl" aria-hidden="true">🔔</p>
           <h2 className="mt-4 text-xl font-extrabold">No notifications yet</h2>
           <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
-            You will see a notification here when a payment is received, a plan is activated or ends, or your free daily limit is reached.
+            You will see a notification here when a payment is received, a plan is activated or ends, your free daily limit is reached, or the admin replies to one of your support tickets.
           </p>
         </SectionCard>
       )}
@@ -3057,6 +3085,588 @@ function ContactPage() {
   );
 }
 
+/* -------------------------------------------------------------------------
+ * Help Center, Support Tickets, Report a Problem and the legal pages
+ * (Phase 3, master spec).
+ *
+ * The Help Center shows only articles stored in the database (seeded
+ * once with real articles; the admin manages them from Admin → Support)
+ * and the search box genuinely filters them. Support tickets work for
+ * logged-in customers (per account) and anonymous visitors (per
+ * browser), like History and Favourites. There is no email service on
+ * this site: ticket replies are delivered in-app, and the owner gets a
+ * notification when the admin replies.
+ * ------------------------------------------------------------------------- */
+
+const TICKET_CATEGORIES: { value: string; label: string }[] = [
+  { value: "billing", label: "Billing" },
+  { value: "download", label: "Download problem" },
+  { value: "account", label: "Account" },
+  { value: "other", label: "Other" },
+];
+
+const REPORT_ISSUES: { value: string; label: string }[] = [
+  { value: "Download failed", label: "Download failed" },
+  { value: "Wrong video", label: "Wrong video" },
+  { value: "Watermark in file", label: "Watermark in file" },
+  { value: "Limit problem", label: "Limit problem" },
+  { value: "Other", label: "Other" },
+];
+
+function ticketStatusPill(status: string) {
+  if (status === "open") return <StatusPill tone="amber" label="● Open" pulse />;
+  if (status === "answered") return <StatusPill tone="green" label="✓ Answered" />;
+  return <StatusPill tone="gray" label="Closed" />;
+}
+
+function HelpCenterPage() {
+  const [query, setQuery] = useState("");
+  const [openId, setOpenId] = useState<number | null>(null);
+  const articles = useQuery({ queryKey: ["help-articles"], queryFn: () => api.listHelpArticles({}) });
+  const all = articles.data?.articles ?? [];
+  const q = query.trim().toLowerCase();
+  const filtered = q
+    ? all.filter(
+        (a) =>
+          a.title.toLowerCase().includes(q) ||
+          a.body.toLowerCase().includes(q) ||
+          a.category.toLowerCase().includes(q),
+      )
+    : all;
+  const categories = [...new Set(all.map((a) => a.category))];
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="🆘" title="Help Center" subtitle="Answers about downloading, limits, plans and your account" />
+      <SectionCard>
+        <label htmlFor="help-search" className="text-sm font-bold">Search the Help Center</label>
+        <input
+          id="help-search"
+          aria-label="Search help articles"
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Type a question — e.g. “link not working”"
+          className="mt-2 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-base"
+          style={{ borderRadius: "var(--radius)" }}
+        />
+        {categories.length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-2">
+            {categories.map((c) => (
+              <button
+                key={c}
+                type="button"
+                onClick={() => setQuery(c)}
+                className="border border-[var(--border)] bg-[var(--surface-alt)] px-3 py-1.5 text-xs font-extrabold"
+                style={{ borderRadius: 999 }}
+              >
+                {c}
+              </button>
+            ))}
+          </div>
+        )}
+      </SectionCard>
+      {articles.isPending && (
+        <div className="flex flex-col gap-3">
+          <Skeleton className="h-16" />
+          <Skeleton className="h-16" />
+          <Skeleton className="h-16" />
+        </div>
+      )}
+      {articles.data && filtered.length === 0 && (
+        <SectionCard className="py-12 text-center">
+          <p className="text-6xl" aria-hidden="true">🔍</p>
+          <h2 className="mt-4 text-xl font-extrabold">No articles found</h2>
+          <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
+            Nothing matches “{query.trim()}”. Try different words, or open a support ticket and ask us directly.
+          </p>
+          {query.trim() && (
+            <button type="button" onClick={() => setQuery("")} className="mt-4 text-sm font-bold text-[var(--accent)]">
+              Show all articles
+            </button>
+          )}
+        </SectionCard>
+      )}
+      {filtered.length > 0 && (
+        <SectionCard>
+          <div className="flex flex-col">
+            {filtered.map((a, i) => (
+              <div key={a.id} className={i > 0 ? "border-t border-[var(--border)]" : ""}>
+                <button
+                  type="button"
+                  onClick={() => setOpenId(openId === a.id ? null : a.id)}
+                  aria-expanded={openId === a.id}
+                  className="flex w-full items-center justify-between gap-3 py-4 text-left"
+                >
+                  <span>
+                    <span className="block text-xs font-extrabold tracking-wide text-[var(--accent)] uppercase">{a.category}</span>
+                    <span className="mt-0.5 block text-base font-extrabold">{a.title}</span>
+                  </span>
+                  <span className={`flex h-7 w-7 shrink-0 items-center justify-center border text-lg font-bold ${openId === a.id ? "rotate-45 border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border)]"}`} style={{ borderRadius: 999 }}>+</span>
+                </button>
+                {openId === a.id && (
+                  <p className="animate-fade-up pb-4 text-base leading-relaxed text-[var(--dim)] whitespace-pre-line">{a.body}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        </SectionCard>
+      )}
+    </main>
+  );
+}
+
+function SupportTicketsPage() {
+  const queryClient = useQueryClient();
+  const [subject, setSubject] = useState("");
+  const [category, setCategory] = useState("download");
+  const [message, setMessage] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [reply, setReply] = useState("");
+  const [replyError, setReplyError] = useState<string | null>(null);
+
+  const tickets = useQuery({
+    queryKey: ["my-tickets"],
+    queryFn: () => api.listMyTickets({ token: getUserToken(), anonId: getAnonId() }),
+  });
+  const detail = useQuery({
+    queryKey: ["ticket", selectedId],
+    queryFn: () => api.getTicket({ id: selectedId!, token: getUserToken(), anonId: getAnonId() }),
+    enabled: selectedId !== null,
+  });
+
+  const createMut = useMutation({
+    mutationFn: () =>
+      api.createTicket({ subject: subject.trim(), category: category as "billing" | "download" | "account" | "problem" | "other", message: message.trim(), token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: (data) => {
+      if (data.ok && data.ticketId) {
+        setSubject("");
+        setMessage("");
+        setFormError(null);
+        queryClient.invalidateQueries({ queryKey: ["my-tickets"] });
+        setSelectedId(data.ticketId);
+      } else {
+        setFormError(data.error ?? "Could not open the ticket — please try again.");
+      }
+    },
+    onError: (error) => setFormError(error.message),
+  });
+  const replyMut = useMutation({
+    mutationFn: () => api.replyTicket({ id: selectedId!, message: reply.trim(), token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: (data) => {
+      if (data.ok) {
+        setReply("");
+        setReplyError(null);
+        queryClient.invalidateQueries({ queryKey: ["ticket", selectedId] });
+        queryClient.invalidateQueries({ queryKey: ["my-tickets"] });
+      } else {
+        setReplyError(data.error ?? "Could not send the reply — please try again.");
+      }
+    },
+    onError: (error) => setReplyError(error.message),
+  });
+  const closeMut = useMutation({
+    mutationFn: () => api.closeTicket({ id: selectedId!, token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: (data) => {
+      if (data.ok) {
+        setReplyError(null);
+        queryClient.invalidateQueries({ queryKey: ["ticket", selectedId] });
+        queryClient.invalidateQueries({ queryKey: ["my-tickets"] });
+      } else {
+        setReplyError(data.error ?? "Could not close the ticket — please try again.");
+      }
+    },
+    onError: (error) => setReplyError(error.message),
+  });
+
+  function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    if (!subject.trim() || !message.trim()) {
+      setFormError("Please fill in a subject and a message, then send.");
+      return;
+    }
+    setFormError(null);
+    createMut.mutate();
+  }
+
+  const items = tickets.data?.tickets ?? [];
+  const ticket = detail.data?.ticket ?? null;
+  const messages = detail.data?.messages ?? [];
+
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="🎫" title="Support Tickets" subtitle="Ask us anything — we reply here, and you get a notification" />
+      {selectedId === null ? (
+        <>
+          <SectionCard>
+            <h2 className="text-lg font-extrabold">Open a new ticket</h2>
+            <form className="mt-4 flex flex-col gap-3" onSubmit={handleCreate}>
+              <div>
+                <label htmlFor="ticket-subject" className="text-sm font-bold">Subject</label>
+                <input {...FIELDS.createTicket.subject} id="ticket-subject" aria-label="Ticket subject" value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="e.g. My download stopped at 90%" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+              </div>
+              <div>
+                <label htmlFor="ticket-category" className="text-sm font-bold">Category</label>
+                <select id="ticket-category" aria-label="Ticket category" value={category} onChange={(e) => setCategory(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }}>
+                  {TICKET_CATEGORIES.map((c) => (
+                    <option key={c.value} value={c.value}>{c.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label htmlFor="ticket-message" className="text-sm font-bold">Message</label>
+                <textarea {...FIELDS.createTicket.message} id="ticket-message" aria-label="Ticket message" value={message} onChange={(e) => setMessage(e.target.value)} rows={4} placeholder="Describe the problem — what happened, and which link it was about?" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+              </div>
+              {formError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{formError}</p>}
+              <button type="submit" disabled={createMut.isPending} className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+                {createMut.isPending ? "Opening…" : "Open ticket"}
+              </button>
+            </form>
+          </SectionCard>
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-extrabold">My tickets</h2>
+            <p className="text-sm font-bold text-[var(--dim)]">{tickets.data ? `${items.length} ticket${items.length === 1 ? "" : "s"}` : "Loading…"}</p>
+          </div>
+          {tickets.isPending && (
+            <div className="flex flex-col gap-3">
+              <Skeleton className="h-20" />
+              <Skeleton className="h-20" />
+            </div>
+          )}
+          {tickets.data && items.length === 0 && (
+            <SectionCard className="py-12 text-center">
+              <p className="text-6xl" aria-hidden="true">🎫</p>
+              <h2 className="mt-4 text-xl font-extrabold">No tickets yet</h2>
+              <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
+                Open a ticket above and the admin will reply here. You will also get a notification when a reply arrives.
+              </p>
+            </SectionCard>
+          )}
+          <ul className="flex flex-col gap-3">
+            {items.map((t) => (
+              <li key={t.id} className="glass card-hover border border-[var(--border)] bg-[var(--surface)] p-4" style={{ borderRadius: "var(--radius)" }}>
+                <button type="button" onClick={() => setSelectedId(t.id)} className="flex w-full flex-wrap items-center justify-between gap-2 text-left">
+                  <span className="min-w-0">
+                    <span className="block truncate text-base font-extrabold">#{t.id} — {t.subject}</span>
+                    <span className="mt-1 block text-xs text-[var(--dim)]">
+                      {TICKET_CATEGORIES.find((c) => c.value === t.category)?.label ?? t.category} · {new Date(t.createdAt).toLocaleString()}
+                    </span>
+                  </span>
+                  {ticketStatusPill(t.status)}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : (
+        <>
+          <button type="button" onClick={() => setSelectedId(null)} className="self-start text-sm font-bold text-[var(--accent)]">← Back to my tickets</button>
+          {detail.isPending && (
+            <div className="flex flex-col gap-3">
+              <Skeleton className="h-24" />
+              <Skeleton className="h-24" />
+            </div>
+          )}
+          {ticket && (
+            <>
+              <SectionCard>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h2 className="text-lg font-extrabold">#{ticket.id} — {ticket.subject}</h2>
+                  {ticketStatusPill(ticket.status)}
+                </div>
+                <p className="mt-1 text-xs text-[var(--dim)]">
+                  {TICKET_CATEGORIES.find((c) => c.value === ticket.category)?.label ?? ticket.category} · Opened {new Date(ticket.createdAt).toLocaleString()}
+                </p>
+              </SectionCard>
+              <ul className="flex flex-col gap-3">
+                {messages.map((m) => (
+                  <li
+                    key={m.id}
+                    className={`glass border bg-[var(--surface)] p-4 ${m.authorRole === "admin" ? "border-[rgba(0,233,154,0.45)]" : "border-[var(--border)]"}`}
+                    style={{ borderRadius: "var(--radius)" }}
+                  >
+                    <p className="text-xs font-extrabold tracking-wide text-[var(--accent)] uppercase">
+                      {m.authorRole === "admin" ? "🛡 Admin" : "👤 You"}
+                    </p>
+                    <p className="mt-1 text-base leading-relaxed whitespace-pre-line">{m.message}</p>
+                    <p className="mt-1 text-xs text-[var(--dim)]">{new Date(m.createdAt).toLocaleString()}</p>
+                  </li>
+                ))}
+              </ul>
+              {messages.length === 0 && (
+                <SectionCard className="py-8 text-center">
+                  <p className="text-sm text-[var(--dim)]">No messages in this ticket yet.</p>
+                </SectionCard>
+              )}
+              <SectionCard>
+                <h2 className="text-lg font-extrabold">Reply</h2>
+                <form
+                  className="mt-3 flex flex-col gap-3"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!reply.trim()) {
+                      setReplyError("Write a reply first.");
+                      return;
+                    }
+                    setReplyError(null);
+                    replyMut.mutate();
+                  }}
+                >
+                  <textarea
+                    {...FIELDS.replyTicket.message}
+                    aria-label="Your reply"
+                    value={reply}
+                    onChange={(e) => setReply(e.target.value)}
+                    rows={4}
+                    placeholder="Write your reply…"
+                    className="w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+                    style={{ borderRadius: "var(--radius)" }}
+                  />
+                  {replyError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{replyError}</p>}
+                  <div className="flex flex-wrap gap-2">
+                    <button type="submit" disabled={replyMut.isPending} className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+                      {replyMut.isPending ? "Sending…" : "Send reply"}
+                    </button>
+                    {ticket.status !== "closed" && (
+                      <button type="button" disabled={closeMut.isPending} onClick={() => closeMut.mutate()} className="border border-[rgba(248,113,113,0.5)] px-5 py-2.5 font-extrabold text-[var(--err-text)] disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+                        Close ticket
+                      </button>
+                    )}
+                  </div>
+                  {ticket.status === "closed" && (
+                    <p className="text-sm text-[var(--dim)]">This ticket is closed. Sending a reply reopens it.</p>
+                  )}
+                </form>
+              </SectionCard>
+            </>
+          )}
+          {!detail.isPending && !ticket && (
+            <SectionCard className="py-12 text-center">
+              <h2 className="text-xl font-extrabold">Ticket not found</h2>
+              <p className="mx-auto mt-2 max-w-sm text-sm text-[var(--dim)]">This ticket does not exist or belongs to another browser.</p>
+              <button type="button" onClick={() => setSelectedId(null)} className="mt-4 text-sm font-bold text-[var(--accent)]">Back to my tickets</button>
+            </SectionCard>
+          )}
+        </>
+      )}
+    </main>
+  );
+}
+
+function ReportProblemPage({ onTicketCreated }: { onTicketCreated: () => void }) {
+  const [issue, setIssue] = useState(REPORT_ISSUES[0]?.value ?? "Download failed");
+  const [description, setDescription] = useState("");
+  const [link, setLink] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+  const [createdId, setCreatedId] = useState<number | null>(null);
+  const queryClient = useQueryClient();
+
+  const createMut = useMutation({
+    mutationFn: () =>
+      api.createTicket({ subject: issue, category: "problem", message: description.trim(), link: link.trim() || undefined, token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: (data) => {
+      if (data.ok && data.ticketId) {
+        setCreatedId(data.ticketId);
+        setFormError(null);
+        setDescription("");
+        setLink("");
+        queryClient.invalidateQueries({ queryKey: ["my-tickets"] });
+      } else {
+        setFormError(data.error ?? "Could not send the report — please try again.");
+      }
+    },
+    onError: (error) => setFormError(error.message),
+  });
+
+  function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!description.trim()) {
+      setFormError("Please describe the problem, then send.");
+      return;
+    }
+    setFormError(null);
+    createMut.mutate();
+  }
+
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="⚠️" title="Report a Problem" subtitle="Tell us what went wrong — it opens a real support ticket" />
+      {createdId !== null ? (
+        <SectionCard className="py-10 text-center">
+          <p className="text-6xl" aria-hidden="true">✓</p>
+          <h2 className="mt-4 text-xl font-extrabold">Report received — ticket #{createdId}</h2>
+          <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
+            Your problem was saved as a support ticket. The admin will reply there, and you will get a notification when a reply arrives.
+          </p>
+          <button type="button" onClick={onTicketCreated} className="cta-gradient mt-5 px-6 py-3 font-extrabold" style={{ borderRadius: "var(--radius)" }}>
+            View my tickets
+          </button>
+        </SectionCard>
+      ) : (
+        <SectionCard>
+          <p className="text-base text-[var(--dim)]">Something failed, the wrong video came back, or a file still had a watermark? Describe it below — include the Jimeng link if you have it, so we can check the same video.</p>
+          <form className="mt-4 flex flex-col gap-3" onSubmit={handleSubmit}>
+            <div>
+              <label htmlFor="report-issue" className="text-sm font-bold">What went wrong?</label>
+              <select id="report-issue" aria-label="What went wrong" value={issue} onChange={(e) => setIssue(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }}>
+                {REPORT_ISSUES.map((r) => (
+                  <option key={r.value} value={r.value}>{r.label}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label htmlFor="report-description" className="text-sm font-bold">Description</label>
+              <textarea {...FIELDS.createTicket.message} id="report-description" aria-label="Problem description" value={description} onChange={(e) => setDescription(e.target.value)} rows={5} placeholder="What happened? What did you expect to happen?" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+            </div>
+            <div>
+              <label htmlFor="report-link" className="text-sm font-bold">Jimeng link (optional)</label>
+              <input id="report-link" aria-label="Jimeng link (optional)" value={link} onChange={(e) => setLink(e.target.value)} placeholder="https://jimeng.jianying.com/s/xxxxx" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+            </div>
+            {formError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{formError}</p>}
+            <button type="submit" disabled={createMut.isPending} className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+              {createMut.isPending ? "Sending…" : "Send report"}
+            </button>
+          </form>
+        </SectionCard>
+      )}
+    </main>
+  );
+}
+
+function TermsPage() {
+  const topics: { icon: string; title: string; body: string }[] = [
+    {
+      icon: "📜",
+      title: "Acceptance of these terms",
+      body: "By using Jimeng Video Downloader you agree to these Terms of Service. If you do not agree, please do not use the site. These terms may be updated over time; continued use after an update means you accept the new terms.",
+    },
+    {
+      icon: "⬇",
+      title: "What the service does",
+      body: "This site fetches the original video file from a public Jimeng AI (or Dreamina) share link you paste, and serves it back to you as an MP4 download. Downloading is free up to a daily limit set by the site owner; monthly plans give you a larger download quota. There is no payment gateway on the site yet — plan purchases are arranged with the admin through a purchase request.",
+    },
+    {
+      icon: "👤",
+      title: "Personal use only",
+      body: "Download videos for personal use only. You must only download your own videos, or public videos you are authorised to download. Do not repost someone else's video as your own, do not use downloaded videos commercially, and do not use this site to infringe anyone's rights.",
+    },
+    {
+      icon: "🔑",
+      title: "Accounts",
+      body: "Downloads need no account. An account is only needed to buy a monthly plan. You are responsible for keeping your password safe and for everything done with your account. The site owner may suspend an account that abuses the service, for example by trying to bypass the download limits.",
+    },
+    {
+      icon: "⚖️",
+      title: "Availability and liability",
+      body: "The service is provided “as is”, with no guarantee that it will always be available or that any particular link will work — Jimeng can change its site at any time, and some links (private drafts, deleted videos, expired share links) simply cannot be fetched. To the fullest extent allowed by law, the site owner is not liable for any loss or damage from using the service.",
+    },
+    {
+      icon: "🛡",
+      title: "Fair use",
+      body: "Do not abuse the service: no automated scraping, no attempts to bypass limits or security, and no use of the service for anything unlawful. Abuse may lead to your account or browser being blocked from downloading.",
+    },
+  ];
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="📜" title="Terms of Service" subtitle="The rules for using Jimeng Video Downloader" />
+      {topics.map((t) => (
+        <SectionCard key={t.title}>
+          <h2 className="flex items-center gap-2 text-lg font-extrabold">
+            <span aria-hidden="true">{t.icon}</span> {t.title}
+          </h2>
+          <p className="mt-2 text-base leading-relaxed">{t.body}</p>
+        </SectionCard>
+      ))}
+    </main>
+  );
+}
+
+function CopyrightPage() {
+  const topics: { icon: string; title: string; body: string }[] = [
+    {
+      icon: "©️",
+      title: "Who owns the videos",
+      body: "All video rights belong to their creators and to ByteDance / Jimeng AI. This site does not own any video it fetches, does not claim any rights over them, and is not affiliated with Jimeng or ByteDance.",
+    },
+    {
+      icon: "👤",
+      title: "Only download what you may use",
+      body: "Only download your own videos, or public videos you are authorised to download, and only for personal use. Do not repost someone else's video as your own, do not sell it, and do not use it in commercial content without the creator's permission.",
+    },
+    {
+      icon: "🚫",
+      title: "No watermark removal as a service",
+      body: "This tool fetches the original master file that Jimeng itself keeps for a published video. It does not strip, erase or alter any watermark from a video file — if a video's only available file carries a watermark, it is shown to you labelled “File with watermark”, never as a clean file.",
+    },
+    {
+      icon: "📩",
+      title: "Takedown requests",
+      body: "If you are a rights holder and believe a video should not be downloadable here, send a message through the Contact page with the video link, a description of your work, and proof that you own the rights. We will review the request and remove access to the video where appropriate. Please note that the video file itself is hosted by Jimeng, not by this site — for a full removal from the internet, the video must also be removed or made private on Jimeng.",
+    },
+    {
+      icon: "⚖️",
+      title: "Repeat infringement",
+      body: "Accounts or browsers that repeatedly download videos they have no right to use may be blocked from the service.",
+    },
+  ];
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="©️" title="Copyright Policy" subtitle="Respecting creators and their rights" />
+      {topics.map((t) => (
+        <SectionCard key={t.title}>
+          <h2 className="flex items-center gap-2 text-lg font-extrabold">
+            <span aria-hidden="true">{t.icon}</span> {t.title}
+          </h2>
+          <p className="mt-2 text-base leading-relaxed">{t.body}</p>
+        </SectionCard>
+      ))}
+    </main>
+  );
+}
+
+function DisclaimerPage() {
+  const topics: { icon: string; title: string; body: string }[] = [
+    {
+      icon: "ℹ️",
+      title: "No affiliation",
+      body: "Jimeng Video Downloader is an independent tool. It is not affiliated with, endorsed by, or connected to Jimeng AI, Dreamina, ByteDance, TikTok or CapCut in any way. “Jimeng”, “Dreamina” and “Seedance” are trademarks of their respective owners.",
+    },
+    {
+      icon: "⚠️",
+      title: "No guarantee",
+      body: "The service is provided “as is” and “as available”. We do not guarantee that the site will always work, that any particular link will resolve, or that a downloaded file will match what you expect. Jimeng may change its website or links at any time, and private, deleted or expired links cannot be fetched.",
+    },
+    {
+      icon: "📦",
+      title: "Files come from Jimeng",
+      body: "Downloaded files are the original files Jimeng keeps for a published video, fetched through its public share link. This site does not create, edit or re-encode the videos, and does not check whether a video is appropriate, lawful or correctly labelled — that is the responsibility of the person who created and published it.",
+    },
+    {
+      icon: "👤",
+      title: "Your responsibility",
+      body: "You are responsible for how you use downloaded videos. Download only videos you are allowed to download, use them for personal use only, and follow the Terms of Service and the Copyright Policy.",
+    },
+    {
+      icon: "🔗",
+      title: "Third-party links",
+      body: "This site links to Jimeng and may show third-party advertising. We are not responsible for the content, availability or privacy practices of third-party sites.",
+    },
+  ];
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="⚖️" title="Disclaimer" subtitle="What this site is — and is not — responsible for" />
+      {topics.map((t) => (
+        <SectionCard key={t.title}>
+          <h2 className="flex items-center gap-2 text-lg font-extrabold">
+            <span aria-hidden="true">{t.icon}</span> {t.title}
+          </h2>
+          <p className="mt-2 text-base leading-relaxed">{t.body}</p>
+        </SectionCard>
+      ))}
+    </main>
+  );
+}
+
 function formatPrice(cents: number): string {
   return `$${(cents / 100).toFixed(2)}`;
 }
@@ -3521,12 +4131,13 @@ function AdminPagination({ page, totalPages, onPage }: { page: number; totalPage
   );
 }
 
-type AdminTab = "dashboard" | "customers" | "plans" | "payments" | "ads" | "apikey" | "settings";
+type AdminTab = "dashboard" | "customers" | "plans" | "payments" | "ads" | "apikey" | "settings" | "support";
 
-/** The admin sidebar has exactly these items — the reference image shows
- *  extra routes (Video Analytics, Revenue Reports, Notifications, Support
- *  Tickets, Backup & Restore, Premium upsell…); none of those exist in
- *  this system, so none are added here. */
+/** The admin sidebar has exactly these items. The reference image shows
+ *  extra routes (Video Analytics, Revenue Reports, Notifications,
+ *  Backup & Restore, Premium upsell…); none of those exist in this
+ *  system, so none are added here. "Support" is real: it holds support
+ *  ticket management and Help Center article management (Phase 3). */
 const ADMIN_NAV: { key: AdminTab; label: string; icon: string }[] = [
   { key: "dashboard", label: "Dashboard", icon: "📊" },
   { key: "customers", label: "Customers", icon: "👥" },
@@ -3534,6 +4145,7 @@ const ADMIN_NAV: { key: AdminTab; label: string; icon: string }[] = [
   { key: "payments", label: "Payments", icon: "💳" },
   { key: "ads", label: "Ads", icon: "📢" },
   { key: "apikey", label: "API Key", icon: "🔑" },
+  { key: "support", label: "Support", icon: "🎫" },
   { key: "settings", label: "Settings", icon: "⚙️" },
 ];
 
@@ -3708,6 +4320,7 @@ function AdminPanel({ admin, onLoggedOut }: { admin: AdminUser; onLoggedOut: () 
           {tab === "payments" && <PaymentsAdmin />}
           {tab === "ads" && <AdsSetup settings={settings.data} />}
           {tab === "apikey" && <ApiKeyBox settings={settings.data} />}
+          {tab === "support" && <SupportAdmin />}
           {tab === "settings" && <AdminSettings admin={admin} />}
         </main>
 
@@ -5314,5 +5927,413 @@ function AdminSettings({ admin }: { admin: AdminUser }) {
         </form>
       </SectionCard>
     </div>
+  );
+}
+
+const SUPPORT_TICKETS_PAGE_SIZE = 10;
+
+/** Admin → Support: support ticket management + Help Center article
+ *  management. Tickets are real user-created rows; replies go to the
+ *  owner in-app (a "support" notification) — there is no email service
+ *  on this site, so nothing is emailed. */
+function SupportAdmin() {
+  const queryClient = useQueryClient();
+  const [sub, setSub] = useState<"tickets" | "articles">("tickets");
+  const [statusFilter, setStatusFilter] = useState<"all" | "open" | "answered" | "closed">("open");
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [selectedId, setSelectedId] = useState<number | null>(null);
+  const [reply, setReply] = useState("");
+  const [replyError, setReplyError] = useState<string | null>(null);
+
+  const tickets = useQuery({
+    queryKey: ["admin-tickets"],
+    queryFn: () => api.listAllTickets({ token: getToken() }),
+  });
+  const detail = useQuery({
+    queryKey: ["admin-ticket", selectedId],
+    queryFn: () => api.getAdminTicket({ id: selectedId!, token: getToken() }),
+    enabled: selectedId !== null,
+  });
+  const articles = useQuery({
+    queryKey: ["help-articles"],
+    queryFn: () => api.listHelpArticles({}),
+  });
+
+  const replyMut = useMutation({
+    mutationFn: () => api.replyTicketAdmin({ id: selectedId!, message: reply.trim(), token: getToken() }),
+    onSuccess: (data) => {
+      if (data.ok) {
+        setReply("");
+        setReplyError(null);
+        queryClient.invalidateQueries({ queryKey: ["admin-ticket", selectedId] });
+        queryClient.invalidateQueries({ queryKey: ["admin-tickets"] });
+      } else {
+        setReplyError(data.error ?? "Could not send the reply — please try again.");
+      }
+    },
+    onError: (error) => setReplyError(error.message),
+  });
+  const statusMut = useMutation({
+    mutationFn: (status: "open" | "closed") => api.setTicketStatus({ id: selectedId!, status, token: getToken() }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["admin-ticket", selectedId] });
+      queryClient.invalidateQueries({ queryKey: ["admin-tickets"] });
+    },
+  });
+
+  const all = tickets.data?.tickets ?? [];
+  const q = search.trim().toLowerCase();
+  const filtered = all.filter(
+    (t) =>
+      (statusFilter === "all" || t.status === statusFilter) &&
+      (!q ||
+        t.subject.toLowerCase().includes(q) ||
+        t.customerName.toLowerCase().includes(q) ||
+        t.customerEmail.toLowerCase().includes(q)),
+  );
+  const totalPages = Math.max(1, Math.ceil(filtered.length / SUPPORT_TICKETS_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const pageItems = filtered.slice((safePage - 1) * SUPPORT_TICKETS_PAGE_SIZE, safePage * SUPPORT_TICKETS_PAGE_SIZE);
+  const openCount = all.filter((t) => t.status === "open").length;
+  const ticket = detail.data?.ticket ?? null;
+  const messages = detail.data?.messages ?? [];
+
+  return (
+    <div className="flex flex-col gap-5">
+      <AdminPageHead icon="🎫" title="Support" subtitle="Answer support tickets and manage the Help Center articles." />
+      <div className="flex flex-wrap gap-2">
+        <button
+          type="button"
+          onClick={() => setSub("tickets")}
+          className={`px-4 py-2 text-sm font-extrabold ${sub === "tickets" ? "cta-gradient" : "border border-[var(--border)] bg-[var(--surface)]"}`}
+          style={{ borderRadius: "var(--radius)" }}
+        >
+          Tickets{openCount > 0 ? ` (${openCount} open)` : ""}
+        </button>
+        <button
+          type="button"
+          onClick={() => setSub("articles")}
+          className={`px-4 py-2 text-sm font-extrabold ${sub === "articles" ? "cta-gradient" : "border border-[var(--border)] bg-[var(--surface)]"}`}
+          style={{ borderRadius: "var(--radius)" }}
+        >
+          Help articles
+        </button>
+      </div>
+
+      {sub === "tickets" && selectedId === null && (
+        <>
+          <SectionCard>
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+              <div className="min-w-0 flex-1">
+                <label htmlFor="admin-ticket-search" className="text-sm font-bold">Search tickets</label>
+                <input
+                  id="admin-ticket-search"
+                  aria-label="Search tickets"
+                  type="search"
+                  value={search}
+                  onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+                  placeholder="Subject, customer name or email…"
+                  className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+                  style={{ borderRadius: "var(--radius)" }}
+                />
+              </div>
+              <div>
+                <label htmlFor="admin-ticket-status" className="text-sm font-bold">Status</label>
+                <select
+                  id="admin-ticket-status"
+                  aria-label="Filter by status"
+                  value={statusFilter}
+                  onChange={(e) => { setStatusFilter(e.target.value as "all" | "open" | "answered" | "closed"); setPage(1); }}
+                  className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2 sm:w-40"
+                  style={{ borderRadius: "var(--radius)" }}
+                >
+                  <option value="open">Open</option>
+                  <option value="answered">Answered</option>
+                  <option value="closed">Closed</option>
+                  <option value="all">All</option>
+                </select>
+              </div>
+            </div>
+            <p className="mt-3 text-sm font-bold text-[var(--admin-dim)]">
+              {tickets.data ? `${filtered.length} ticket${filtered.length === 1 ? "" : "s"} · ${openCount} open` : "Loading…"}
+            </p>
+          </SectionCard>
+          {tickets.isPending && (
+            <div className="flex flex-col gap-3">
+              <Skeleton className="h-20" />
+              <Skeleton className="h-20" />
+            </div>
+          )}
+          {tickets.data && filtered.length === 0 && (
+            <SectionCard className="py-12 text-center">
+              <p className="text-6xl" aria-hidden="true">🎫</p>
+              <h2 className="mt-4 text-xl font-extrabold">No tickets here</h2>
+              <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--admin-dim)]">
+                {statusFilter === "open" ? "No open tickets — everything is answered or closed." : "No tickets match this filter."}
+              </p>
+            </SectionCard>
+          )}
+          <ul className="flex flex-col gap-3">
+            {pageItems.map((t) => (
+              <li key={t.id} className="glass card-hover border border-[var(--border)] bg-[var(--surface)] p-4" style={{ borderRadius: "var(--radius)" }}>
+                <button type="button" onClick={() => setSelectedId(t.id)} className="flex w-full flex-wrap items-center justify-between gap-2 text-left">
+                  <span className="min-w-0">
+                    <span className="block truncate text-base font-extrabold">#{t.id} — {t.subject}</span>
+                    <span className="mt-1 block text-xs text-[var(--admin-dim)]">
+                      {t.customerName}{t.customerEmail ? ` · ${t.customerEmail}` : ""} · {TICKET_CATEGORIES.find((c) => c.value === t.category)?.label ?? t.category} · {new Date(t.createdAt).toLocaleString()}
+                    </span>
+                  </span>
+                  {ticketStatusPill(t.status)}
+                </button>
+              </li>
+            ))}
+          </ul>
+          <AdminPagination page={safePage} totalPages={totalPages} onPage={setPage} />
+        </>
+      )}
+
+      {sub === "tickets" && selectedId !== null && (
+        <>
+          <button type="button" onClick={() => setSelectedId(null)} className="self-start text-sm font-bold text-[var(--accent)]">← Back to tickets</button>
+          {detail.isPending && (
+            <div className="flex flex-col gap-3">
+              <Skeleton className="h-24" />
+              <Skeleton className="h-24" />
+            </div>
+          )}
+          {ticket && (
+            <>
+              <SectionCard>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h2 className="text-lg font-extrabold">#{ticket.id} — {ticket.subject}</h2>
+                  {ticketStatusPill(ticket.status)}
+                </div>
+                <p className="mt-1 text-xs text-[var(--admin-dim)]">
+                  {ticket.customerName}{ticket.customerEmail ? ` · ${ticket.customerEmail}` : ""} · {TICKET_CATEGORIES.find((c) => c.value === ticket.category)?.label ?? ticket.category} · Opened {new Date(ticket.createdAt).toLocaleString()}
+                </p>
+              </SectionCard>
+              <ul className="flex flex-col gap-3">
+                {messages.map((m) => (
+                  <li
+                    key={m.id}
+                    className={`glass border bg-[var(--surface)] p-4 ${m.authorRole === "admin" ? "border-[rgba(0,233,154,0.45)]" : "border-[var(--border)]"}`}
+                    style={{ borderRadius: "var(--radius)" }}
+                  >
+                    <p className="text-xs font-extrabold tracking-wide text-[var(--accent)] uppercase">
+                      {m.authorRole === "admin" ? "🛡 Admin" : "👤 Customer"}
+                    </p>
+                    <p className="mt-1 text-base leading-relaxed whitespace-pre-line">{m.message}</p>
+                    <p className="mt-1 text-xs text-[var(--admin-dim)]">{new Date(m.createdAt).toLocaleString()}</p>
+                  </li>
+                ))}
+              </ul>
+              <SectionCard>
+                <h2 className="text-lg font-extrabold">Reply as admin</h2>
+                <p className="mt-1 text-sm text-[var(--admin-dim)]">The customer is notified in-app when you reply — no email is sent.</p>
+                <form
+                  className="mt-3 flex flex-col gap-3"
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    if (!reply.trim()) {
+                      setReplyError("Write a reply first.");
+                      return;
+                    }
+                    setReplyError(null);
+                    replyMut.mutate();
+                  }}
+                >
+                  <textarea
+                    {...FIELDS.replyTicketAdmin.message}
+                    aria-label="Admin reply"
+                    value={reply}
+                    onChange={(e) => setReply(e.target.value)}
+                    rows={4}
+                    placeholder="Write your reply…"
+                    className="w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+                    style={{ borderRadius: "var(--radius)" }}
+                  />
+                  {replyError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{replyError}</p>}
+                  <div className="flex flex-wrap gap-2">
+                    <button type="submit" disabled={replyMut.isPending} className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+                      {replyMut.isPending ? "Sending…" : "Send reply"}
+                    </button>
+                    {ticket.status !== "closed" ? (
+                      <button type="button" disabled={statusMut.isPending} onClick={() => statusMut.mutate("closed")} className="border border-[rgba(248,113,113,0.5)] px-5 py-2.5 font-extrabold text-[var(--err-text)] disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+                        Close ticket
+                      </button>
+                    ) : (
+                      <button type="button" disabled={statusMut.isPending} onClick={() => statusMut.mutate("open")} className="border border-[var(--accent)] px-5 py-2.5 font-extrabold text-[var(--accent)] disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+                        Reopen ticket
+                      </button>
+                    )}
+                  </div>
+                </form>
+              </SectionCard>
+            </>
+          )}
+          {!detail.isPending && !ticket && (
+            <SectionCard className="py-12 text-center">
+              <h2 className="text-xl font-extrabold">Ticket not found</h2>
+              <button type="button" onClick={() => setSelectedId(null)} className="mt-4 text-sm font-bold text-[var(--accent)]">Back to tickets</button>
+            </SectionCard>
+          )}
+        </>
+      )}
+
+      {sub === "articles" && <HelpArticlesAdmin articles={articles.data?.articles ?? []} loading={articles.isPending} />}
+    </div>
+  );
+}
+
+function HelpArticlesAdmin({ articles, loading }: { articles: { id: number; title: string; body: string; category: string }[]; loading: boolean }) {
+  const queryClient = useQueryClient();
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [title, setTitle] = useState("");
+  const [category, setCategory] = useState("General");
+  const [body, setBody] = useState("");
+  const [formError, setFormError] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<number | null>(null);
+
+  const createMut = useMutation({
+    mutationFn: () => api.createHelpArticle({ title: title.trim(), category: category.trim() || "General", body: body.trim(), token: getToken() }),
+    onSuccess: (data) => {
+      if (data.ok) {
+        resetForm();
+        queryClient.invalidateQueries({ queryKey: ["help-articles"] });
+      } else {
+        setFormError(data.error ?? "Could not save the article — please try again.");
+      }
+    },
+    onError: (error) => setFormError(error.message),
+  });
+  const updateMut = useMutation({
+    mutationFn: () => api.updateHelpArticle({ id: editingId!, title: title.trim(), category: category.trim() || "General", body: body.trim(), token: getToken() }),
+    onSuccess: (data) => {
+      if (data.ok) {
+        resetForm();
+        queryClient.invalidateQueries({ queryKey: ["help-articles"] });
+      } else {
+        setFormError(data.error ?? "Could not save the article — please try again.");
+      }
+    },
+    onError: (error) => setFormError(error.message),
+  });
+  const deleteMut = useMutation({
+    mutationFn: (id: number) => api.deleteHelpArticle({ id, token: getToken() }),
+    onSuccess: () => {
+      setDeletingId(null);
+      queryClient.invalidateQueries({ queryKey: ["help-articles"] });
+    },
+  });
+
+  function resetForm() {
+    setEditingId(null);
+    setTitle("");
+    setCategory("General");
+    setBody("");
+    setFormError(null);
+  }
+
+  function startEdit(a: { id: number; title: string; body: string; category: string }) {
+    setEditingId(a.id);
+    setTitle(a.title);
+    setCategory(a.category);
+    setBody(a.body);
+    setFormError(null);
+  }
+
+  return (
+    <>
+      <SectionCard>
+        <h2 className="text-lg font-extrabold">{editingId === null ? "Add a Help Center article" : `Edit article #${editingId}`}</h2>
+        <form
+          className="mt-4 flex flex-col gap-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (!title.trim() || !body.trim()) {
+              setFormError("Please fill in a title and a body, then save.");
+              return;
+            }
+            setFormError(null);
+            if (editingId === null) createMut.mutate();
+            else updateMut.mutate();
+          }}
+        >
+          <div>
+            <label htmlFor="article-title" className="text-sm font-bold">Title</label>
+            <input {...FIELDS.createHelpArticle.title} id="article-title" aria-label="Article title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. How do I download a video?" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+          </div>
+          <div>
+            <label htmlFor="article-category" className="text-sm font-bold">Category</label>
+            <input {...FIELDS.createHelpArticle.category} id="article-category" aria-label="Article category" value={category} onChange={(e) => setCategory(e.target.value)} placeholder="General" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+          </div>
+          <div>
+            <label htmlFor="article-body" className="text-sm font-bold">Body</label>
+            <textarea {...FIELDS.createHelpArticle.body} id="article-body" aria-label="Article body" value={body} onChange={(e) => setBody(e.target.value)} rows={8} placeholder="Write the article…" className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+          </div>
+          {formError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{formError}</p>}
+          <div className="flex flex-wrap gap-2">
+            <button type="submit" disabled={createMut.isPending || updateMut.isPending} className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+              {editingId === null ? (createMut.isPending ? "Adding…" : "Add article") : (updateMut.isPending ? "Saving…" : "Save changes")}
+            </button>
+            {editingId !== null && (
+              <button type="button" onClick={resetForm} className="border border-[var(--border)] px-5 py-2.5 font-extrabold disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
+                Cancel
+              </button>
+            )}
+          </div>
+        </form>
+      </SectionCard>
+      <div className="flex items-center justify-between">
+        <h2 className="text-lg font-extrabold">Articles</h2>
+        <p className="text-sm font-bold text-[var(--admin-dim)]">{loading ? "Loading…" : `${articles.length} article${articles.length === 1 ? "" : "s"}`}</p>
+      </div>
+      {loading && (
+        <div className="flex flex-col gap-3">
+          <Skeleton className="h-20" />
+          <Skeleton className="h-20" />
+        </div>
+      )}
+      {!loading && articles.length === 0 && (
+        <SectionCard className="py-12 text-center">
+          <p className="text-6xl" aria-hidden="true">📖</p>
+          <h2 className="mt-4 text-xl font-extrabold">No articles yet</h2>
+          <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--admin-dim)]">Add the first article above — the Help Center shows only articles stored here.</p>
+        </SectionCard>
+      )}
+      <ul className="flex flex-col gap-3">
+        {articles.map((a) => (
+          <li key={a.id} className="glass border border-[var(--border)] bg-[var(--surface)] p-4" style={{ borderRadius: "var(--radius)" }}>
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-xs font-extrabold tracking-wide text-[var(--accent)] uppercase">{a.category}</p>
+                <p className="mt-0.5 text-base font-extrabold">{a.title}</p>
+                <p className="mt-1 line-clamp-2 text-sm text-[var(--admin-dim)]">{a.body}</p>
+              </div>
+              <div className="flex shrink-0 gap-2">
+                <button type="button" onClick={() => startEdit(a)} className="border border-[var(--border)] px-3 py-1.5 text-xs font-extrabold" style={{ borderRadius: 8 }}>
+                  Edit
+                </button>
+                {deletingId === a.id ? (
+                  <>
+                    <button type="button" disabled={deleteMut.isPending} onClick={() => deleteMut.mutate(a.id)} className="border border-[rgba(248,113,113,0.5)] px-3 py-1.5 text-xs font-extrabold text-[var(--err-text)] disabled:opacity-50" style={{ borderRadius: 8 }}>
+                      Confirm delete
+                    </button>
+                    <button type="button" onClick={() => setDeletingId(null)} className="border border-[var(--border)] px-3 py-1.5 text-xs font-extrabold" style={{ borderRadius: 8 }}>
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button type="button" onClick={() => setDeletingId(a.id)} className="border border-[rgba(248,113,113,0.5)] px-3 py-1.5 text-xs font-extrabold text-[var(--err-text)]" style={{ borderRadius: 8 }}>
+                    Delete
+                  </button>
+                )}
+              </div>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </>
   );
 }
