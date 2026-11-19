@@ -113,3 +113,47 @@ CREATE TABLE IF NOT EXISTS download_events (
 -- added here: SQLite has no ADD COLUMN IF NOT EXISTS, so db.ts adds them
 -- (guarded by a PRAGMA table_info check) at Store startup, so existing
 -- databases created before this change keep working.
+
+-- Phase 2 (master spec, ported from the artifact's drizzle/0005
+-- migration): favourites, per-account download settings and the
+-- notification centre. Notifications are created ONLY by real server
+-- events (payment received, plan activated/expired/exhausted, daily
+-- limit reached) — never seeded or faked.
+CREATE TABLE IF NOT EXISTS favorites (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  download_id INTEGER NOT NULL,
+  user_id INTEGER,
+  anon_id TEXT,
+  owner_key TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '',
+  cover_url TEXT,
+  video_url TEXT NOT NULL,
+  quality_label TEXT NOT NULL DEFAULT '',
+  source_url TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS favorites_owner_download_idx
+  ON favorites (owner_key, download_id);
+
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER PRIMARY KEY,
+  default_quality TEXT NOT NULL DEFAULT 'best',
+  default_mode TEXT NOT NULL DEFAULT 'single',
+  updated_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id INTEGER,
+  anon_id TEXT,
+  owner_key TEXT NOT NULL,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  read INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS notifications_owner_idx
+  ON notifications (owner_key, created_at);

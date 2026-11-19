@@ -87,6 +87,41 @@ export type SessionRow = {
   createdAt: Date;
 };
 
+// Phase 2 — favourites, per-account download settings, notifications.
+
+export type FavoriteRow = {
+  id: number;
+  downloadId: number;
+  userId: number | null;
+  anonId: string | null;
+  ownerKey: string;
+  title: string;
+  coverUrl: string | null;
+  videoUrl: string;
+  qualityLabel: string;
+  sourceUrl: string;
+  createdAt: Date;
+};
+
+export type UserSettingsRow = {
+  userId: number;
+  defaultQuality: string;
+  defaultMode: string;
+  updatedAt: Date;
+};
+
+export type NotificationRow = {
+  id: number;
+  userId: number | null;
+  anonId: string | null;
+  ownerKey: string;
+  type: string;
+  title: string;
+  message: string;
+  read: boolean;
+  createdAt: Date;
+};
+
 type UserRaw = {
   id: number;
   name: string;
@@ -956,5 +991,306 @@ export class Store {
       )
       .all(sinceMs) as { day: string; n: number }[];
     return rows.map((r) => ({ day: r.day, n: Number(r.n) }));
+  }
+
+  // -- Phase 2: favourites, download settings, notifications --------------
+  // Owner key is one text key per account ("user:<id>") or anonymous
+  // browser ("anon:<browser id>"), so the same scoping works for
+  // logged-in and anonymous visitors.
+
+  getDownloadById(id: number): DownloadRow | null {
+    const row = this.db
+      .query(
+        "SELECT id, source_url, title, video_url, cover_url, user_id, anon_id, created_at " +
+          "FROM downloads WHERE id = ? LIMIT 1",
+      )
+      .get(id) as {
+      id: number;
+      source_url: string;
+      title: string;
+      video_url: string;
+      cover_url: string | null;
+      user_id: number | null;
+      anon_id: string | null;
+      created_at: number;
+    } | null;
+    return row ? this.toDownloadRow(row) : null;
+  }
+
+  private toFavoriteRow(r: {
+    id: number;
+    download_id: number;
+    user_id: number | null;
+    anon_id: string | null;
+    owner_key: string;
+    title: string;
+    cover_url: string | null;
+    video_url: string;
+    quality_label: string;
+    source_url: string;
+    created_at: number;
+  }): FavoriteRow {
+    return {
+      id: r.id,
+      downloadId: r.download_id,
+      userId: r.user_id,
+      anonId: r.anon_id,
+      ownerKey: r.owner_key,
+      title: r.title,
+      coverUrl: r.cover_url,
+      videoUrl: r.video_url,
+      qualityLabel: r.quality_label,
+      sourceUrl: r.source_url,
+      createdAt: new Date(r.created_at),
+    };
+  }
+
+  insertFavorite(row: {
+    downloadId: number;
+    userId: number | null;
+    anonId: string | null;
+    ownerKey: string;
+    title: string;
+    coverUrl: string | null;
+    videoUrl: string;
+    qualityLabel: string;
+    sourceUrl: string;
+  }): number {
+    const info = this.db
+      .query(
+        "INSERT INTO favorites (download_id, user_id, anon_id, owner_key, title, cover_url, video_url, quality_label, source_url, created_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run(
+        row.downloadId,
+        row.userId,
+        row.anonId,
+        row.ownerKey,
+        row.title,
+        row.coverUrl,
+        row.videoUrl,
+        row.qualityLabel,
+        row.sourceUrl,
+        Date.now(),
+      );
+    return Number(info.lastInsertRowid);
+  }
+
+  findFavorite(ownerKey: string, downloadId: number): FavoriteRow | null {
+    const row = this.db
+      .query(
+        "SELECT * FROM favorites WHERE owner_key = ? AND download_id = ? LIMIT 1",
+      )
+      .get(ownerKey, downloadId) as {
+      id: number;
+      download_id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      owner_key: string;
+      title: string;
+      cover_url: string | null;
+      video_url: string;
+      quality_label: string;
+      source_url: string;
+      created_at: number;
+    } | null;
+    return row ? this.toFavoriteRow(row) : null;
+  }
+
+  listFavorites(ownerKey: string, limit: number): FavoriteRow[] {
+    const rows = this.db
+      .query(
+        "SELECT * FROM favorites WHERE owner_key = ? ORDER BY id DESC LIMIT ?",
+      )
+      .all(ownerKey, limit) as {
+      id: number;
+      download_id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      owner_key: string;
+      title: string;
+      cover_url: string | null;
+      video_url: string;
+      quality_label: string;
+      source_url: string;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toFavoriteRow(r));
+  }
+
+  deleteFavoriteById(id: number, ownerKey: string): void {
+    this.db
+      .query("DELETE FROM favorites WHERE id = ? AND owner_key = ?")
+      .run(id, ownerKey);
+  }
+
+  deleteFavoritesForDownload(downloadId: number): void {
+    this.db
+      .query("DELETE FROM favorites WHERE download_id = ?")
+      .run(downloadId);
+  }
+
+  deleteFavoritesForUser(userId: number): void {
+    this.db.query("DELETE FROM favorites WHERE user_id = ?").run(userId);
+  }
+
+  deleteAllFavorites(): void {
+    this.db.query("DELETE FROM favorites").run();
+  }
+
+  // -- per-account download settings ----------------------------------------
+
+  getUserSettings(userId: number): UserSettingsRow | null {
+    const row = this.db
+      .query("SELECT * FROM user_settings WHERE user_id = ? LIMIT 1")
+      .get(userId) as {
+      user_id: number;
+      default_quality: string;
+      default_mode: string;
+      updated_at: number;
+    } | null;
+    if (!row) return null;
+    return {
+      userId: row.user_id,
+      defaultQuality: row.default_quality,
+      defaultMode: row.default_mode,
+      updatedAt: new Date(row.updated_at),
+    };
+  }
+
+  upsertUserSettings(
+    userId: number,
+    defaultQuality: string,
+    defaultMode: string,
+  ): void {
+    this.db
+      .query(
+        "INSERT INTO user_settings (user_id, default_quality, default_mode, updated_at) " +
+          "VALUES (?, ?, ?, ?) " +
+          "ON CONFLICT(user_id) DO UPDATE SET default_quality = excluded.default_quality, " +
+          "default_mode = excluded.default_mode, updated_at = excluded.updated_at",
+      )
+      .run(userId, defaultQuality, defaultMode, Date.now());
+  }
+
+  deleteUserSettings(userId: number): void {
+    this.db
+      .query("DELETE FROM user_settings WHERE user_id = ?")
+      .run(userId);
+  }
+
+  updateUserName(id: number, name: string): void {
+    this.db.query("UPDATE users SET name = ? WHERE id = ?").run(name, id);
+  }
+
+  // -- notifications ----------------------------------------------------------
+  // Created ONLY by real server events (payment received, plan
+  // activated/expired/exhausted, daily limit reached) — never seeded.
+
+  insertNotification(row: {
+    userId: number | null;
+    anonId: string | null;
+    ownerKey: string;
+    type: string;
+    title: string;
+    message: string;
+  }): number {
+    const info = this.db
+      .query(
+        "INSERT INTO notifications (user_id, anon_id, owner_key, type, title, message, read, created_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
+      )
+      .run(
+        row.userId,
+        row.anonId,
+        row.ownerKey,
+        row.type,
+        row.title,
+        row.message,
+        Date.now(),
+      );
+    return Number(info.lastInsertRowid);
+  }
+
+  private toNotificationRow(r: {
+    id: number;
+    user_id: number | null;
+    anon_id: string | null;
+    owner_key: string;
+    type: string;
+    title: string;
+    message: string;
+    read: number;
+    created_at: number;
+  }): NotificationRow {
+    return {
+      id: r.id,
+      userId: r.user_id,
+      anonId: r.anon_id,
+      ownerKey: r.owner_key,
+      type: r.type,
+      title: r.title,
+      message: r.message,
+      read: r.read === 1,
+      createdAt: new Date(r.created_at),
+    };
+  }
+
+  listNotifications(ownerKey: string, limit: number): NotificationRow[] {
+    const rows = this.db
+      .query(
+        "SELECT * FROM notifications WHERE owner_key = ? ORDER BY id DESC LIMIT ?",
+      )
+      .all(ownerKey, limit) as {
+      id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      owner_key: string;
+      type: string;
+      title: string;
+      message: string;
+      read: number;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toNotificationRow(r));
+  }
+
+  markNotificationRead(id: number, ownerKey: string): void {
+    this.db
+      .query(
+        "UPDATE notifications SET read = 1 WHERE id = ? AND owner_key = ?",
+      )
+      .run(id, ownerKey);
+  }
+
+  markAllNotificationsRead(ownerKey: string): void {
+    this.db
+      .query(
+        "UPDATE notifications SET read = 1 WHERE owner_key = ? AND read = 0",
+      )
+      .run(ownerKey);
+  }
+
+  deleteNotification(id: number, ownerKey: string): void {
+    this.db
+      .query("DELETE FROM notifications WHERE id = ? AND owner_key = ?")
+      .run(id, ownerKey);
+  }
+
+  deleteNotificationsForUser(userId: number): void {
+    this.db
+      .query("DELETE FROM notifications WHERE user_id = ?")
+      .run(userId);
+  }
+
+  /** True when this owner already got a daily-limit notification today
+   *  (UTC day) — the limit notification is sent at most once per day. */
+  hasLimitNotificationToday(ownerKey: string, dayStartMs: number): boolean {
+    const row = this.db
+      .query(
+        "SELECT id FROM notifications WHERE owner_key = ? AND type = 'limit' AND created_at >= ? LIMIT 1",
+      )
+      .get(ownerKey, dayStartMs) as { id: number } | null;
+    return !!row;
   }
 }

@@ -356,10 +356,26 @@ function getActiveSubscription(env: Env, userId: number): SubscriptionRow | null
   const now = Date.now();
   if (sub.expiresAt.getTime() <= now) {
     env.store.updateSubscriptionStatus(sub.id, "expired");
+    // The flip happens exactly once (status leaves 'active'), so this
+    // notification is created exactly once per expired plan.
+    createNotification(env, {
+      userId,
+      anonId: null,
+      type: "plan",
+      title: `Your ${sub.planName} plan has expired`,
+      message: `Your ${sub.planName} plan ended on ${sub.expiresAt.toLocaleDateString()}. You are now on the Free plan.`,
+    });
     return null;
   }
   if (sub.limitUsed >= sub.limitTotal) {
     env.store.updateSubscriptionStatus(sub.id, "exhausted");
+    createNotification(env, {
+      userId,
+      anonId: null,
+      type: "plan",
+      title: `Your ${sub.planName} plan's downloads are used up`,
+      message: `You used all ${sub.limitTotal.toLocaleString()} downloads of your ${sub.planName} plan. You are now on the Free plan.`,
+    });
     return null;
   }
   return sub;
@@ -408,6 +424,13 @@ function assignSubscription(
     startsAt: new Date(now),
     expiresAt: new Date(now + durationDays * 24 * 3600 * 1000),
   });
+  createNotification(env, {
+    userId,
+    anonId: null,
+    type: "plan",
+    title: `Your ${plan.name} plan is now active`,
+    message: `Your ${plan.name} plan is active — ${downloadLimit.toLocaleString()} downloads for ${durationDays} days.`,
+  });
 }
 
 function utcDayStartMs(now = Date.now()): number {
@@ -415,6 +438,86 @@ function utcDayStartMs(now = Date.now()): number {
   d.setUTCHours(0, 0, 0, 0);
   return d.getTime();
 }
+
+/** Quality label for a video URL, mirroring resolver.ts: the resolution
+ *  found in the URL, or "Original quality" when none is there. Used as
+ *  the favourite's snapshot label when the client passes none. */
+function qualityLabel(url: string, isOrigin: boolean): string {
+  const res = url.match(/(2160|1440|1080|720|540|480|360)p?/i)?.[1] ?? null;
+  const base = res ? `${res}p` : "Original quality";
+  return isOrigin ? `${base} · Origin (No Watermark)` : base;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — notifications. Created ONLY by real server events (payment
+// received, plan activated/expired/exhausted, daily limit reached).
+// ---------------------------------------------------------------------------
+
+type NotificationType = "payment" | "plan" | "limit";
+
+/** Owner key shared by favourites and notifications: one text key per
+ *  account ("user:<id>") or anonymous browser ("anon:<browser id>") so
+ *  the same scoping works for logged-in and anonymous visitors. */
+function ownerKeyFor(
+  userId: number | null | undefined,
+  anonId: string | null | undefined,
+): string | null {
+  if (userId !== null && userId !== undefined) return `user:${userId}`;
+  if (anonId) return `anon:${anonId}`;
+  return null;
+}
+
+function createNotification(
+  env: Env,
+  opts: {
+    userId: number | null | undefined;
+    anonId: string | null | undefined;
+    type: NotificationType;
+    title: string;
+    message: string;
+  },
+): void {
+  const ownerKey = ownerKeyFor(opts.userId, opts.anonId);
+  if (!ownerKey) return;
+  env.store.insertNotification({
+    userId: opts.userId ?? null,
+    anonId: opts.userId ? null : (opts.anonId ?? null),
+    ownerKey,
+    type: opts.type,
+    title: opts.title,
+    message: opts.message,
+  });
+}
+
+/** Free-daily-limit notification, at most one per owner per UTC day. */
+function maybeNotifyLimitReached(
+  env: Env,
+  userId: number | null,
+  anonId: string | null,
+  freeLimit: number,
+): void {
+  const ownerKey = ownerKeyFor(userId, anonId);
+  if (!ownerKey) return;
+  const dayStart = utcDayStartMs();
+  if (env.store.hasLimitNotificationToday(ownerKey, dayStart)) return;
+  createNotification(env, {
+    userId,
+    anonId,
+    type: "limit",
+    title: "Daily free limit reached",
+    message: `You have used your ${freeLimit} free downloads for today. See the Plans page to download more.`,
+  });
+}
+
+type QualityPref = "best" | "original" | "720p" | "480p" | "360p";
+type DownloadModePref = "single" | "bulk";
+const QUALITY_PREFS: readonly string[] = [
+  "best",
+  "original",
+  "720p",
+  "480p",
+  "360p",
+];
 
 const DOWNLOAD_HOST_SUFFIXES = [
   "jimeng.com",
@@ -446,6 +549,7 @@ type ResolveResponse = {
   usedCustomApi: boolean;
   note: string | null;
   error: string | null;
+  downloadId: number | null;
 };
 
 async function resolveLink(env: Env, args: unknown): Promise<ResolveResponse> {
@@ -479,6 +583,7 @@ async function resolveLink(env: Env, args: unknown): Promise<ResolveResponse> {
         videos: [], images: [], usedCustomApi: false, note: avatarNote,
         error:
           "A link was found in the pasted text, but it is not a Jimeng link. Only public share links from jimeng.jianying.com, jimeng.cn or dreamina.capcut.com work.",
+        downloadId: null,
       };
     }
     return {
@@ -486,6 +591,7 @@ async function resolveLink(env: Env, args: unknown): Promise<ResolveResponse> {
       usedCustomApi: false, note: null,
       error:
         "No link was found. Paste Jimeng's FULL share text (together with the Chinese text) — the link will be extracted from it automatically.",
+      downloadId: null,
     };
   }
 
@@ -498,8 +604,9 @@ async function resolveLink(env: Env, args: unknown): Promise<ResolveResponse> {
       const viaApi = await resolveViaCustomApi(apiBase, apiKey, shareUrl);
       if (viaApi && viaApi.videos.length > 0) {
         const first = viaApi.videos[0];
+        let downloadId: number | null = null;
         if (first) {
-          env.store.insertDownload({
+          downloadId = env.store.insertDownload({
             sourceUrl: shareUrl,
             title: viaApi.title,
             videoUrl: first.url,
@@ -512,6 +619,7 @@ async function resolveLink(env: Env, args: unknown): Promise<ResolveResponse> {
           ok: true, sourceUrl: shareUrl, title: viaApi.title,
           coverUrl: viaApi.coverUrl, videos: viaApi.videos, images: viaApi.images,
           usedCustomApi: true, note: "The video was fetched using your saved API key.", error: null,
+          downloadId,
         };
       }
       note = "The custom API did not respond, so the built-in method was used instead.";
@@ -523,8 +631,9 @@ async function resolveLink(env: Env, args: unknown): Promise<ResolveResponse> {
   const result = await resolveBuiltIn(shareUrl);
   if (result.ok) {
     const first = result.videos[0];
+    let downloadId: number | null = null;
     if (first) {
-      env.store.insertDownload({
+      downloadId = env.store.insertDownload({
         sourceUrl: shareUrl,
         title: result.title,
         videoUrl: first.url,
@@ -537,11 +646,13 @@ async function resolveLink(env: Env, args: unknown): Promise<ResolveResponse> {
       ok: true, sourceUrl: result.sourceUrl, title: result.title,
       coverUrl: result.coverUrl, videos: result.videos, images: result.images,
       usedCustomApi: false, note, error: null,
+      downloadId,
     };
   }
   return {
     ok: false, sourceUrl: result.sourceUrl, title: "", coverUrl: null,
     videos: [], images: [], usedCustomApi: false, note: note ?? avatarNote, error: result.error,
+    downloadId: null,
   };
 }
 
@@ -591,6 +702,12 @@ async function prepareDownload(
         me ? null : (optString(args, "anonId", 100) || null),
       );
       if (used >= freeLimit) {
+        maybeNotifyLimitReached(
+          env,
+          me?.id ?? null,
+          me ? null : (optString(args, "anonId", 100) || null),
+          freeLimit,
+        );
         return {
           ok: false, downloadUrl: null, sizeBytes: 0,
           error: `You have used your ${freeLimit} free downloads for today. See the Plans page to download more.`,
@@ -778,11 +895,13 @@ function listHistory(env: Env, args: unknown): {
 
 function deleteHistoryItem(env: Env, args: unknown): { ok: true } {
   const id = reqInt(args, "id");
+  env.store.deleteFavoritesForDownload(id);
   env.store.deleteDownload(id);
   return { ok: true as const };
 }
 
 function clearHistory(env: Env): { ok: true } {
+  env.store.deleteAllFavorites();
   env.store.clearDownloads();
   return { ok: true as const };
 }
@@ -1114,6 +1233,7 @@ function me(env: Env, args: unknown): {
   downloadsTotal: number;
   freeDailyLimit: number;
   freeRemaining: number;
+  joinedAt: string | null;
 } {
   const user = authUser(env, optToken(args));
   const freeLimit = getFreeDailyLimit(env);
@@ -1122,6 +1242,7 @@ function me(env: Env, args: unknown): {
       ok: false, user: null, plan: null,
       downloadsToday: 0, downloadsTotal: 0,
       freeDailyLimit: freeLimit, freeRemaining: 0,
+      joinedAt: null,
     };
   }
   const sub = getActiveSubscription(env, user.id);
@@ -1149,6 +1270,7 @@ function me(env: Env, args: unknown): {
     downloadsTotal: total,
     freeDailyLimit: freeLimit,
     freeRemaining: sub ? 0 : freeLimit === 0 ? -1 : Math.max(0, freeLimit - today),
+    joinedAt: env.store.getUserById(user.id)?.createdAt.toISOString() ?? null,
   };
 }
 
@@ -1456,17 +1578,25 @@ function markPaid(
   }
   const user = env.store.getUserById(req.userId);
   if (!user) return { ok: false, error: "The customer account no longer exists." };
+  const amount = amountCents ?? req.priceCents;
   env.store.insertPayment({
     userId: user.id,
     purchaseRequestId: req.id,
     customerName: user.name,
     customerEmail: user.email,
     planName: req.planName,
-    amountCents: amountCents ?? req.priceCents,
+    amountCents: amount,
     method,
     note,
   });
   env.store.updatePurchaseRequestStatus(req.id, "paid");
+  createNotification(env, {
+    userId: user.id,
+    anonId: null,
+    type: "payment",
+    title: `Payment received for the ${req.planName} plan`,
+    message: `Your payment of $${(amount / 100).toFixed(2)} for the ${req.planName} plan was received. The admin will activate your plan shortly.`,
+  });
   return { ok: true, error: null };
 }
 
@@ -1613,6 +1743,9 @@ function deleteUser(
   env.store.deleteSessionsForUser(userId);
   env.store.deleteSubscriptionsForUser(userId);
   env.store.deletePurchaseRequestsForUser(userId);
+  env.store.deleteFavoritesForUser(userId);
+  env.store.deleteNotificationsForUser(userId);
+  env.store.deleteUserSettings(userId);
   env.store.deleteUserById(userId);
   // Recorded payments are KEPT (they carry the customer name/email) so
   // revenue history stays correct.
@@ -1645,6 +1778,224 @@ function submitContact(env: Env, args: unknown): { ok: true } {
     throw new HandlerError(400, "email must be a valid email address");
   }
   env.store.insertContactMessage({ name, email, message });
+  return { ok: true as const };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — favourites, profile, download settings, notifications.
+// ---------------------------------------------------------------------------
+
+function toggleFavorite(
+  env: Env,
+  args: unknown,
+): { ok: boolean; favorited: boolean; error: string | null } {
+  const downloadId = reqInt(args, "downloadId");
+  const label = optString(args, "label", 200).trim();
+  const me = authUser(env, optToken(args));
+  const userId = me?.id ?? null;
+  const anonId = me ? null : (optString(args, "anonId", 100) || null);
+  const ownerKey = ownerKeyFor(userId, anonId);
+  if (!ownerKey) {
+    return { ok: false, favorited: false, error: "Could not identify this browser — please try again." };
+  }
+  const existing = env.store.findFavorite(ownerKey, downloadId);
+  if (existing) {
+    env.store.deleteFavoriteById(existing.id, ownerKey);
+    return { ok: true, favorited: false, error: null };
+  }
+  const row = env.store.getDownloadById(downloadId);
+  // Only the owner's own history rows (or old unattributed rows, which
+  // are visible to everyone) can be favourited.
+  const ownsRow =
+    !!row &&
+    ((userId !== null && row.userId === userId) ||
+      (userId === null && anonId !== null && row.anonId === anonId) ||
+      (row.userId === null && row.anonId === null));
+  if (!row || !ownsRow) {
+    return { ok: false, favorited: false, error: "This video is not in your history." };
+  }
+  env.store.insertFavorite({
+    downloadId: row.id,
+    userId,
+    anonId,
+    ownerKey,
+    title: row.title,
+    coverUrl: row.coverUrl,
+    videoUrl: row.videoUrl,
+    qualityLabel: label || qualityLabel(row.videoUrl, true),
+    sourceUrl: row.sourceUrl,
+  });
+  return { ok: true, favorited: true, error: null };
+}
+
+function listFavorites(env: Env, args: unknown): {
+  items: {
+    id: number;
+    downloadId: number;
+    title: string;
+    coverUrl: string | null;
+    videoUrl: string;
+    qualityLabel: string;
+    sourceUrl: string;
+    createdAt: string;
+  }[];
+} {
+  const rec = asRecord(args);
+  let limit = 50;
+  const raw = rec?.limit;
+  if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) {
+    limit = Math.min(raw, 100);
+  }
+  const me = authUser(env, optToken(args));
+  const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+  if (!ownerKey) return { items: [] };
+  return {
+    items: env.store.listFavorites(ownerKey, limit).map((r) => ({
+      id: r.id,
+      downloadId: r.downloadId,
+      title: r.title,
+      coverUrl: r.coverUrl,
+      videoUrl: r.videoUrl,
+      qualityLabel: r.qualityLabel,
+      sourceUrl: r.sourceUrl,
+      createdAt: r.createdAt.toISOString(),
+    })),
+  };
+}
+
+function removeFavorite(env: Env, args: unknown): { ok: true } {
+  const id = reqInt(args, "id");
+  const me = authUser(env, optToken(args));
+  const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+  if (!ownerKey) return { ok: true as const };
+  env.store.deleteFavoriteById(id, ownerKey);
+  return { ok: true as const };
+}
+
+function updateProfileName(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null } {
+  const me = requireUser(env, args);
+  const name = reqString(args, "name", 100).trim();
+  if (!name) return { ok: false, error: "Enter your name." };
+  env.store.updateUserName(me.id, name);
+  return { ok: true, error: null };
+}
+
+async function changeUserPassword(
+  env: Env,
+  args: unknown,
+): Promise<{ ok: boolean; error: string | null }> {
+  const me = requireUser(env, args);
+  const currentPassword = reqString(args, "currentPassword", 200);
+  const newPassword = reqString(args, "newPassword", 200);
+  if (newPassword.length < 8) {
+    return { ok: false, error: "The new password must be at least 8 characters." };
+  }
+  const u = env.store.getUserById(me.id);
+  if (!u || !(await verifyPassword(currentPassword, u.passwordHash))) {
+    return { ok: false, error: "The current password is incorrect." };
+  }
+  env.store.updateUserPassword(me.id, await hashPassword(newPassword));
+  env.store.deleteSessionsForUserExcept(me.id, optToken(args));
+  return { ok: true, error: null };
+}
+
+function getDownloadSettings(
+  env: Env,
+  args: unknown,
+): { defaultQuality: QualityPref; defaultMode: DownloadModePref } {
+  const me = authUser(env, optToken(args));
+  if (!me) return { defaultQuality: "best", defaultMode: "single" };
+  const row = env.store.getUserSettings(me.id);
+  return {
+    defaultQuality: (row?.defaultQuality ?? "best") as QualityPref,
+    defaultMode: (row?.defaultMode ?? "single") as DownloadModePref,
+  };
+}
+
+function saveDownloadSettings(env: Env, args: unknown): { ok: true } {
+  const me = requireUser(env, args);
+  const rec = asRecord(args);
+  const quality = rec?.defaultQuality;
+  const mode = rec?.defaultMode;
+  if (typeof quality !== "string" || !QUALITY_PREFS.includes(quality)) {
+    throw new HandlerError(
+      400,
+      "defaultQuality must be one of: best, original, 720p, 480p, 360p",
+    );
+  }
+  if (mode !== "single" && mode !== "bulk") {
+    throw new HandlerError(400, 'defaultMode must be "single" or "bulk"');
+  }
+  env.store.upsertUserSettings(
+    me.id,
+    quality as QualityPref,
+    mode as DownloadModePref,
+  );
+  return { ok: true as const };
+}
+
+function listNotifications(env: Env, args: unknown): {
+  items: {
+    id: number;
+    type: string;
+    title: string;
+    message: string;
+    read: boolean;
+    createdAt: string;
+  }[];
+  unreadCount: number;
+} {
+  const rec = asRecord(args);
+  let limit = 50;
+  const raw = rec?.limit;
+  if (typeof raw === "number" && Number.isInteger(raw) && raw > 0) {
+    limit = Math.min(raw, 100);
+  }
+  const me = authUser(env, optToken(args));
+  const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+  if (!ownerKey) return { items: [], unreadCount: 0 };
+  const rows = env.store.listNotifications(ownerKey, limit);
+  return {
+    items: rows.map((r) => ({
+      id: r.id,
+      type: r.type,
+      title: r.title,
+      message: r.message,
+      read: r.read,
+      createdAt: r.createdAt.toISOString(),
+    })),
+    // Same as the artifact: the unread count is computed over the
+    // fetched window (limit 50), not over the whole table.
+    unreadCount: rows.filter((r) => !r.read).length,
+  };
+}
+
+function markNotificationRead(env: Env, args: unknown): { ok: true } {
+  const id = reqInt(args, "id");
+  const me = authUser(env, optToken(args));
+  const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+  if (!ownerKey) return { ok: true as const };
+  env.store.markNotificationRead(id, ownerKey);
+  return { ok: true as const };
+}
+
+function markAllNotificationsRead(env: Env, args: unknown): { ok: true } {
+  const me = authUser(env, optToken(args));
+  const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+  if (!ownerKey) return { ok: true as const };
+  env.store.markAllNotificationsRead(ownerKey);
+  return { ok: true as const };
+}
+
+function deleteNotification(env: Env, args: unknown): { ok: true } {
+  const id = reqInt(args, "id");
+  const me = authUser(env, optToken(args));
+  const ownerKey = ownerKeyFor(me?.id ?? null, me ? null : (optString(args, "anonId", 100) || null));
+  if (!ownerKey) return { ok: true as const };
+  env.store.deleteNotification(id, ownerKey);
   return { ok: true as const };
 }
 
@@ -1689,4 +2040,15 @@ export const ACTIONS: Record<string, ActionHandler> = {
   deleteUser,
   getAdminSettings,
   saveAdminSettings,
+  toggleFavorite,
+  listFavorites,
+  removeFavorite,
+  updateProfileName,
+  changeUserPassword,
+  getDownloadSettings,
+  saveDownloadSettings,
+  listNotifications,
+  markNotificationRead,
+  markAllNotificationsRead,
+  deleteNotification,
 };
