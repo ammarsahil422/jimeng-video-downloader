@@ -978,6 +978,12 @@ async function register(
   if (password.length < 8) {
     return { ok: false, token: null, error: "The password must be at least 8 characters.", user: null };
   }
+  // The admin email is reserved — it can never be registered as a
+  // customer account. Same message as the duplicate check below, so
+  // nothing leaks about which addresses exist.
+  if (email === ADMIN_EMAIL) {
+    return { ok: false, token: null, error: "An account with this email already exists. Try logging in instead.", user: null };
+  }
   if (env.store.getUserByEmail(email)) {
     return { ok: false, token: null, error: "An account with this email already exists. Try logging in instead.", user: null };
   }
@@ -1024,6 +1030,66 @@ async function userLogin(
     ok: true,
     token,
     error: null,
+    user: { id: u.id, name: u.name, email: u.email, role: "user" },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Unified login — the single login form for everyone. The admin account is
+// checked first (admin email + bcrypt password); a match returns role
+// "admin" and the admin session token, which opens the Admin Panel
+// directly. Otherwise the customer account is checked and role "customer"
+// is returned. All failures use the same generic message so nothing leaks
+// about which accounts exist.
+// ---------------------------------------------------------------------------
+async function login(
+  env: Env,
+  args: unknown,
+): Promise<{
+  ok: boolean;
+  role: "admin" | "customer" | null;
+  token: string | null;
+  error: string | null;
+  admin: { id: number; name: string; email: string; role: string } | null;
+  user: { id: number; name: string; email: string; role: string } | null;
+}> {
+  seedAdmin(env);
+  const email = reqEmail(args, "email");
+  const password = reqString(args, "password", 200);
+  const u = env.store.getUserByEmail(email);
+  if (!u || !(await verifyPassword(password, u.passwordHash))) {
+    return { ok: false, role: null, token: null, error: "Incorrect email or password.", admin: null, user: null };
+  }
+  if (u.status !== "active") {
+    return {
+      ok: false,
+      role: null,
+      token: null,
+      error: u.role === "admin"
+        ? "This account is disabled. Contact the site owner."
+        : "Your account is suspended. Contact the site owner for help.",
+      admin: null,
+      user: null,
+    };
+  }
+  const token = createSession(env, u.id);
+  env.store.updateUserLastLogin(u.id);
+  if (u.role === "admin") {
+    return {
+      ok: true,
+      role: "admin" as const,
+      token,
+      error: null,
+      admin: { id: u.id, name: u.name, email: u.email, role: "admin" },
+      user: null,
+    };
+  }
+  return {
+    ok: true,
+    role: "customer" as const,
+    token,
+    error: null,
+    admin: null,
     user: { id: u.id, name: u.name, email: u.email, role: "user" },
   };
 }
@@ -1603,6 +1669,7 @@ export const ACTIONS: Record<string, ActionHandler> = {
   adminChangePassword,
   register,
   userLogin,
+  login,
   me,
   logout,
   myRequests,
