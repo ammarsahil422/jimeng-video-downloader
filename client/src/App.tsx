@@ -758,8 +758,6 @@ function AppShell() {
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.getSettings({ token: getToken() }) });
   const history = useQuery({ queryKey: ["history"], queryFn: () => api.listHistory({ limit: 30, token: getUserToken(), anonId: getAnonId() }) });
   const historyCount = history.data?.items.length ?? 0;
-  const notifications = useQuery({ queryKey: ["notifications"], queryFn: () => api.listNotifications({ limit: 50, token: getUserToken(), anonId: getAnonId() }) });
-  const unreadCount = notifications.data?.unreadCount ?? 0;
   const dlSettings = useDownloadSettings();
 
   // Phase 5 — SEO meta from the server (admin-editable in Settings).
@@ -971,11 +969,12 @@ function AppShell() {
       <SiteWideAdCode code={settings.data?.adCodes.head} />
       <SiteWideAdCode code={settings.data?.adCodes.socialbar} />
 
-      {/* Side menu drawer (reference: savevideoraw style) */}
+      {/* Side menu drawer — slides in from the LEFT (hamburger opens it);
+          overlay click or the X button closes it. */}
       {menuOpen && (
         <div className="fixed inset-0 z-50" role="dialog" aria-modal="true" aria-label="Site menu">
           <div className="absolute inset-0 bg-black/50 backdrop-blur-[2px]" onClick={() => setMenuOpen(false)} />
-          <div className="glass absolute top-0 right-0 flex h-full w-[80%] max-w-[340px] flex-col overflow-y-auto bg-[var(--surface)] shadow-2xl">
+          <div className="glass animate-drawer-in absolute top-0 left-0 flex h-full w-[80%] max-w-[340px] flex-col overflow-y-auto bg-[var(--surface)] shadow-2xl">
             <div className="flex items-center justify-between px-5 pt-5 pb-2">
               <Logo compact />
               <button
@@ -1111,73 +1110,28 @@ function AppShell() {
       )}
 
       <div className="mx-auto w-full max-w-7xl px-4 pb-8">
-        {/* Top banner ad slot */}
-        <div className="pt-4">
-          <AdSlot label="Advertisement · Top Banner 728 × 90" saved={Boolean(settings.data?.adSlots.top)} code={settings.data?.adCodes.top} />
-        </div>
-
-        {/* Header: logo + menu + history (design) */}
-        <header className="flex items-center justify-between gap-3 py-4">
-          <div className="flex min-w-0 items-center gap-3">
-            <button type="button" onClick={() => go("home")} aria-label="Jimeng Downloader — home" className="shrink-0">
-              <Logo />
-            </button>
+        {/* Header: hamburger + logo only (see below). The Top banner ad
+            used to sit here, above the header — it now lives below the
+            page content, just above the footer. */}
+        {/* Sticky site header — hamburger (three lines, no text) at the
+            far left, logo right after it. The bell, History button,
+            language and theme shortcuts are NOT here any more: they live
+            in the sidebar drawer (Favourites, Notifications, History)
+            and Download Settings (theme + language), so nothing overlaps
+            on a 360 px phone. */}
+        <header className="glass sticky top-0 z-40 -mx-4 border-b border-[var(--border)] bg-[var(--surface)]">
+          <div className="mx-auto flex w-full max-w-7xl items-center gap-3 px-4 py-3">
             <button
               type="button"
               onClick={() => setMenuOpen(true)}
               aria-label={t("menu.open")}
-              className="glass flex items-center gap-2 border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-extrabold"
-              style={{ borderRadius: "var(--radius)" }}
+              className="flex h-11 w-11 shrink-0 items-center justify-center border border-[var(--border)] bg-[var(--surface-alt)] text-xl font-extrabold"
+              style={{ borderRadius: 12 }}
             >
-              ☰ Menu <span aria-hidden="true" className="text-xs">▾</span>
+              ☰
             </button>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            {/* Phase 5 — theme + language toggles. */}
-            <button
-              type="button"
-              onClick={() => changeTheme(theme === "dark" ? "light" : "dark")}
-              aria-label={theme === "dark" ? t("header.theme_to_light") : t("header.theme_to_dark")}
-              className="glass flex items-center gap-2 border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-extrabold"
-              style={{ borderRadius: "var(--radius)" }}
-            >
-              <span aria-hidden="true">{theme === "dark" ? "☀️" : "🌙"}</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => changeLang(lang === "en" ? "ur" : "en")}
-              aria-label={lang === "en" ? t("header.lang_to_ur") : t("header.lang_to_en")}
-              className="glass flex items-center gap-2 border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-extrabold"
-              style={{ borderRadius: "var(--radius)" }}
-            >
-              <span aria-hidden="true">🌐</span>
-              {lang === "en" ? "اردو" : "EN"}
-            </button>
-            <button
-              type="button"
-              onClick={() => go("notifications")}
-              aria-label={unreadCount > 0 ? `${t("header.notifications")} — ${unreadCount} unread` : t("header.notifications")}
-              className={`glass relative flex items-center gap-2 border px-3 py-2 text-sm font-extrabold ${view === "notifications" ? "border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
-              style={{ borderRadius: "var(--radius)" }}
-            >
-              <span aria-hidden="true">🔔</span>
-              {unreadCount > 0 && (
-                <span className="flex h-5 min-w-5 items-center justify-center bg-[var(--err-text)] px-1 text-xs font-extrabold text-white" style={{ borderRadius: 999 }}>
-                  {unreadCount > 99 ? "99+" : unreadCount}
-                </span>
-              )}
-            </button>
-            <button
-              type="button"
-              onClick={() => go("history")}
-              aria-label={t("header.history")}
-              className={`glass flex items-center gap-2 border px-4 py-2 text-sm font-extrabold ${view === "history" ? "border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
-              style={{ borderRadius: "var(--radius)" }}
-            >
-              🕘 {t("header.history")}
-              <span className="flex h-5 min-w-5 items-center justify-center bg-[var(--accent)] px-1 text-xs font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>
-                {historyCount}
-              </span>
+            <button type="button" onClick={() => go("home")} aria-label="Jimeng Downloader — home" className="min-w-0 shrink-0">
+              <Logo />
             </button>
           </div>
         </header>
@@ -1463,6 +1417,14 @@ function AppShell() {
         {view === "terms" && <TermsPage />}
         {view === "copyright" && <CopyrightPage />}
         {view === "disclaimer" && <DisclaimerPage />}
+
+        {/* Top banner ad — moved down here, below the page content and
+            just above the footer (it used to sit above the header, where
+            it ruined the site's look). Same slot, same code, same real
+            script injection — only the position moved. */}
+        <div className="mt-10">
+          <AdSlot label="Advertisement · Top Banner 728 × 90" saved={Boolean(settings.data?.adSlots.top)} code={settings.data?.adCodes.top} />
+        </div>
 
         <footer className="mt-10 border-t border-[var(--border)] pt-6 text-center">
           <BrandBanner />
@@ -2475,7 +2437,7 @@ function JimengDownloaderPage({
     <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
       <main className="flex min-w-0 flex-col gap-6">
         <PageHero icon="🎬" title={t("menu.jimeng")} subtitle={t("dl.subtitle")} />
-        <p className="mx-auto inline-flex items-center gap-2 border border-[rgba(251,191,36,0.4)] bg-[var(--warn-bg)] px-4 py-2 text-sm font-bold text-[var(--warn-text)]" style={{ borderRadius: 999 }}>
+        <p className="mx-auto flex max-w-full flex-wrap items-center justify-center gap-2 border border-[rgba(251,191,36,0.4)] bg-[var(--warn-bg)] px-4 py-2 text-center text-sm font-bold text-[var(--warn-text)]" style={{ borderRadius: 999 }}>
           {t("dl.public_only")}
         </p>
 
@@ -2609,11 +2571,11 @@ function JimengDownloaderPage({
                         role="radio"
                         aria-checked={i === selectedVideo}
                         onClick={() => setSelectedVideo(i)}
-                        className={`flex items-center justify-between border px-4 py-2.5 text-left text-sm font-semibold ${i === selectedVideo ? "border-[var(--accent)] bg-[var(--surface-alt)]" : "border-[var(--border)]"}`}
+                        className={`flex items-center justify-between gap-2 border px-4 py-2.5 text-left text-sm font-semibold ${i === selectedVideo ? "border-[var(--accent)] bg-[var(--surface-alt)]" : "border-[var(--border)]"}`}
                         style={{ borderRadius: "var(--radius)" }}
                       >
-                        <span>🎬 {v.label}</span>
-                        <span className="text-xs text-[var(--dim)]">
+                        <span className="min-w-0 flex-1 truncate">🎬 {v.label}</span>
+                        <span className="shrink-0 text-xs text-[var(--dim)]">
                           {[v.width && v.height ? `${v.width}×${v.height}` : null, formatBytes(v.sizeBytes), "MP4"]
                             .filter(Boolean)
                             .join(" · ")}
@@ -2653,7 +2615,7 @@ function JimengDownloaderPage({
                     </button>
                     <FavoriteButton downloadId={result.downloadId} label={chosenVideo.label} />
                   </div>
-                  <p className="mt-3 flex items-center justify-center gap-2 border border-[rgba(0,233,154,0.35)] bg-[rgba(0,233,154,0.08)] px-4 py-2.5 text-sm font-bold text-[var(--accent)]" style={{ borderRadius: "var(--radius)" }}>
+                  <p className="mt-3 flex flex-wrap items-center justify-center gap-2 border border-[rgba(0,233,154,0.35)] bg-[rgba(0,233,154,0.08)] px-4 py-2.5 text-center text-sm font-bold text-[var(--accent)]" style={{ borderRadius: "var(--radius)" }}>
                     {t("dl.tip_offline")}
                   </p>
                   <p className="mt-2 text-xs text-[var(--dim)]">
