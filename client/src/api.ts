@@ -165,6 +165,16 @@ export type AdSlots = {
   incontent: boolean;
   sidebar: boolean;
   bottom: boolean;
+  socialbar: boolean;
+};
+
+export type AdCodes = {
+  head: string | null;
+  top: string | null;
+  incontent: string | null;
+  sidebar: string | null;
+  bottom: string | null;
+  socialbar: string | null;
 };
 
 export type SettingsResult = {
@@ -172,6 +182,7 @@ export type SettingsResult = {
   hasApiKey: boolean;
   apiBaseUrl: string | null;
   adSlots: AdSlots;
+  adCodes: AdCodes;
   smartLink: { url: string | null; enabled: boolean };
 };
 
@@ -281,12 +292,12 @@ export interface Actions {
   }) => Promise<{ ok: true; hint: string }>;
   clearApiKey: (args: { token?: string }) => Promise<{ ok: true }>;
   saveAdCode: (args: {
-    slot: "head" | "top" | "incontent" | "sidebar" | "bottom";
+    slot: "head" | "top" | "incontent" | "sidebar" | "bottom" | "socialbar";
     code: string;
     token?: string;
   }) => Promise<{ ok: true }>;
   clearAdCode: (args: {
-    slot: "head" | "top" | "incontent" | "sidebar" | "bottom";
+    slot: "head" | "top" | "incontent" | "sidebar" | "bottom" | "socialbar";
     token?: string;
   }) => Promise<{ ok: true }>;
   listHistory: (args: {

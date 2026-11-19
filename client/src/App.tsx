@@ -4,6 +4,7 @@ import JSZip from "jszip";
 import QRCode from "qrcode";
 import { SafeAreaTopScrim } from "./safe-area";
 import { api, type ApiResponse } from "./api";
+import { injectAdCode, injectHeadCode } from "./adInject";
 import {
   LangProvider,
   PrefsProvider,
@@ -80,7 +81,7 @@ type View =
   | "privacy"
   | "contact"
   | "admin";
-type AdSlotKey = "head" | "top" | "incontent" | "sidebar" | "bottom";
+type AdSlotKey = "head" | "top" | "incontent" | "sidebar" | "bottom" | "socialbar";
 
 /** Admin session token storage — the token lives in the browser only; the
  *  server validates it on every admin action. Downloads are public and
@@ -263,10 +264,11 @@ function useSeo(): void {
 
 const AD_SLOTS: { key: AdSlotKey; label: string; size: string }[] = [
   { key: "top", label: "Top Banner", size: "728 × 90 · Leaderboard" },
-  { key: "incontent", label: "In-Content", size: "Responsive · In-article" },
+  { key: "incontent", label: "In-Content", size: "Native Banner · In-article" },
   { key: "sidebar", label: "Sidebar", size: "300 × 250 · Rectangle" },
   { key: "bottom", label: "Bottom Banner", size: "728 × 90 · Leaderboard" },
-  { key: "head", label: "Head Code (ads.txt / meta verification)", size: "Site-wide code" },
+  { key: "head", label: "Head Code", size: "Site-wide · Popunder / verification" },
+  { key: "socialbar", label: "Social Bar", size: "Site-wide · Floating corner bar" },
 ];
 
 type PreparedSave = {
@@ -346,27 +348,71 @@ function formatBytes(n: number | null): string | null {
   return `${n} B`;
 }
 
-/** Design-style ad placeholder: "ADVERTISEMENT · TOP BANNER 728 × 90".
- *  The slot stays a placeholder until the admin saves an AdSense code for
- *  it — the saved code is only marked, the box itself never renders ads
- *  from this preview. */
-function AdSlot({ label, sub, saved, tall }: { label: string; sub?: string; saved: boolean; tall?: boolean }) {
+/** Design-style ad slot. With no saved code it stays the dashed "Ad
+ *  Space" placeholder; with code, the snippet is injected with real
+ *  script elements (see client/src/adInject.ts) — scripts set through
+ *  innerHTML would never execute, so the ad would never earn. The
+ *  injected ad loads async and never blocks the download flow. On a
+ *  narrow phone a 728 px banner scrolls sideways inside the slot instead
+ *  of breaking the page layout. */
+function AdSlot({ label, sub, saved, tall, code }: { label: string; sub?: string; saved: boolean; tall?: boolean; code?: string | null }) {
+  const hostRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    if (!code) {
+      host.replaceChildren();
+      return;
+    }
+    injectAdCode(host, code);
+    return () => {
+      host.replaceChildren();
+    };
+  }, [code]);
+  if (!code) {
+    return (
+      <div
+        role="complementary"
+        aria-label={`Ad space: ${label}`}
+        className={`glass flex flex-col items-center justify-center gap-1 border-2 border-dashed border-[var(--ad-border)] bg-[var(--surface-alt)] px-4 text-center ${tall ? "min-h-64 py-8" : "min-h-24 py-4"}`}
+        style={{ borderRadius: "var(--radius)" }}
+      >
+        <p className="text-xs font-bold tracking-[0.18em] text-[var(--dim)] uppercase">{label}</p>
+        {sub && <p className="text-xs text-[var(--dim)]">{sub}</p>}
+        {saved ? (
+          <p className="text-xs font-semibold text-[var(--accent)]">✓ AdSense code saved — your ad will appear here</p>
+        ) : (
+          <p className="text-xs text-[var(--dim)]">Your Google AdSense ad will appear here</p>
+        )}
+      </div>
+    );
+  }
   return (
     <div
       role="complementary"
-      aria-label={`Ad space: ${label}`}
-      className={`glass flex flex-col items-center justify-center gap-1 border-2 border-dashed border-[var(--ad-border)] bg-[var(--surface-alt)] px-4 text-center ${tall ? "min-h-64 py-8" : "min-h-24 py-4"}`}
-      style={{ borderRadius: "var(--radius)" }}
+      aria-label={`Advertisement: ${label}`}
+      className="w-full"
+      style={{ maxWidth: "100%", overflowX: "auto" }}
     >
-      <p className="text-xs font-bold tracking-[0.18em] text-[var(--dim)] uppercase">{label}</p>
-      {sub && <p className="text-xs text-[var(--dim)]">{sub}</p>}
-      {saved ? (
-        <p className="text-xs font-semibold text-[var(--accent)]">✓ AdSense code saved — your ad will appear here</p>
-      ) : (
-        <p className="text-xs text-[var(--dim)]">Your Google AdSense ad will appear here</p>
-      )}
+      <p className="mb-1 text-center text-[10px] font-bold tracking-[0.18em] text-[var(--dim)] uppercase">Advertisement</p>
+      <div className="mx-auto w-fit max-w-full">
+        <div ref={hostRef} />
+      </div>
     </div>
   );
+}
+
+/** Injects a saved site-wide ad script (Head slot / Social Bar) into
+ *  document.head once the settings load; removes it again on change or
+ *  unmount. Renders nothing visible — the ad script builds its own
+ *  floating bar. The script loads async and never blocks the page or a
+ *  download. */
+function SiteWideAdCode({ code }: { code?: string | null }) {
+  useEffect(() => {
+    if (!code) return;
+    return injectHeadCode(code);
+  }, [code]);
+  return null;
 }
 
 /** The owner's Adsterra smart link, as a clearly labelled banner on the
@@ -922,6 +968,8 @@ function AppShell() {
   return (
     <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
       <SafeAreaTopScrim backgroundColor="var(--bg)" />
+      <SiteWideAdCode code={settings.data?.adCodes.head} />
+      <SiteWideAdCode code={settings.data?.adCodes.socialbar} />
 
       {/* Side menu drawer (reference: savevideoraw style) */}
       {menuOpen && (
@@ -1065,7 +1113,7 @@ function AppShell() {
       <div className="mx-auto w-full max-w-7xl px-4 pb-8">
         {/* Top banner ad slot */}
         <div className="pt-4">
-          <AdSlot label="Advertisement · Top Banner 728 × 90" saved={Boolean(settings.data?.adSlots.top)} />
+          <AdSlot label="Advertisement · Top Banner 728 × 90" saved={Boolean(settings.data?.adSlots.top)} code={settings.data?.adCodes.top} />
         </div>
 
         {/* Header: logo + menu + history (design) */}
@@ -1214,7 +1262,7 @@ function AppShell() {
 
             {/* Sidebar */}
             <aside className="flex min-w-0 flex-col gap-6">
-              <AdSlot label="Advertisement · Sidebar" sub="300 × 250" saved={Boolean(settings.data?.adSlots.sidebar)} tall />
+              <AdSlot label="Advertisement · Sidebar" sub="300 × 250" saved={Boolean(settings.data?.adSlots.sidebar)} code={settings.data?.adCodes.sidebar} tall />
               <SectionCard>
                 <h2 className="flex items-center gap-2 text-lg font-extrabold">
                   <span className="flex h-6 w-6 items-center justify-center bg-[var(--accent)] text-sm font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>?</span>
@@ -1234,7 +1282,7 @@ function AppShell() {
 
             {/* In-content ad (design: full width, below the downloader) */}
             <div className="mt-6">
-              <AdSlot label="Advertisement · In-Content" saved={Boolean(settings.data?.adSlots.incontent)} />
+              <AdSlot label="Advertisement · In-Content" saved={Boolean(settings.data?.adSlots.incontent)} code={settings.data?.adCodes.incontent} />
             </div>
 
             {/* How it works (design) */}
@@ -1374,6 +1422,7 @@ function AppShell() {
             onGoPlans={() => go("plans")}
             onGoHistory={() => go("history")}
             sidebarAdSaved={Boolean(settings.data?.adSlots.sidebar)}
+            sidebarAdCode={settings.data?.adCodes.sidebar}
             smartLink={settings.data?.smartLink}
           />
         )}
@@ -1388,6 +1437,7 @@ function AppShell() {
             onGoPlans={() => go("plans")}
             onGoHistory={() => go("history")}
             sidebarAdSaved={Boolean(settings.data?.adSlots.sidebar)}
+            sidebarAdCode={settings.data?.adCodes.sidebar}
             smartLink={settings.data?.smartLink}
           />
         )}
@@ -1435,7 +1485,7 @@ function AppShell() {
           </nav>
           {/* Bottom banner ad slot (design: below the footer links) */}
           <div className="mt-6">
-            <AdSlot label="Advertisement · Bottom Banner 728 × 90" saved={Boolean(settings.data?.adSlots.bottom)} />
+            <AdSlot label="Advertisement · Bottom Banner 728 × 90" saved={Boolean(settings.data?.adSlots.bottom)} code={settings.data?.adCodes.bottom} />
           </div>
           <p className="mt-4 pb-2 text-xs text-[var(--dim)] italic">
             {t("home.footer_note")}
@@ -2092,6 +2142,7 @@ type JimengDownloaderPageProps = DownloadFlowProps & {
   onGoPlans: () => void;
   onGoHistory: () => void;
   sidebarAdSaved: boolean;
+  sidebarAdCode: string | null | undefined;
   smartLink: { url: string | null; enabled: boolean } | undefined;
 };
 
@@ -2151,6 +2202,7 @@ function JimengDownloaderPage({
   onGoPlans,
   onGoHistory,
   sidebarAdSaved,
+  sidebarAdCode,
   smartLink,
 }: JimengDownloaderPageProps) {
   const t = useT();
@@ -2847,7 +2899,7 @@ function JimengDownloaderPage({
             <span className="text-[var(--accent)]">ℹ️</span> Only public / published creations work.
           </p>
         </SectionCard>
-        <AdSlot label="Advertisement · Sidebar" sub="300 × 250" saved={sidebarAdSaved} tall />
+        <AdSlot label="Advertisement · Sidebar" sub="300 × 250" saved={sidebarAdSaved} code={sidebarAdCode} tall />
         <SectionCard>
           <h2 className="flex items-center gap-2 text-lg font-extrabold">
             <span className="flex h-6 w-6 items-center justify-center bg-[var(--accent)] text-sm font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>?</span>
@@ -3174,34 +3226,47 @@ function AdsSetup({ settings }: { settings: ApiResponse<typeof api, "getSettings
       <AdminPageHead
         icon="📢"
         title="Advertisement Settings"
-        subtitle="Once your AdSense is approved, paste each slot's code here and save it. No publisher ID is pre-filled — only add your own code."
+        subtitle="Paste each slot's code here and save it — the code renders live in that slot on the site. Four slots already have your Adsterra codes: Top Banner, Head Popunder, In-Content Native Banner, and Social Bar; change or remove any of them any time. No publisher ID is pre-filled — only add your own code."
       />
       <SmartLinkEditor settings={settings} />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
         {AD_SLOTS.map((slot) => (
-          <AdSlotEditor key={slot.key} slot={slot.key} label={slot.label} size={slot.size} saved={Boolean(settings?.adSlots[slot.key])} />
+          <AdSlotEditor key={slot.key} slot={slot.key} label={slot.label} size={slot.size} saved={Boolean(settings?.adSlots[slot.key])} code={settings?.adCodes[slot.key] ?? null} />
         ))}
       </div>
       <p className="text-xs text-[var(--admin-dim)]">
-        The code is stored only on the server and the slot is marked “code saved” — the empty Ad Space boxes on the page are exactly where the ads will appear.
+        Saved code is injected into the slot on the site with real script elements, so ad scripts actually run — an empty slot keeps its dashed placeholder box.
       </p>
     </div>
   );
 }
 
-function AdSlotEditor({ slot, label, size, saved }: { slot: AdSlotKey; label: string; size: string; saved: boolean }) {
+function AdSlotEditor({ slot, label, size, saved, code: savedCode }: { slot: AdSlotKey; label: string; size: string; saved: boolean; code: string | null }) {
   const queryClient = useQueryClient();
   const [code, setCode] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
   const [codeError, setCodeError] = useState<string | null>(null);
+  const init = useRef(false);
+
+  // Prefill from the saved value once it loads — the Top slot's Adsterra
+  // banner is seeded server-side, so it shows here on first open. Only
+  // mark initialised once a real value arrives; settings load async and
+  // an empty slot legitimately stays empty.
+  useEffect(() => {
+    if (savedCode !== null && !init.current) {
+      init.current = true;
+      setCode(savedCode);
+    }
+  }, [savedCode]);
+
   const save = useMutation({
     mutationFn: async () => await api.saveAdCode({ slot, code, token: getToken() }),
-    onSuccess: () => { setMsg("Code saved ✓"); setCode(""); queryClient.invalidateQueries({ queryKey: ["settings"] }); },
+    onSuccess: () => { setMsg("Code saved ✓"); queryClient.invalidateQueries({ queryKey: ["settings"] }); },
     onError: (error) => setMsg(error.message),
   });
   const clear = useMutation({
     mutationFn: () => api.clearAdCode({ slot, token: getToken() }),
-    onSuccess: () => { setMsg("Code removed."); queryClient.invalidateQueries({ queryKey: ["settings"] }); },
+    onSuccess: () => { setMsg("Code removed."); setCode(""); queryClient.invalidateQueries({ queryKey: ["settings"] }); },
   });
 
   function handleSaveCode() {
