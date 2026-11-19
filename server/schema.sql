@@ -2,6 +2,13 @@
 -- Same tables as the Hatch-hosted version (drizzle/0002_downloader_tables.sql).
 -- Applied automatically at server start (CREATE TABLE IF NOT EXISTS).
 
+-- Key/value settings: api_key, api_base_url, adsense_head, adsense_top,
+-- adsense_incontent, adsense_sidebar, adsense_bottom, adsense_socialbar,
+-- smart_link_url, smart_link_enabled, seo_title, seo_description,
+-- seo_keywords, free_daily_limit. adsense_top / adsense_head /
+-- adsense_incontent / adsense_socialbar default to the owner's Adsterra
+-- codes when never set (see getAdSlotCodeValues in handlers.ts); an
+-- explicit remove writes an empty value so the default does not return.
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL

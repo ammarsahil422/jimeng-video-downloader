@@ -127,7 +127,7 @@ function asRecord(v: unknown): Record<string, unknown> | null {
     : null;
 }
 
-const AD_SLOTS = ["head", "top", "incontent", "sidebar", "bottom"] as const;
+const AD_SLOTS = ["head", "top", "incontent", "sidebar", "bottom", "socialbar"] as const;
 type AdSlot = (typeof AD_SLOTS)[number];
 
 // ---------------------------------------------------------------------------
@@ -1067,27 +1067,95 @@ function isHttpUrl(value: string): boolean {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Ad slot codes (Admin → Ads).
+//
+// The site owner's own ad code per slot, stored in the settings table as
+// adsense_<slot> (head / top / incontent / sidebar / bottom / socialbar).
+// The code is a PUBLIC embed snippet by design — the same bytes any
+// visitor's browser would receive inside the page HTML — so getSettings
+// returns the effective code for every slot to everyone, and the client
+// injects it with real script elements (see client/src/adInject.ts).
+// Only the admin can change it (saveAdCode / clearAdCode).
+//
+// Four slots ship with the owner's Adsterra codes as defaults, so the
+// ads show immediately on a fresh database: Top 728×90 banner, Head
+// popunder, In-Content native banner, and the Social Bar. The admin can
+// change or remove any of them in Admin → Ads at any time. Removing
+// writes an empty string (not a deleted row) so the default does NOT
+// come back after a remove — the same pattern as the smart link.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_ADSTERRA_TOP_CODE = `<script>
+  atOptions = {
+    'key' : 'a4e928f8eb4c0f0ff37cb6f0ac928ea2',
+    'format' : 'iframe',
+    'height' : 90,
+    'width' : 728,
+    'params' : {}
+  };
+</script>
+<script src="https://bicea.org/22/a4e928f8eb4c0f0ff37cb6f0ac928ea2"></script>`;
+
+/** The owner's Adsterra popunder, seeded as the Head Code default (site-wide script). */
+const DEFAULT_POPUNDER_HEAD_CODE =
+  `<script data-cfasync="false" src="https://afders.org/1/5a2a072ce17662b32a95c0d3c59626c7"></script>`;
+
+/** The owner's Adsterra Social Bar, seeded as its own site-wide slot's default. */
+const DEFAULT_SOCIAL_BAR_CODE =
+  `<script data-cfasync="false" src="https://bicea.org/14/bf1490030c76c548336e25733bf3e827"></script>`;
+
+/** The owner's Adsterra Native Banner, seeded as the In-Content default. */
+const DEFAULT_NATIVE_INCONTENT_CODE =
+  `<script async="async" data-cfasync="false" src="https://bicea.org/21/0000ec8fe23b2035eca06cc135531a16"></script>\n<div id="container-0000ec8fe23b2035eca06cc135531a16"></div>`;
+
+function getAdSlotCodeValues(env: Env): Record<AdSlot, string | null> {
+  const out = {} as Record<AdSlot, string | null>;
+  for (const key of AD_SLOTS) {
+    const raw = env.store.getSetting(`adsense_${key}`);
+    // Absent row = never touched → the owner's seeded default for that
+    // slot (Top banner, Head popunder, In-Content native, Social Bar).
+    // Present-but-empty = the admin removed it → stays removed.
+    if (raw === null) {
+      if (key === "top") { out[key] = DEFAULT_ADSTERRA_TOP_CODE; continue; }
+      if (key === "head") { out[key] = DEFAULT_POPUNDER_HEAD_CODE; continue; }
+      if (key === "incontent") { out[key] = DEFAULT_NATIVE_INCONTENT_CODE; continue; }
+      if (key === "socialbar") { out[key] = DEFAULT_SOCIAL_BAR_CODE; continue; }
+    }
+    out[key] = raw?.trim() ? raw.trim() : null;
+  }
+  return out;
+}
+
 function getSettings(env: Env, args: unknown): {
   apiKeyHint: string | null;
   hasApiKey: boolean;
   apiBaseUrl: string | null;
   adSlots: Record<AdSlot, boolean>;
+  adCodes: Record<AdSlot, string | null>;
   smartLink: { url: string | null; enabled: boolean };
 } {
   // The API-key hint and base URL are returned only to the admin — regular
-  // visitors get nulls. The ad-slot booleans drive the public placeholders.
-  // The smart link is a public ad link (no secrets), so everyone gets it.
+  // visitors get nulls. The ad-slot codes are public embed snippets by
+  // design, so everyone gets the effective code for every slot. The
+  // "saved" flags follow the effective codes so the placeholder and the
+  // rendered ad never disagree. The smart link is a public ad link
+  // (no secrets), so everyone gets it.
   const isAdmin = authAdmin(env, optToken(args)) !== null;
   const apiKey = isAdmin ? env.store.getSetting("api_key") : null;
+  // Effective codes (the owner's seeded defaults apply on a fresh
+  // database); the "saved" flags follow the effective codes.
+  const codes = getAdSlotCodeValues(env);
   const adSlots = {} as Record<AdSlot, boolean>;
   for (const slot of AD_SLOTS) {
-    adSlots[slot] = Boolean(env.store.getSetting(`adsense_${slot}`));
+    adSlots[slot] = Boolean(codes[slot]);
   }
   return {
     apiKeyHint: isAdmin ? keyHint(apiKey) : null,
     hasApiKey: isAdmin ? Boolean(apiKey) : false,
     apiBaseUrl: isAdmin ? env.store.getSetting("api_base_url") : null,
     adSlots,
+    adCodes: codes,
     smartLink: getSmartLinkValues(env),
   };
 }
@@ -1183,7 +1251,10 @@ function clearAdCode(env: Env, args: unknown): { ok: true } {
   if (typeof slot !== "string" || !(AD_SLOTS as readonly string[]).includes(slot)) {
     throw new HandlerError(400, "slot must be one of: " + AD_SLOTS.join(", "));
   }
-  env.store.deleteSetting(`adsense_${slot}`);
+  // Writes an empty value (not a deleted row) so a seeded default —
+  // the Top banner, Head popunder, In-Content native, or Social Bar —
+  // does not come back after a remove.
+  env.store.setSetting(`adsense_${slot}`, "");
   logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.ads.clear", detail: `Ad code removed from the "${slot}" slot.` });
   return { ok: true as const };
 }
