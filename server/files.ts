@@ -90,10 +90,13 @@ export class FileStore {
     return null;
   }
 
-  store(key: string, bytes: Uint8Array, contentType: string): StoredFile {
+  async store(key: string, bytes: Uint8Array, contentType: string): Promise<StoredFile> {
     const filename = filenameFor(key, contentType);
     const path = this.pathFor(filename);
-    Bun.write(path, bytes);
+    // Bun.write is async: awaiting it matters — prepareDownload returns
+    // success as soon as this resolves, and a download arriving before
+    // the write finished would serve a 0-byte (or partial) file.
+    await Bun.write(path, bytes);
     this.prune();
     return {
       key,
