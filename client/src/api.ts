@@ -216,6 +216,17 @@ export interface Actions {
     error: string | null;
     user: AuthUser | null;
   }>;
+  login: (args: {
+    email: string;
+    password: string;
+  }) => Promise<{
+    ok: boolean;
+    role: "admin" | "customer" | null;
+    token: string | null;
+    error: string | null;
+    admin: AdminUser | null;
+    user: AuthUser | null;
+  }>;
   me: (args: { token?: string }) => Promise<{
     ok: boolean;
     user: AuthUser | null;

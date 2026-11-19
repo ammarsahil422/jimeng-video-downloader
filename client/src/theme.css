@@ -52,8 +52,9 @@
 body {
   font-family: var(--font-sans);
   background:
-    radial-gradient(1100px 480px at 12% -8%, rgba(0, 233, 154, 0.10), transparent 60%),
-    radial-gradient(900px 420px at 88% -6%, rgba(0, 180, 216, 0.07), transparent 60%),
+    radial-gradient(1100px 520px at 12% -8%, rgba(0, 233, 154, 0.13), transparent 60%),
+    radial-gradient(900px 460px at 88% -6%, rgba(0, 180, 216, 0.09), transparent 60%),
+    radial-gradient(700px 380px at 50% 0%, rgba(0, 201, 139, 0.07), transparent 65%),
     var(--bg);
   background-attachment: fixed;
 }
@@ -68,6 +69,38 @@ body {
   }
 }
 
+/* Refined typography: tighter display headings, balanced wrapping. */
+h1, h2, h3 {
+  letter-spacing: -0.015em;
+  text-wrap: balance;
+}
+
+/* Visible keyboard focus — premium and accessible. */
+:focus-visible {
+  outline: 2px solid rgba(0, 233, 154, 0.75);
+  outline-offset: 2px;
+}
+
+/* Input focus glow. */
+input:not([type="checkbox"], [type="radio"]):focus, textarea:focus, select:focus {
+  border-color: rgba(0, 233, 154, 0.55);
+  box-shadow: 0 0 0 3px rgba(0, 233, 154, 0.14);
+  outline: none;
+}
+
+/* Press feedback on every button. */
+button:active {
+  transform: scale(0.98);
+}
+
+/* Gradient accent text for key headings — same palette, richer look. */
+.text-gradient {
+  background: linear-gradient(92deg, #34f5a5 0%, #00e99a 45%, #00c98b 75%, #00b4d8 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
 /* Bright green gradient primary button (design: "Bright Green Gradient"). */
 .cta-gradient {
   background: linear-gradient(180deg, #34f5a5 0%, #00e99a 48%, #00b57e 100%);
@@ -75,7 +108,12 @@ body {
   box-shadow: 0 10px 28px rgba(0, 233, 154, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.4);
 }
 .cta-gradient:hover {
-  filter: brightness(1.06);
+  filter: brightness(1.08);
+  box-shadow: 0 14px 34px rgba(0, 233, 154, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.45);
+}
+.cta-gradient:active {
+  transform: translateY(1px) scale(0.99);
+  box-shadow: 0 6px 18px rgba(0, 233, 154, 0.30), inset 0 1px 0 rgba(255, 255, 255, 0.35);
 }
 .cta-gradient:disabled {
   opacity: 0.5;
@@ -84,15 +122,16 @@ body {
 
 /* Glassmorphism treatment for cards and panels. */
 .glass {
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 8px 28px rgba(0, 0, 0, 0.28);
 }
 
 /* Card hover lift — used by pricing cards, history cards, step cards. */
 .card-hover:hover {
-  transform: translateY(-2px);
-  border-color: rgba(0, 233, 154, 0.45);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45), 0 0 24px rgba(0, 233, 154, 0.10);
+  transform: translateY(-3px);
+  border-color: rgba(0, 233, 154, 0.5);
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.5), 0 0 28px rgba(0, 233, 154, 0.14);
 }
 
 /* Page entrance: every User Panel page fades up on view change. */
@@ -125,6 +164,29 @@ body {
 .pulse-dot {
   animation: pulse-dot 1.2s ease-in-out infinite;
 }
+
+/* Small loading spinner for the full-page loading states. */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+.spinner {
+  display: inline-block;
+  height: 28px;
+  width: 28px;
+  border-radius: 999px;
+  border: 3px solid rgba(0, 233, 154, 0.22);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+
+/* Text selection and scrollbars in the accent palette. */
+::selection {
+  background: rgba(0, 233, 154, 0.32);
+  color: #ffffff;
+}
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgba(0, 233, 154, 0.25); border-radius: 999px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-track { background: transparent; }
 
 /* Admin Panel design system — ChatGPT dashboard reference:
    sidebar #07131B, card #0D1922, secondary accent #00C98B,

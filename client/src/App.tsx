@@ -10,6 +10,7 @@ const FIELDS = {
   saveAdCode: { code: {} },
   submitContact: { name: {}, email: {}, message: {} },
   register: { name: {}, email: {}, password: {} },
+  login: { email: {}, password: {} },
   userLogin: { email: {}, password: {} },
   assignPlan: { durationDays: {}, downloadLimit: {} },
   createPlan: { name: {}, durationDays: {}, downloadLimit: {}, description: {} },
@@ -229,7 +230,7 @@ function PageHero({ icon, title, subtitle }: { icon: string; title: string; subt
       <span className="mx-auto flex h-14 w-14 items-center justify-center border border-[rgba(0,233,154,0.4)] bg-[rgba(0,233,154,0.10)] text-2xl shadow-[0_0_28px_rgba(0,233,154,0.18)]" style={{ borderRadius: 999 }}>
         {icon}
       </span>
-      <h1 className="mt-4 text-3xl font-extrabold sm:text-4xl">{title}</h1>
+      <h1 className="text-gradient mt-4 text-3xl font-extrabold sm:text-4xl">{title}</h1>
       {subtitle && <p className="mx-auto mt-2 max-w-xl text-base text-[var(--dim)]">{subtitle}</p>}
     </div>
   );
@@ -556,12 +557,13 @@ export function App() {
 
   // Admin shell: when the admin is logged in, the Admin Panel renders as
   // its own full-screen shell (sidebar + header) instead of inside the
-  // User Panel page. The admin login page still renders in the user shell.
+  // User Panel page. Login is unified — admin credentials on the single
+  // login page open this shell directly; logout returns to the User Panel.
   if (view === "admin" && admin) {
     return (
       <div className="min-h-screen bg-[var(--bg)] text-[var(--text)]">
         <SafeAreaTopScrim backgroundColor="var(--bg)" />
-        <AdminPanel admin={admin} onLoggedOut={handleLogout} onGoHome={() => go("home")} />
+        <AdminPanel admin={admin} onLoggedOut={handleLogout} />
       </div>
     );
   }
@@ -650,15 +652,6 @@ export function App() {
               {admin && (
                 <button
                   type="button"
-                  onClick={() => go("admin")}
-                  className={`flex items-center justify-between gap-2 px-3 py-3.5 text-left text-lg font-semibold ${view === "admin" ? "text-[var(--accent)]" : ""}`}
-                >
-                  <span>🛡 Admin Panel</span>
-                </button>
-              )}
-              {admin && (
-                <button
-                  type="button"
                   onClick={handleLogout}
                   className="mt-1 flex items-center justify-between gap-2 border-t border-[var(--border)] px-3 py-3.5 text-left text-lg font-semibold text-[var(--err-text)]"
                 >
@@ -725,7 +718,7 @@ export function App() {
                   SEEDANCE 2.0 · JIMENG AI
                 </p>
                 <h1 className="mx-auto mt-4 max-w-3xl text-4xl font-extrabold leading-tight sm:text-5xl">
-                  Jimeng Video Downloader — <span className="text-[var(--accent)]">No Watermark</span>
+                  Jimeng Video Downloader — <span className="text-gradient">No Watermark</span>
                 </h1>
                 <p className="mx-auto mt-3 max-w-2xl text-base text-[var(--dim)] sm:text-lg">
                   Choose a downloader below — paste a public link and download the original MP4. Free, no login required.
@@ -869,27 +862,46 @@ export function App() {
         )}
         {view === "auth" && !userChecked && (
           <main className="mx-auto max-w-3xl py-16 text-center">
-            <p className="text-base text-[var(--dim)]">Loading…</p>
+            <span className="spinner" aria-hidden="true" />
+            <p className="mt-3 text-base text-[var(--dim)]">Loading…</p>
           </main>
         )}
-        {view === "auth" && userChecked && !user && (
+        {view === "auth" && userChecked && !user && !admin && (
           <AuthPage
             onLoggedIn={(u) => { handleUserLoggedIn(u); go("home"); }}
-            onAdminLogin={() => go("admin")}
+            onAdminLoggedIn={(a) => { setAdmin(a); queryClient.invalidateQueries({ queryKey: ["settings"] }); go("admin"); }}
           />
+        )}
+        {view === "auth" && admin && (
+          <main className="mx-auto flex max-w-md flex-col gap-5 pt-16 text-center">
+            <SectionCard>
+              <p className="text-6xl" aria-hidden="true">🛡</p>
+              <h1 className="text-gradient mt-4 text-2xl font-extrabold">Signed in as Admin</h1>
+              <p className="mt-2 text-sm text-[var(--dim)]">You are signed in with {admin.email}.</p>
+              <button
+                type="button"
+                onClick={() => go("admin")}
+                className="cta-gradient mt-5 w-full px-5 py-3 font-extrabold"
+                style={{ borderRadius: "var(--radius)" }}
+              >
+                Open Admin Panel
+              </button>
+            </SectionCard>
+          </main>
         )}
         {view === "auth" && userChecked && user && (
           <MyPlanPage user={user} onGoPlans={() => go("plans")} />
         )}
         {view === "myplan" && !userChecked && (
           <main className="mx-auto max-w-3xl py-16 text-center">
-            <p className="text-base text-[var(--dim)]">Loading…</p>
+            <span className="spinner" aria-hidden="true" />
+            <p className="mt-3 text-base text-[var(--dim)]">Loading…</p>
           </main>
         )}
         {view === "myplan" && userChecked && !user && (
           <AuthPage
             onLoggedIn={(u) => { handleUserLoggedIn(u); }}
-            onAdminLogin={() => go("admin")}
+            onAdminLoggedIn={(a) => { setAdmin(a); queryClient.invalidateQueries({ queryKey: ["settings"] }); go("admin"); }}
           />
         )}
         {view === "myplan" && userChecked && user && (
@@ -926,11 +938,15 @@ export function App() {
         )}
         {view === "admin" && !adminChecked && (
           <main className="mx-auto max-w-3xl py-16 text-center">
-            <p className="text-base text-[var(--dim)]">Loading…</p>
+            <span className="spinner" aria-hidden="true" />
+            <p className="mt-3 text-base text-[var(--dim)]">Loading…</p>
           </main>
         )}
         {view === "admin" && adminChecked && !admin && (
-          <AdminLoginPage onLoggedIn={(a) => { setAdmin(a); queryClient.invalidateQueries({ queryKey: ["settings"] }); }} />
+          <AuthPage
+            onLoggedIn={(u) => { handleUserLoggedIn(u); go("home"); }}
+            onAdminLoggedIn={(a) => { setAdmin(a); queryClient.invalidateQueries({ queryKey: ["settings"] }); go("admin"); }}
+          />
         )}
         {view === "sora" && <SoraPage onGoHome={() => go("jimeng")} />}
         {view === "about" && <AboutPage />}
@@ -2357,7 +2373,7 @@ function formatPrice(cents: number): string {
  * admin, who activates the plan after receiving the payment.
  * ------------------------------------------------------------------------- */
 
-function AuthPage({ onLoggedIn, onAdminLogin }: { onLoggedIn: (u: MeUser) => void; onAdminLogin: () => void }) {
+function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => void; onAdminLoggedIn: (a: AdminUser) => void }) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -2382,15 +2398,27 @@ function AuthPage({ onLoggedIn, onAdminLogin }: { onLoggedIn: (u: MeUser) => voi
     setError(null);
     setBusy(true);
     try {
-      const data =
-        mode === "register"
-          ? await api.register({ name: name.trim(), email: email.trim(), password })
-          : await api.userLogin({ email: email.trim(), password });
-      if (data.ok && data.token && data.user) {
-        setUserToken(data.token);
-        onLoggedIn(data.user);
+      if (mode === "register") {
+        const data = await api.register({ name: name.trim(), email: email.trim(), password });
+        if (data.ok && data.token && data.user) {
+          setUserToken(data.token);
+          onLoggedIn(data.user);
+        } else {
+          setError(data.error ?? "Could not create the account — please try again.");
+        }
       } else {
-        setError(data.error ?? "Incorrect email or password.");
+        // Unified login: admin credentials open the Admin Panel directly,
+        // customer credentials open the User Panel.
+        const data = await api.login({ email: email.trim(), password });
+        if (data.ok && data.token && data.role === "admin" && data.admin) {
+          setToken(data.token);
+          onAdminLoggedIn(data.admin);
+        } else if (data.ok && data.token && data.role === "customer" && data.user) {
+          setUserToken(data.token);
+          onLoggedIn(data.user);
+        } else {
+          setError(data.error ?? "Incorrect email or password.");
+        }
       }
     } catch {
       setError("No response from the server. Please try again in a moment.");
@@ -2402,7 +2430,7 @@ function AuthPage({ onLoggedIn, onAdminLogin }: { onLoggedIn: (u: MeUser) => voi
     <main className="mx-auto flex max-w-md flex-col gap-5">
       <div className="animate-fade-up pt-4 text-center sm:pt-8">
         <span className="inline-block"><Logo /></span>
-        <h1 className="mt-4 text-3xl font-extrabold">{mode === "login" ? "Login" : "Create an account"}</h1>
+        <h1 className="text-gradient mt-4 text-3xl font-extrabold">{mode === "login" ? "Login" : "Create an account"}</h1>
         <p className="mx-auto mt-2 max-w-sm text-base text-[var(--dim)]">
           Downloads are free and need no login. An account is only needed if you want to buy a monthly plan for more downloads.
         </p>
@@ -2442,7 +2470,7 @@ function AuthPage({ onLoggedIn, onAdminLogin }: { onLoggedIn: (u: MeUser) => voi
           <div>
             <label htmlFor="auth-email" className="text-sm font-bold">Email</label>
             <input
-              {...(mode === "register" ? FIELDS.register.email : FIELDS.userLogin.email)}
+              {...(mode === "register" ? FIELDS.register.email : FIELDS.login.email)}
               id="auth-email"
               type="email"
               autoComplete="email"
@@ -2456,7 +2484,7 @@ function AuthPage({ onLoggedIn, onAdminLogin }: { onLoggedIn: (u: MeUser) => voi
           <div>
             <label htmlFor="auth-password" className="text-sm font-bold">Password</label>
             <input
-              {...(mode === "register" ? FIELDS.register.password : FIELDS.userLogin.password)}
+              {...(mode === "register" ? FIELDS.register.password : FIELDS.login.password)}
               id="auth-password"
               type="password"
               autoComplete={mode === "register" ? "new-password" : "current-password"}
@@ -2477,12 +2505,6 @@ function AuthPage({ onLoggedIn, onAdminLogin }: { onLoggedIn: (u: MeUser) => voi
             {busy ? "Please wait…" : mode === "login" ? "🔑 Log in" : "Create my account"}
           </button>
         </form>
-        <p className="mt-3 text-center text-sm text-[var(--dim)]">
-          Site admin?{" "}
-          <button type="button" onClick={onAdminLogin} className="font-bold text-[var(--accent)]">
-            Log in as Admin →
-          </button>
-        </p>
       </SectionCard>
     </main>
   );
@@ -2743,107 +2765,6 @@ function MyPlanPage({ user, onGoPlans }: { user: MeUser; onGoPlans: () => void }
   );
 }
 
-/* -------------------------------------------------------------------------
- * Admin login + Admin Panel.
- *
- * Login is admin-only: the sidebar Login item opens this page, and the
- * admin email/password opens the panel. Downloads stay public — regular
- * visitors never see a login wall. The Ads Setup and API Key sections
- * live here only; they do not render anywhere on the public site.
- * ------------------------------------------------------------------------- */
-
-function AdminLoginPage({ onLoggedIn }: { onLoggedIn: (admin: AdminUser) => void }) {
-  const [email, setEmail] = useState("");
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault();
-    if (!email.trim() || !password) {
-      setError("Enter your admin email and password.");
-      return;
-    }
-    setError(null);
-    setBusy(true);
-    try {
-      const data = await api.adminLogin({ email: email.trim(), password });
-      if (data.ok && data.token && data.admin) {
-        setToken(data.token);
-        onLoggedIn(data.admin);
-      } else {
-        setError(data.error ?? "Incorrect email or password.");
-      }
-    } catch {
-      setError("No response from the server. Please try again in a moment.");
-    }
-    setBusy(false);
-  }
-
-  return (
-    <main className="animate-fade-up mx-auto flex max-w-md flex-col gap-5 pt-4 sm:pt-8">
-      <div className="flex flex-col items-center text-center">
-        <Logo />
-        <p className="mt-4 inline-block border border-[rgba(0,233,154,0.4)] bg-[rgba(0,233,154,0.10)] px-3 py-1 text-[11px] font-extrabold tracking-[0.22em] text-[var(--accent)] uppercase" style={{ borderRadius: 999 }}>
-          Admin Panel
-        </p>
-      </div>
-      <section className="glass border border-[var(--border)] bg-[var(--admin-card)] p-6 shadow-lg shadow-black/30" style={{ borderRadius: "var(--radius)" }}>
-        <div className="flex items-start gap-3">
-          <span className="flex h-12 w-12 shrink-0 items-center justify-center border border-[rgba(0,233,154,0.4)] bg-[rgba(0,233,154,0.10)] text-2xl shadow-[0_0_24px_rgba(0,233,154,0.15)]" style={{ borderRadius: 14 }} aria-hidden="true">
-            🛡
-          </span>
-          <div className="min-w-0">
-            <h1 className="text-2xl font-extrabold">Admin Login</h1>
-            <p className="mt-1 text-sm text-[var(--admin-dim)]">Access your admin panel</p>
-          </div>
-        </div>
-        <form onSubmit={handleSubmit} className="mt-5 flex flex-col gap-3">
-          <div>
-            <label htmlFor="admin-email" className="text-sm font-bold">Admin email</label>
-            <input
-              id="admin-email"
-              type="email"
-              autoComplete="username"
-              value={email}
-              onChange={(e) => { setEmail(e.target.value); if (error) setError(null); }}
-              placeholder="admin@jimengdownloader.com"
-              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5"
-              style={{ borderRadius: "var(--radius)" }}
-            />
-          </div>
-          <div>
-            <label htmlFor="admin-password" className="text-sm font-bold">Password</label>
-            <input
-              id="admin-password"
-              type="password"
-              autoComplete="current-password"
-              value={password}
-              onChange={(e) => { setPassword(e.target.value); if (error) setError(null); }}
-              placeholder="Admin password"
-              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5"
-              style={{ borderRadius: "var(--radius)" }}
-            />
-          </div>
-          {error && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{error}</p>}
-          <button
-            type="submit"
-            disabled={busy}
-            className="cta-gradient px-5 py-3 font-extrabold disabled:opacity-50"
-            style={{ borderRadius: "var(--radius)" }}
-          >
-            {busy ? "Logging in…" : "🔑 Log in as Admin"}
-          </button>
-        </form>
-      </section>
-      <p className="text-center text-sm text-[var(--dim)]">
-        This login is only for the site admin. Downloads on this site are free and need no login.
-      </p>
-      <p className="text-center text-xs font-bold text-[var(--admin-dim)]">🔒 Secure Admin Panel — Only for authorized users.</p>
-    </main>
-  );
-}
-
 /** Shared admin page header: icon badge + title + subtitle, with optional
  *  right-side content (count badge or action). Same visual language as
  *  the Dashboard hero. */
@@ -2859,7 +2780,7 @@ function AdminPageHead({ icon, title, subtitle, right }: { icon: string; title: 
           {icon}
         </span>
         <div className="min-w-0">
-          <h1 className="text-2xl font-extrabold sm:text-3xl">{title}</h1>
+          <h1 className="text-gradient text-2xl font-extrabold sm:text-3xl">{title}</h1>
           {subtitle && <p className="mt-1 text-sm text-[var(--admin-dim)]">{subtitle}</p>}
         </div>
       </div>
@@ -2925,7 +2846,7 @@ type AdminStatsResult = ApiResponse<typeof api, "adminStats">;
  *  top header with admin profile dropdown, content area below. All
  *  seven admin tabs share the same design system (dark navy #050B12,
  *  emerald accent #00E99A, glassmorphism cards). */
-function AdminPanel({ admin, onLoggedOut, onGoHome }: { admin: AdminUser; onLoggedOut: () => void; onGoHome: () => void }) {
+function AdminPanel({ admin, onLoggedOut }: { admin: AdminUser; onLoggedOut: () => void }) {
   const [tab, setTab] = useState<AdminTab>("dashboard");
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [profileOpen, setProfileOpen] = useState(false);
@@ -2997,7 +2918,7 @@ function AdminPanel({ admin, onLoggedOut, onGoHome }: { admin: AdminUser; onLogg
   );
 
   return (
-    <div className="flex min-h-screen">
+    <div className="animate-fade-up flex min-h-screen">
       {/* Desktop sidebar */}
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-64 flex-col border-r border-[rgba(0,233,154,0.14)] bg-[var(--admin-sidebar)] lg:flex">
         {nav}
@@ -3067,15 +2988,6 @@ function AdminPanel({ admin, onLoggedOut, onGoHome }: { admin: AdminUser; onLogg
                       <p className="truncate text-sm font-extrabold">{admin.name || "Admin"}</p>
                       <p className="truncate text-xs text-[var(--admin-dim)]">{admin.email}</p>
                     </div>
-                    <button
-                      type="button"
-                      role="menuitem"
-                      onClick={() => { setProfileOpen(false); onGoHome(); }}
-                      className="mt-1 flex w-full items-center gap-2 px-3 py-2.5 text-left text-sm font-bold hover:bg-white/5"
-                      style={{ borderRadius: 10 }}
-                    >
-                      🌐 View user site
-                    </button>
                     <button
                       type="button"
                       role="menuitem"
@@ -3185,7 +3097,7 @@ function AdminDashboard({ stats, onNavigate }: {
           </span>
           <div className="min-w-0 flex-1">
             <h1 className="text-2xl font-extrabold sm:text-3xl">Jimeng Video Downloader</h1>
-            <p className="mt-1 text-lg font-extrabold text-[var(--accent)] sm:text-xl">Admin Dashboard</p>
+            <p className="text-gradient mt-1 text-lg font-extrabold sm:text-xl">Admin Dashboard</p>
             <p className="mt-2 text-sm text-[var(--admin-dim)] sm:text-base">Manage your platform efficiently.</p>
           </div>
           <span className="hidden shrink-0 md:block" aria-hidden="true">
