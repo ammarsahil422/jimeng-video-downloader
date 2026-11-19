@@ -12,20 +12,28 @@ or on a computer), the same Download button saves the file normally.
 
 ## What this package is
 
-- **Client:** the same React site (downloader, preview, quality list,
-  download history, optional API-key box, AdSense-ready slots, About /
-  Privacy Policy / Contact pages), with a side menu (☰ Menu: Jimeng
-  Downloader, Download History, What is Jimeng?, How to Use, FAQ, Bulk
-  Download, Contact, About, Privacy Policy), a separate Download History
-  page, and Bulk Download (up to 10 links at once). The whole interface
-  is in English. Prebuilt in `public/` — it runs as-is.
-  Source is in `client/` if you ever want to change the design.
+- **Client:** the same React site, with a downloaders hub as the home
+  page (Jimeng is live; Sora is listed only as "Coming Soon"). Opening
+  Jimeng shows its downloader page with **Single** mode (one video) and
+  **Bulk** mode (up to 10 links at once): each resolved video gets its
+  own export-quality dropdown (real qualities only), its own Download
+  button, plus **Download All** (downloads one after another) and
+  **Download ZIP** (one ZIP file with all the videos, made in the
+  browser). Also: downloader, preview, quality list, download history,
+  optional API-key box, AdSense-ready slots, Plans / My Plan pages,
+  Login/Register, About / Privacy Policy / Contact pages, and a side
+  menu (☰ Menu: Jimeng Downloader, Download History, What is Jimeng?,
+  How to Use, FAQ, Bulk Download, Contact, About, Privacy Policy).
+  The whole interface is in English. Prebuilt in `public/` — it runs
+  as-is. Source is in `client/` if you ever want to change the design.
 - **Server:** `server/server.ts` (Bun). It serves the client, answers the
   site's actions (`POST /actions`), and serves prepared downloads from
   `/blobs/<key>`.
-- **Storage:** a plain SQLite file (`data/app.db`, created on first run) for
-  settings, download history and contact messages; downloaded videos are
-  cached on disk under `data/files/` (oldest deleted first after 5 GB —
+- **Storage:** a plain SQLite file (`data/app.db`, created on first run)
+  for settings, download history, contact messages, customer accounts,
+  plans, subscriptions, purchase requests, payments and per-download
+  events (free daily limit + MB totals); downloaded videos are cached
+  on disk under `data/files/` (oldest deleted first after 5 GB —
   change with `MAX_CACHE_BYTES`).
 - **No Hatch SDK, no external services, no npm runtime dependencies.**
   The server needs only Bun. The client build needs `bun install` once.
@@ -73,17 +81,46 @@ This package now matches the latest Muse-app version:
 - **How to Use** now also documents the phone method the user found:
   on the playing video, tap the three dots (⋮) → Share → Save at the
   end of the share sheet, and the video saves to the gallery.
-- **Admin Panel (admin-only login):** downloads stay public — no login,
-  no user accounts. The sidebar has a Login item; entering the admin
-  email/password opens the Admin Panel with Dashboard (downloads today /
-  total, storage used, recent downloads), Ads (the AdSense slots moved
-  here — they no longer appear on the public site), API Key settings,
-  and Settings (change the admin password, shows the admin email). The
-  admin account is seeded automatically on first boot
-  (`admin@jimengdownloader.com`); the password is set by the site owner
-  and is not written in this repo. On Render Free the database resets
-  on restart/redeploy, so the admin account is re-seeded on every boot
-  and the same admin login keeps working.
+- **Home hub + Jimeng page (Single / Bulk):** the home page is now a
+  downloaders hub — Jimeng is the only live downloader for now (Sora
+  is "Coming Soon"). Clicking Jimeng opens its own downloader page.
+  **Single** mode downloads one video; **Bulk** mode takes up to 10
+  links, resolves them one by one, and each video gets its own
+  export-quality dropdown (real qualities only) and Download button.
+  **Download All** downloads the videos one after another
+  automatically, and **Download ZIP** packs all of them into one ZIP
+  file (built in the browser with JSZip — no server change needed).
+- **Subscription system (new):** downloads stay public — no login
+  needed. Customers can register/login to buy a monthly plan:
+  Starter 1,000 videos / 30 days / $4.99, Pro 5,000 / 30 days / $9.99,
+  Business 10,000 / 30 days / $19.99 (seeded defaults; editable in
+  Admin → Plans). Free users get a daily limit set in Admin → Settings
+  (default 10/day; 0 = unlimited) — anonymous visitors are counted per
+  browser, logged-in customers per account. When the free limit is hit,
+  the Plans page opens automatically with Buy buttons. There is **no
+  payment gateway yet**: Buy creates a pending purchase request and the
+  admin marks it paid, then activates the plan by hand (Admin →
+  Payments). Suspended customers cannot download; deleting a customer
+  keeps their recorded payments.
+- **Admin Panel (admin-only login, fully redesigned):** the sidebar has
+  a Login item; entering the admin email/password opens the Admin Panel
+  with Dashboard (11 real stats: customers, free/subscribed users,
+  plans sold, revenue, transactions, downloads + MB today/total,
+  storage; last-7-days chart; recent downloads/payments/signups; quick
+  actions), Customers (search, plan assign with duration/limit,
+  suspend/unsuspend, delete with confirmation), Plans (create/edit/
+  activate/deactivate — editing a plan never changes a running
+  subscription), Payments (pending requests, Mark Paid form, paid →
+  activate, manual payment, recorded payments), Ads (the AdSense slots
+  moved here — they no longer appear on the public site), API Key
+  settings (masked, last 4 characters only), and Settings (free daily
+  limit, admin email, change admin password). The admin account is
+  seeded automatically on first boot (`admin@jimengdownloader.com`);
+  the password is set by the site owner and is not written in this
+  repo. On Render Free the database resets on restart/redeploy, so the
+  admin account is re-seeded on every boot and the same admin login
+  keeps working — but customer accounts, plans and payment records do
+  NOT survive a Render Free restart (no persistent disk).
 
 ## What you need
 
@@ -334,17 +371,27 @@ those steps. Nothing needs to be rebuilt for the move.
 
 ## Using the site
 
-- **Download a video:** paste a public Jimeng share link (or the whole
-  Chinese share text — the link is extracted from inside it), press
-  "Get Video", pick a quality (clean Origin files come first), press
-  "Download MP4", then press **"Download Now"** in the Save panel.
-  In a real browser that saves the file to Downloads. On a phone, "Share
-  and Save" hands the file to the system share sheet instead. Or, on the
-  playing video itself, tap the three dots (⋮) → Share → Save at the end
-  of the share sheet to save it straight to the gallery.
-- **Bulk Download:** open it from the ☰ Menu, paste up to 10 links (one
-  per line), and each video is resolved in turn with its own Download
-  button.
+- **Download a video:** the home page is a downloaders hub — click
+  **Jimeng** to open its downloader page. Paste a public Jimeng share
+  link (or the whole Chinese share text — the link is extracted from
+  inside it), press "Get Video", pick a quality (clean Origin files
+  come first), press "Download MP4", then press **"Download Now"** in
+  the Save panel. In a real browser that saves the file to Downloads.
+  On a phone, "Share and Save" hands the file to the system share sheet
+  instead. Or, on the playing video itself, tap the three dots (⋮) →
+  Share → Save at the end of the share sheet to save it straight to
+  the gallery.
+- **Bulk Download:** on the Jimeng page, switch to **Bulk** mode, paste
+  up to 10 links (one per line), press Fetch, and each video is
+  resolved in turn with its own quality dropdown and Download button.
+  **Download All** downloads them one after another; **Download ZIP**
+  packs all of them into one ZIP file (extract it to get all the
+  videos). The same Bulk page is also in the ☰ Menu.
+- **Plans (optional, no login needed to download):** free users get 10
+  downloads a day (set in Admin → Settings). Register/login to buy a
+  monthly plan (Starter / Pro / Business) — Buy sends a request to the
+  admin, who activates the plan after receiving the payment. Your plan,
+  remaining downloads and today's usage are on the **My Plan** page.
 - **History:** every successful resolve is saved in "My Download
   History" (open it from the ☰ Menu or the History button) and stays
   after a restart (SQLite). Old history rows from the
@@ -378,8 +425,9 @@ sudo systemctl restart jimeng-downloader
 ## Backups
 
 Back up `data/` — it holds `app.db` (settings, history, contact
-messages) and `data/files/` (cached videos). Everything else in this
-folder can be re-downloaded/rebuilt.
+messages, customer accounts, plans, subscriptions and payments) and
+`data/files/` (cached videos). Everything else in this folder can be
+re-downloaded/rebuilt.
 
 ## Troubleshooting
 
@@ -434,3 +482,62 @@ for that case fixed it in the re-test above, but if you ever see only a
 button saves the file on *your* phone after you deploy. That is the step
 this whole package exists for — please test it on your phone once the
 site is on your domain, and tell us if it saves or not.
+
+## Verification (done 19 Nov 2026 — subscription system, hub, admin redesign sync)
+
+The standalone server was run locally with a fresh empty database and
+tested end-to-end (106 automated checks, all passing):
+
+- **Home hub + Jimeng page:** `GET /` returns 200; the built client
+  bundle contains the hub, the Jimeng downloader page, Single/Bulk
+  modes, "Download All" and "Download ZIP" (and no Hatch SDK strings).
+- **Resolve + download (real Jimeng links):**
+  `jimeng.jianying.com/s/f-SQrY1mR80/` ("adegan yang sama hanya ganti
+  peran jadi semprul") → clean files first, default **720p · Origin
+  (No Watermark), 720×1254, 2,325,839 bytes**; `prepareDownload`
+  returned ok and `GET /blobs/…` returned **exactly 2,325,839 bytes**,
+  `video/mp4`, attachment disposition, Range → 206. ffprobe on the
+  saved file: **h264, 720×1254, 10.08 s**. Bulk: two more real links
+  resolved the same way (2,527,890 and 4,014,875 bytes), and the three
+  prepared files were packed into a ZIP (8,868,920 bytes, 3 entries,
+  byte-identical to the prepared files) — the same fetch the browser's
+  Download ZIP button does.
+- **Subscriptions:** register/login, seeded Starter $4.99 / Pro $9.99 /
+  Business $19.99 plans; Buy → pending → Mark Paid ($9.99, JazzCash)
+  → Activate → Pro with 5,000 remaining; duplicate Buy returns the
+  existing request; admin cannot Buy; manual payment recorded;
+  assignPlan replaces the running plan; editing a plan does not change
+  running subscriptions; deactivated plans disappear from the public
+  Plans page.
+- **Free daily limit:** set to 2 for the test — an anonymous browser
+  and a plan-less customer each got 2 downloads, the 3rd was blocked
+  with `limitReached: true`; a customer with a plan downloaded past
+  the limit on plan quota.
+- **Suspend / delete:** suspended customer cannot download or log in;
+  unsuspend restores both; deleting a customer keeps their recorded
+  payments (revenue history stays correct).
+- **Ads + API key:** AdSense code saved/cleared per slot; API key
+  saved with hint `••••7890` for the admin only (visitors get nulls);
+  key cleared cleanly.
+- **Admin dashboard:** 3 customers, 3 subscribed, 0 free, 1 plan sold,
+  $15.98 revenue, 3 transactions, 13 downloads today, 34 MB today,
+  7-day chart with today = 13, recent signups/payments/downloads all
+  correct. Wrong admin password rejected; bogus tokens get 401.
+- **History scoping:** a customer sees only their own rows, an
+  anonymous browser sees only unattributed rows, the admin sees all.
+- **Restart:** the server was stopped and restarted on the same
+  database — it came up cleanly (the `downloads.user_id` / `anon_id`
+  migration is a no-op on the second boot) with all data intact.
+
+One bug was found and fixed during this run: `server/files.ts` called
+`Bun.write` without awaiting it, so a download requested immediately
+after `prepareDownload` could briefly serve a 0-byte file. `store()`
+is now async and awaited — the byte-exact checks above were re-run
+after the fix and pass.
+
+**Not tested here (needs the real admin password, which is not in
+this package):** logging in as the admin with the actual password,
+and changing the admin password with the current one. Both were tested
+only for wrong-password rejection. The owner should log in once after
+deploying and confirm the Admin Panel opens; the seeded admin account
+is `admin@jimengdownloader.com`.
