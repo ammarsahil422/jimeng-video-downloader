@@ -1,0 +1,36 @@
+# Jimeng Video Downloader — nginx reverse proxy (optional).
+# Use this when you want the site on your domain with HTTPS (port 443).
+# Without it, the site works fine at http://YOUR-SERVER-IP:3000.
+#
+# Install (Ubuntu):
+#   sudo apt install -y nginx
+#   sudo cp nginx.conf.example /etc/nginx/sites-available/jimeng-downloader
+#   # Edit server_name below to your domain, then:
+#   sudo ln -s /etc/nginx/sites-available/jimeng-downloader /etc/nginx/sites-enabled/
+#   sudo nginx -t && sudo systemctl reload nginx
+#   # Free HTTPS certificate (Let's Encrypt):
+#   sudo apt install -y certbot python3-certbot-nginx
+#   sudo certbot --nginx -d yourdomain.com -d www.yourdomain.com
+#
+# Replace yourdomain.com with your real domain in both places below.
+
+server {
+    listen 80;
+    server_name yourdomain.com www.yourdomain.com;
+
+    # Big enough for video downloads served through the app.
+    client_max_body_size 300m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Downloads can take a while on slow connections (the server fetches
+        # the video from Jimeng's CDN first) — do not cut them off early.
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+}

@@ -1,0 +1,33 @@
+# Jimeng Video Downloader — systemd service (optional, recommended).
+# Keeps the site running after reboot and restarts it if it crashes.
+#
+# Install:
+#   1. Edit the paths below (User + WorkingDirectory) to match your server.
+#   2. sudo cp jimeng-downloader.service /etc/systemd/system/
+#   3. sudo systemctl daemon-reload
+#   4. sudo systemctl enable --now jimeng-downloader
+#   5. sudo systemctl status jimeng-downloader   (check it is running)
+# Logs: sudo journalctl -u jimeng-downloader -f
+
+[Unit]
+Description=Jimeng Video Downloader (standalone Bun server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# --- EDIT THESE TWO LINES ---------------------------------------------------
+User=ubuntu
+WorkingDirectory=/home/ubuntu/jimeng-video-downloader-standalone
+# ----------------------------------------------------------------------------
+ExecStart=/home/ubuntu/.bun/bin/bun run server/server.ts
+Restart=on-failure
+RestartSec=5
+Environment=PORT=3000
+Environment=HOST=0.0.0.0
+Environment=DATA_DIR=/home/ubuntu/jimeng-video-downloader-standalone/data
+# No secrets needed: the optional API key and AdSense codes are stored in the
+# SQLite database through the site's own Settings pages, not in env vars.
+
+[Install]
+WantedBy=multi-user.target

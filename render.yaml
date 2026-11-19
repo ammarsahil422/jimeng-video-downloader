@@ -1,0 +1,31 @@
+# Render blueprint — deploys the Jimeng Video Downloader as one free
+# web service (Docker). In the Render dashboard: New → Blueprint, pick
+# the repo containing this folder, and Render creates the service from
+# this file. Or create a Web Service manually and point it at this repo
+# with the Docker runtime.
+#
+# Region: Frankfurt (close to Pakistan / the Middle East; Oregon works
+# the same if you prefer a US region).
+# PORT is set automatically by Render — do not set it here.
+# No persistent disk: not available on the Render free plan, so the
+# SQLite database (download history, settings) and the cached video
+# files live in the container and reset when the service restarts or
+# redeploys. See "Path C — Deploy on Render (free)" in README.md.
+
+services:
+  - type: web
+    name: jimeng-video-downloader
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: DATA_DIR
+        value: /app/data
+      - key: MAX_CACHE_BYTES
+        value: "5000000000"
