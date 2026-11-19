@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import JSZip from "jszip";
+import QRCode from "qrcode";
 import { SafeAreaTopScrim } from "./safe-area";
 import { api, type ApiResponse } from "./api";
 
@@ -1682,7 +1683,7 @@ function NotificationsPage() {
   });
   const items = notifications.data?.items ?? [];
   const unreadCount = notifications.data?.unreadCount ?? 0;
-  const typeIcon: Record<string, string> = { payment: "💳", plan: "💎", limit: "⚠️", support: "🎫" };
+  const typeIcon: Record<string, string> = { payment: "💳", plan: "💎", limit: "⚠️", support: "🎫", announcement: "📢" };
 
   return (
     <main className="mx-auto flex max-w-3xl flex-col gap-5">
@@ -3687,6 +3688,11 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Admin 2FA: after the password checks out, the server asks for the
+  // 6-digit authenticator code (totpRequired). The code step replaces
+  // the password form; the email/password stay in state for the retry.
+  const [totpRequired, setTotpRequired] = useState(false);
+  const [totpCode, setTotpCode] = useState("");
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -3700,6 +3706,10 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
     }
     if (mode === "register" && password.length < 8) {
       setError("The password must be at least 8 characters.");
+      return;
+    }
+    if (totpRequired && !/^\d{6}$/.test(totpCode.trim())) {
+      setError("Enter the 6-digit code from your authenticator app.");
       return;
     }
     setError(null);
@@ -3716,13 +3726,21 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
       } else {
         // Unified login: admin credentials open the Admin Panel directly,
         // customer credentials open the User Panel.
-        const data = await api.login({ email: email.trim(), password });
+        const data = await api.login({
+          email: email.trim(),
+          password,
+          ...(totpRequired ? { totpCode: totpCode.trim() } : {}),
+        });
         if (data.ok && data.token && data.role === "admin" && data.admin) {
           setToken(data.token);
           onAdminLoggedIn(data.admin);
         } else if (data.ok && data.token && data.role === "customer" && data.user) {
           setUserToken(data.token);
           onLoggedIn(data.user);
+        } else if (data.totpRequired) {
+          setTotpRequired(true);
+          setTotpCode("");
+          setError(null);
         } else {
           setError(data.error ?? "Incorrect email or password.");
         }
@@ -3802,6 +3820,32 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
               style={{ borderRadius: "var(--radius)" }}
             />
           </div>
+          {totpRequired && mode === "login" && (
+            <div>
+              <label htmlFor="auth-totp" className="text-sm font-bold">Two-factor code</label>
+              <input
+                id="auth-totp"
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={6}
+                value={totpCode}
+                onChange={(e) => { setTotpCode(e.target.value.replace(/\D/g, "").slice(0, 6)); if (error) setError(null); }}
+                placeholder="6-digit code"
+                className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-center text-xl font-extrabold tracking-[0.4em]"
+                style={{ borderRadius: "var(--radius)" }}
+              />
+              <p className="mt-1 text-xs text-[var(--dim)]">
+                Two-factor authentication is on for this admin account — enter the 6-digit code from your authenticator app.
+              </p>
+              <button
+                type="button"
+                onClick={() => { setTotpRequired(false); setTotpCode(""); setError(null); }}
+                className="mt-1 text-xs font-bold text-[var(--accent)]"
+              >
+                ← Back to email &amp; password
+              </button>
+            </div>
+          )}
           {error && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{error}</p>}
           <button
             type="submit"
@@ -3809,7 +3853,7 @@ function AuthPage({ onLoggedIn, onAdminLoggedIn }: { onLoggedIn: (u: MeUser) => 
             className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50"
             style={{ borderRadius: "var(--radius)" }}
           >
-            {busy ? "Please wait…" : mode === "login" ? "🔑 Log in" : "Create my account"}
+            {busy ? "Please wait…" : totpRequired ? "Verify code" : mode === "login" ? "🔑 Log in" : "Create my account"}
           </button>
         </form>
       </SectionCard>
@@ -4131,13 +4175,16 @@ function AdminPagination({ page, totalPages, onPage }: { page: number; totalPage
   );
 }
 
-type AdminTab = "dashboard" | "customers" | "plans" | "payments" | "ads" | "apikey" | "settings" | "support";
+type AdminTab = "dashboard" | "customers" | "plans" | "payments" | "ads" | "apikey" | "settings" | "support" | "logs" | "reports";
 
 /** The admin sidebar has exactly these items. The reference image shows
  *  extra routes (Video Analytics, Revenue Reports, Notifications,
  *  Backup & Restore, Premium upsell…); none of those exist in this
  *  system, so none are added here. "Support" is real: it holds support
- *  ticket management and Help Center article management (Phase 3). */
+ *  ticket management and Help Center article management (Phase 3) plus
+ *  broadcast announcements (Phase 4). "Logs" holds the real system log
+ *  and the manual backup/restore (Phase 4); "Reports" holds real
+ *  date-range analytics (Phase 4). */
 const ADMIN_NAV: { key: AdminTab; label: string; icon: string }[] = [
   { key: "dashboard", label: "Dashboard", icon: "📊" },
   { key: "customers", label: "Customers", icon: "👥" },
@@ -4146,6 +4193,8 @@ const ADMIN_NAV: { key: AdminTab; label: string; icon: string }[] = [
   { key: "ads", label: "Ads", icon: "📢" },
   { key: "apikey", label: "API Key", icon: "🔑" },
   { key: "support", label: "Support", icon: "🎫" },
+  { key: "logs", label: "Logs", icon: "📋" },
+  { key: "reports", label: "Reports", icon: "📈" },
   { key: "settings", label: "Settings", icon: "⚙️" },
 ];
 
@@ -4321,6 +4370,8 @@ function AdminPanel({ admin, onLoggedOut }: { admin: AdminUser; onLoggedOut: () 
           {tab === "ads" && <AdsSetup settings={settings.data} />}
           {tab === "apikey" && <ApiKeyBox settings={settings.data} />}
           {tab === "support" && <SupportAdmin />}
+          {tab === "logs" && <LogsAdmin />}
+          {tab === "reports" && <ReportsAdmin />}
           {tab === "settings" && <AdminSettings admin={admin} />}
         </main>
 
@@ -4629,6 +4680,13 @@ function CustomersAdmin() {
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<"all" | "active" | "disabled">("all");
   const [page, setPage] = useState(1);
+  // Password reset (Phase 4): the admin sets a new password for a
+  // customer — needed after a backup restore, when restored accounts
+  // have no usable password. The new password is shown once, so the
+  // admin can share it with the customer privately.
+  const [resetId, setResetId] = useState<number | null>(null);
+  const [resetPw, setResetPw] = useState("");
+  const [resetMsg, setResetMsg] = useState<string | null>(null);
 
   function invalidate() {
     queryClient.invalidateQueries({ queryKey: ["admin-customers"] });
@@ -4702,6 +4760,28 @@ function CustomersAdmin() {
       }
     } catch {
       setMsg("No response from the server. Please try again in a moment.");
+    }
+    setBusyId(null);
+  }
+
+  async function handleResetPassword(customer: CustomerRow) {
+    if (resetPw.length < 8) {
+      setResetMsg("The new password must be at least 8 characters.");
+      return;
+    }
+    setBusyId(customer.id);
+    setResetMsg(null);
+    try {
+      const data = await api.resetCustomerPassword({ userId: customer.id, newPassword: resetPw, token: getToken() });
+      if (data.ok) {
+        setMsg(`${customer.name}'s password was reset to “${resetPw}” — share it with them privately. Their sessions were signed out.`);
+        setResetId(null);
+        setResetPw("");
+      } else {
+        setResetMsg(data.error ?? "Could not reset the password.");
+      }
+    } catch {
+      setResetMsg("No response from the server. Please try again in a moment.");
     }
     setBusyId(null);
   }
@@ -4958,7 +5038,43 @@ function CustomersAdmin() {
                         Delete
                       </button>
                     )}
+                    <button
+                      type="button"
+                      onClick={() => { setResetId(resetId === c.id ? null : c.id); setResetPw(""); setResetMsg(null); }}
+                      className="border border-[var(--border)] px-4 py-2 text-sm font-bold"
+                      style={{ borderRadius: "var(--radius)" }}
+                    >
+                      Reset password
+                    </button>
                   </div>
+                  {resetId === c.id && (
+                    <div className="mt-3 border border-[var(--border)] bg-[var(--surface-alt)] p-3" style={{ borderRadius: "var(--radius)" }}>
+                      <p className="text-xs font-bold text-[var(--dim)]">
+                        Set a new password for {c.name}. Their sessions are signed out immediately. The new password is shown once here — share it with the customer privately. Needed after a backup restore, when restored accounts have no usable password.
+                      </p>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <input
+                          type="text"
+                          autoComplete="off"
+                          value={resetPw}
+                          onChange={(e) => setResetPw(e.target.value)}
+                          placeholder="New password (min 8 characters)"
+                          className="min-w-0 flex-1 border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm"
+                          style={{ borderRadius: "var(--radius)" }}
+                        />
+                        <button
+                          type="button"
+                          disabled={busyId === c.id}
+                          onClick={() => handleResetPassword(c)}
+                          className="bg-[var(--accent)] px-4 py-2 text-sm font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
+                          style={{ borderRadius: "var(--radius)" }}
+                        >
+                          {busyId === c.id ? "Saving…" : "Set password"}
+                        </button>
+                      </div>
+                      {resetMsg && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{resetMsg}</p>}
+                    </div>
+                  )}
                 </div>
               )}
             </li>
@@ -5926,6 +6042,8 @@ function AdminSettings({ admin }: { admin: AdminUser }) {
           </button>
         </form>
       </SectionCard>
+
+      <SecurityAdmin />
     </div>
   );
 }
@@ -5938,7 +6056,7 @@ const SUPPORT_TICKETS_PAGE_SIZE = 10;
  *  on this site, so nothing is emailed. */
 function SupportAdmin() {
   const queryClient = useQueryClient();
-  const [sub, setSub] = useState<"tickets" | "articles">("tickets");
+  const [sub, setSub] = useState<"tickets" | "articles" | "broadcasts">("tickets");
   const [statusFilter, setStatusFilter] = useState<"all" | "open" | "answered" | "closed">("open");
   const [search, setSearch] = useState("");
   const [page, setPage] = useState(1);
@@ -6019,7 +6137,17 @@ function SupportAdmin() {
         >
           Help articles
         </button>
+        <button
+          type="button"
+          onClick={() => setSub("broadcasts")}
+          className={`px-4 py-2 text-sm font-extrabold ${sub === "broadcasts" ? "cta-gradient" : "border border-[var(--border)] bg-[var(--surface)]"}`}
+          style={{ borderRadius: "var(--radius)" }}
+        >
+          📢 Announcements
+        </button>
       </div>
+
+      {sub === "broadcasts" && <BroadcastAdmin />}
 
       {sub === "tickets" && selectedId === null && (
         <>
@@ -6335,5 +6463,826 @@ function HelpArticlesAdmin({ articles, loading }: { articles: { id: number; titl
         ))}
       </ul>
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 4 — Logs & Backup, Reports, Security, Broadcasts (master spec).
+// All data is real and server-backed. Nothing here is seeded or faked:
+// the log only ever shows events that actually happened after the
+// system_logs table existed, and reports only aggregate real rows.
+// ---------------------------------------------------------------------------
+
+/** Downloads a text file (JSON backup, CSV report) through the browser. */
+function downloadTextFile(filename: string, text: string, mime: string): void {
+  const blob = new Blob([text], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function csvCell(value: string | number): string {
+  const s = String(value);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function downloadCsv(filename: string, headers: string[], rows: (string | number)[][]): void {
+  const lines = [headers.map(csvCell).join(","), ...rows.map((r) => r.map(csvCell).join(","))];
+  downloadTextFile(filename, lines.join("\n"), "text/csv");
+}
+
+/** QR code drawn from the otpauth:// URL with the `qrcode` package —
+ *  generated locally in the browser as SVG (no canvas needed, no
+ *  external QR service — the secret must never be sent to a third
+ *  party). */
+function QrCode({ value }: { value: string }) {
+  const [svg, setSvg] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    QRCode.toString(value, { type: "svg", margin: 1, width: 220, color: { dark: "#050B12", light: "#FFFFFF" } })
+      .then((s) => { if (!cancelled) setSvg(s); })
+      .catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; };
+  }, [value]);
+  if (failed) return <p className="text-sm text-[var(--err-text)]">Could not draw the QR code — use the secret text below instead.</p>;
+  if (!svg) return <Skeleton className="h-56 w-56" />;
+  // The SVG string is generated locally by the qrcode library from the
+  // otpauth URL — it contains no user content, so inner HTML is safe.
+  return <div className="h-56 w-56 [&>svg]:h-full [&>svg]:w-full" style={{ borderRadius: 12 }} dangerouslySetInnerHTML={{ __html: svg }} />;
+}
+
+type SystemLogRow = ApiResponse<typeof api, "listSystemLogs">["logs"][number];
+
+const LOGS_PAGE_SIZE = 50;
+
+/** Admin → Logs: the real system log (newest first, filter + search +
+ *  pagination) and manual Backup & Restore. */
+function LogsAdmin() {
+  const queryClient = useQueryClient();
+  const [actionFilter, setActionFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [page, setPage] = useState(1);
+  const [backupMsg, setBackupMsg] = useState<string | null>(null);
+  const [backupError, setBackupError] = useState<string | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [restoreMsg, setRestoreMsg] = useState<string | null>(null);
+  const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restoreConfirmed, setRestoreConfirmed] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  const logs = useQuery({
+    queryKey: ["system-logs", actionFilter, search, page],
+    queryFn: () =>
+      api.listSystemLogs({
+        action: actionFilter === "all" ? undefined : actionFilter,
+        search: search.trim() || undefined,
+        limit: LOGS_PAGE_SIZE,
+        offset: (page - 1) * LOGS_PAGE_SIZE,
+        token: getToken(),
+      }),
+  });
+
+  const total = logs.data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / LOGS_PAGE_SIZE));
+  const safePage = Math.min(page, totalPages);
+  const actions = logs.data?.actions ?? [];
+
+  async function handleDownloadBackup() {
+    setBackupError(null);
+    setBackupMsg(null);
+    setBackupBusy(true);
+    try {
+      const data = await api.exportBackup({ token: getToken() });
+      if (data.ok) {
+        downloadTextFile(data.filename, data.json, "application/json");
+        setBackupMsg(`Backup downloaded as ${data.filename}. Keep the file safe — anyone with it can restore your data.`);
+        queryClient.invalidateQueries({ queryKey: ["system-logs"] });
+      } else {
+        setBackupError(data.error ?? "Could not create the backup.");
+      }
+    } catch {
+      setBackupError("No response from the server. Please try again in a moment.");
+    }
+    setBackupBusy(false);
+  }
+
+  async function handleRestoreFile(file: File) {
+    setRestoreError(null);
+    setRestoreMsg(null);
+    setRestoreBusy(true);
+    try {
+      const text = await file.text();
+      const data = await api.restoreBackup({ json: text, token: getToken() });
+      if (data.ok && data.restored) {
+        setRestoreMsg(
+          `Backup restored: ${data.restored.users} users, ${data.restored.plans} plans, ${data.restored.downloads} downloads, ${data.restored.payments} payments, ${data.restored.tickets} tickets. Restored customer accounts have no usable password — reset each one from Customers → Reset password before they can log in. Your admin account was kept intact.`,
+        );
+        queryClient.invalidateQueries({ queryKey: ["system-logs"] });
+        queryClient.invalidateQueries({ queryKey: ["admin-customers"] });
+        queryClient.invalidateQueries({ queryKey: ["admin-stats"] });
+      } else {
+        setRestoreError(data.error ?? "Could not restore the backup.");
+      }
+    } catch {
+      setRestoreError("Could not read that file. Choose a backup JSON downloaded from this page.");
+    }
+    setRestoreBusy(false);
+    if (fileRef.current) fileRef.current.value = "";
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <AdminPageHead
+        icon="📋"
+        title="System Logs"
+        subtitle="Every real admin action, newest first. Nothing is seeded — an empty log just means nothing has happened yet."
+      />
+      <p className="border border-[rgba(0,233,154,0.35)] bg-[rgba(0,233,154,0.08)] p-3 text-sm font-semibold text-[var(--admin-dim)]" style={{ borderRadius: "var(--radius)" }}>
+        ⚠️ Hosting note: this site runs on free hosting with no persistent disk, so the log and all other data live in the database and reset if the server restarts or redeploys. Download a backup (below) after important changes — there is no automatic scheduled backup to disk.
+      </p>
+
+      <SectionCard className="bg-[var(--admin-card)]">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
+          <div className="min-w-0 flex-1">
+            <label htmlFor="logs-search" className="text-sm font-bold">Search logs</label>
+            <input
+              id="logs-search"
+              type="search"
+              value={search}
+              onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+              placeholder="Email, action or detail…"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          <div>
+            <label htmlFor="logs-action" className="text-sm font-bold">Action</label>
+            <select
+              id="logs-action"
+              value={actionFilter}
+              onChange={(e) => { setActionFilter(e.target.value); setPage(1); }}
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm sm:w-56"
+              style={{ borderRadius: "var(--radius)" }}
+            >
+              <option value="all">All actions</option>
+              {actions.map((a) => (
+                <option key={a} value={a}>{a}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+        <p className="mt-3 text-sm font-bold text-[var(--admin-dim)]">
+          {logs.data ? `${total.toLocaleString()} event${total === 1 ? "" : "s"}` : "Loading…"}
+        </p>
+      </SectionCard>
+
+      {logs.isPending && (
+        <div className="flex flex-col gap-2">
+          <Skeleton className="h-14 w-full" />
+          <Skeleton className="h-14 w-full" />
+        </div>
+      )}
+      {logs.data && logs.data.logs.length === 0 && (
+        <SectionCard className="py-12 text-center">
+          <p className="text-6xl" aria-hidden="true">📋</p>
+          <h2 className="mt-4 text-xl font-extrabold">No log events yet</h2>
+          <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--admin-dim)]">
+            Admin actions (logins, plan changes, payments, settings, ticket replies, announcements) appear here as they happen.
+          </p>
+        </SectionCard>
+      )}
+      <ul className="flex flex-col gap-2">
+        {logs.data?.logs.map((l: SystemLogRow) => (
+          <li key={l.id} className="border border-[var(--border)] bg-[var(--surface-alt)] p-3 text-sm" style={{ borderRadius: "var(--radius)" }}>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-extrabold text-[var(--accent)]">{l.action}</span>
+              <span className="text-xs text-[var(--admin-dim)]">{new Date(l.createdAt).toLocaleString()}</span>
+            </div>
+            {l.detail && <p className="mt-1">{l.detail}</p>}
+            {l.actorEmail && <p className="mt-0.5 text-xs text-[var(--admin-dim)]">{l.actorType} · {l.actorEmail}</p>}
+          </li>
+        ))}
+      </ul>
+      {total > 0 && (
+        <div className="flex flex-col items-center gap-3">
+          <p className="text-xs text-[var(--admin-dim)]">
+            Showing {(safePage - 1) * LOGS_PAGE_SIZE + 1}–{Math.min(safePage * LOGS_PAGE_SIZE, total)} of {total.toLocaleString()} events
+          </p>
+          <AdminPagination page={safePage} totalPages={totalPages} onPage={setPage} />
+        </div>
+      )}
+
+      <SectionCard className="bg-[var(--admin-card)]">
+        <h2 className="text-lg font-extrabold">💾 Backup &amp; Restore</h2>
+        <p className="mt-1 text-sm leading-relaxed text-[var(--admin-dim)]">
+          Download a full backup of the database as a JSON file — users, plans, subscriptions, payments, downloads, favourites, notifications, tickets, articles, settings and the log itself. Password hashes, two-factor secrets and session tokens are <strong>never</strong> included in the file. The file also contains the saved API key and ad codes, so keep it private.
+        </p>
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            disabled={backupBusy}
+            onClick={handleDownloadBackup}
+            className="bg-[var(--accent)] px-5 py-2.5 font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {backupBusy ? "Preparing…" : "⬇ Download backup (JSON)"}
+          </button>
+        </div>
+        {backupError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{backupError}</p>}
+        {backupMsg && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{backupMsg}</p>}
+
+        <div className="mt-5 border-t border-[var(--border)] pt-4">
+          <h3 className="text-base font-extrabold">Restore from a backup</h3>
+          <p className="mt-1 text-sm leading-relaxed text-[var(--admin-dim)]">
+            Upload a backup JSON downloaded from this page. It <strong>replaces all data</strong> (users, plans, payments, downloads, tickets, settings, log) with the backup's contents. Your admin account is kept intact with its real password, so you are never locked out, and your current session stays logged in. Restored customer accounts get no usable password — reset each one from Customers → Reset password before they can log in. Malformed files are rejected with an error and nothing is changed.
+          </p>
+          <label className="mt-3 flex items-start gap-2 text-sm font-bold">
+            <input
+              type="checkbox"
+              checked={restoreConfirmed}
+              onChange={(e) => setRestoreConfirmed(e.target.checked)}
+              className="mt-0.5 h-4 w-4 shrink-0 accent-[var(--accent)]"
+            />
+            I understand this replaces all current data with the backup file.
+          </label>
+          <input
+            ref={fileRef}
+            type="file"
+            accept="application/json,.json"
+            className="hidden"
+            aria-label="Choose a backup JSON file"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) void handleRestoreFile(f);
+            }}
+          />
+          <button
+            type="button"
+            disabled={restoreBusy || !restoreConfirmed}
+            onClick={() => fileRef.current?.click()}
+            className="mt-3 border border-[var(--border)] px-5 py-2.5 font-extrabold disabled:opacity-50"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {restoreBusy ? "Restoring…" : "Choose backup file…"}
+          </button>
+          {restoreError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{restoreError}</p>}
+          {restoreMsg && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{restoreMsg}</p>}
+        </div>
+      </SectionCard>
+    </div>
+  );
+}
+
+type ReportDay = ApiResponse<typeof api, "getReports">["days"][number];
+
+/** Admin → Reports: real date-range analytics (UTC days) with CSV export. */
+function ReportsAdmin() {
+  const today = new Date();
+  const defaultTo = today.toISOString().slice(0, 10);
+  const defaultFrom = new Date(today.getTime() - 29 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const [from, setFrom] = useState(defaultFrom);
+  const [to, setTo] = useState(defaultTo);
+  const [rangeError, setRangeError] = useState<string | null>(null);
+
+  const valid = /^\d{4}-\d{2}-\d{2}$/.test(from) && /^\d{4}-\d{2}-\d{2}$/.test(to) && from <= to;
+  const reports = useQuery({
+    queryKey: ["reports", from, to],
+    queryFn: () => api.getReports({ from, to, token: getToken() }),
+    enabled: valid,
+  });
+  const data = reports.data;
+  const maxDownloads = Math.max(1, ...(data?.days.map((d) => d.downloads) ?? [1]));
+
+  function loadRange() {
+    if (!valid) {
+      setRangeError("Pick a valid date range (from date on or before the to date).");
+      return;
+    }
+    setRangeError(null);
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <AdminPageHead
+        icon="📈"
+        title="Reports &amp; Analytics"
+        subtitle="Real numbers from your downloads, payments and signups — nothing is invented. Days are UTC days; empty days show zero."
+      />
+      <SectionCard className="bg-[var(--admin-card)]">
+        <div className="flex flex-wrap items-end gap-3">
+          <label className="text-sm font-bold">
+            From
+            <input
+              type="date"
+              value={from}
+              max={to}
+              onChange={(e) => setFrom(e.target.value)}
+              className="mt-1 block border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </label>
+          <label className="text-sm font-bold">
+            To
+            <input
+              type="date"
+              value={to}
+              min={from}
+              onChange={(e) => setTo(e.target.value)}
+              className="mt-1 block border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </label>
+          <button
+            type="button"
+            onClick={loadRange}
+            disabled={reports.isFetching}
+            className="bg-[var(--accent)] px-5 py-2.5 font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {reports.isFetching ? "Loading…" : "Load report"}
+          </button>
+          <button
+            type="button"
+            onClick={() => { setFrom(defaultFrom); setTo(defaultTo); setRangeError(null); }}
+            className="border border-[var(--border)] px-4 py-2.5 font-bold"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            Last 30 days
+          </button>
+        </div>
+        {rangeError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{rangeError}</p>}
+        {data && !data.ok && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{data.error ?? "Could not load the report."}</p>}
+      </SectionCard>
+
+      {reports.isPending && (
+        <div className="flex flex-col gap-2">
+          <Skeleton className="h-20 w-full" />
+          <Skeleton className="h-40 w-full" />
+        </div>
+      )}
+
+      {data?.ok && (
+        <>
+          <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
+            <AdminStatCard icon="⬇️" value={data.totals.downloads.toLocaleString()} label="Downloads" />
+            <AdminStatCard icon="💰" value={formatPrice(data.totals.revenueCents)} label="Revenue" />
+            <AdminStatCard icon="👤" value={data.totals.signups.toLocaleString()} label="New signups" />
+            <AdminStatCard icon="💎" value={data.totals.plansSold.toLocaleString()} label="Plans sold" />
+            <AdminStatCard icon="💾" value={`${data.totals.mbUsed.toFixed(1)} MB`} label="Bandwidth used" />
+          </div>
+
+          <SectionCard className="bg-[var(--admin-card)]">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-lg font-extrabold">Downloads per day</h2>
+              <button
+                type="button"
+                onClick={() => downloadCsv(`downloads-${from}-to-${to}.csv`, ["date", "downloads", "revenue_usd", "signups"], data.days.map((d: ReportDay) => [d.date, d.downloads, (d.revenueCents / 100).toFixed(2), d.signups]))}
+                className="border border-[var(--border)] px-4 py-2 text-sm font-extrabold"
+                style={{ borderRadius: "var(--radius)" }}
+              >
+                ⬇ CSV — daily downloads
+              </button>
+            </div>
+            <ul className="mt-4 flex flex-col gap-2">
+              {data.days.map((d: ReportDay) => (
+                <li key={d.date} className="flex items-center gap-3 text-sm">
+                  <span className="w-24 shrink-0 font-bold text-[var(--admin-dim)]">{d.date}</span>
+                  <span className="h-5 min-w-0 flex-1 overflow-hidden rounded-full bg-white/5" aria-hidden="true">
+                    <span
+                      className="block h-full rounded-full bg-[var(--accent)]"
+                      style={{ width: `${Math.max(d.downloads > 0 ? 2 : 0, (d.downloads / maxDownloads) * 100)}%` }}
+                    />
+                  </span>
+                  <span className="w-16 shrink-0 text-right font-extrabold">{d.downloads.toLocaleString()}</span>
+                  <span className="hidden w-24 shrink-0 text-right text-[var(--admin-dim)] sm:block">{formatPrice(d.revenueCents)}</span>
+                  <span className="hidden w-20 shrink-0 text-right text-[var(--admin-dim)] sm:block">{d.signups} new</span>
+                </li>
+              ))}
+            </ul>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => downloadCsv(`revenue-${from}-to-${to}.csv`, ["date", "revenue_usd"], data.days.map((d: ReportDay) => [d.date, (d.revenueCents / 100).toFixed(2)]))}
+                className="border border-[var(--border)] px-4 py-2 text-sm font-extrabold"
+                style={{ borderRadius: "var(--radius)" }}
+              >
+                ⬇ CSV — revenue
+              </button>
+              <button
+                type="button"
+                onClick={() => downloadCsv(`signups-${from}-to-${to}.csv`, ["date", "signups"], data.days.map((d: ReportDay) => [d.date, d.signups]))}
+                className="border border-[var(--border)] px-4 py-2 text-sm font-extrabold"
+                style={{ borderRadius: "var(--radius)" }}
+              >
+                ⬇ CSV — signups
+              </button>
+            </div>
+          </SectionCard>
+
+          <SectionCard className="bg-[var(--admin-card)]">
+            <h2 className="text-lg font-extrabold">Top customers by downloads</h2>
+            {data.topCustomers.length === 0 ? (
+              <p className="mt-2 text-sm text-[var(--admin-dim)]">No logged-in customer downloads in this range.</p>
+            ) : (
+              <ul className="mt-3 flex flex-col gap-2">
+                {data.topCustomers.map((c) => (
+                  <li key={c.userId} className="flex flex-wrap items-center justify-between gap-2 border border-[var(--border)] bg-[var(--surface-alt)] p-3 text-sm" style={{ borderRadius: "var(--radius)" }}>
+                    <span className="min-w-0">
+                      <span className="block truncate font-extrabold">{c.name}</span>
+                      <span className="block truncate text-xs text-[var(--admin-dim)]">{c.email}</span>
+                    </span>
+                    <span className="font-extrabold text-[var(--accent)]">{c.downloads.toLocaleString()} downloads · {c.mb.toFixed(1)} MB</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </SectionCard>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Admin → Settings → Security: admin 2FA (TOTP), active sessions with
+ *  revocation, locked-out accounts, and the rate-limit rule. */
+function SecurityAdmin() {
+  const queryClient = useQueryClient();
+  const security = useQuery({ queryKey: ["security-overview"], queryFn: () => api.getSecurityOverview({ token: getToken() }) });
+  const [setup, setSetup] = useState<{ secret: string; otpauthUrl: string } | null>(null);
+  const [setupCode, setSetupCode] = useState("");
+  const [setupMsg, setSetupMsg] = useState<string | null>(null);
+  const [setupError, setSetupError] = useState<string | null>(null);
+  const [setupBusy, setSetupBusy] = useState(false);
+  const [disablePw, setDisablePw] = useState("");
+  const [disableCode, setDisableCode] = useState("");
+  const [disableMsg, setDisableMsg] = useState<string | null>(null);
+  const [disableError, setDisableError] = useState<string | null>(null);
+  const [disableBusy, setDisableBusy] = useState(false);
+  const [revokeMsg, setRevokeMsg] = useState<string | null>(null);
+  const [revokeError, setRevokeError] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState<string | null>(null);
+
+  async function handleStartSetup() {
+    setSetupError(null);
+    setSetupBusy(true);
+    try {
+      const data = await api.startTotpSetup({ token: getToken() });
+      if (data.ok && data.secret && data.otpauthUrl) {
+        setSetup({ secret: data.secret, otpauthUrl: data.otpauthUrl });
+        setSetupCode("");
+      } else {
+        setSetupError(data.error ?? "Could not start 2FA setup.");
+      }
+    } catch {
+      setSetupError("No response from the server. Please try again in a moment.");
+    }
+    setSetupBusy(false);
+  }
+
+  async function handleConfirmSetup() {
+    if (!/^\d{6}$/.test(setupCode.trim())) {
+      setSetupError("Enter the 6-digit code from your authenticator app.");
+      return;
+    }
+    setSetupError(null);
+    setSetupMsg(null);
+    setSetupBusy(true);
+    try {
+      const data = await api.confirmTotpSetup({ code: setupCode.trim(), token: getToken() });
+      if (data.ok) {
+        setSetupMsg("Two-factor authentication is now ON. Your next admin login will ask for a code after the password.");
+        setSetup(null);
+        setSetupCode("");
+        queryClient.invalidateQueries({ queryKey: ["security-overview"] });
+      } else {
+        setSetupError(data.error ?? "That code is not correct.");
+      }
+    } catch {
+      setSetupError("No response from the server. Please try again in a moment.");
+    }
+    setSetupBusy(false);
+  }
+
+  async function handleDisable() {
+    if (!disablePw || !/^\d{6}$/.test(disableCode.trim())) {
+      setDisableError("Enter your current password and the 6-digit code.");
+      return;
+    }
+    setDisableError(null);
+    setDisableMsg(null);
+    setDisableBusy(true);
+    try {
+      const data = await api.disableTotp({ password: disablePw, code: disableCode.trim(), token: getToken() });
+      if (data.ok) {
+        setDisableMsg("Two-factor authentication is now OFF.");
+        setDisablePw("");
+        setDisableCode("");
+        queryClient.invalidateQueries({ queryKey: ["security-overview"] });
+      } else {
+        setDisableError(data.error ?? "Could not disable 2FA.");
+      }
+    } catch {
+      setDisableError("No response from the server. Please try again in a moment.");
+    }
+    setDisableBusy(false);
+  }
+
+  async function handleRevoke(prefix: string) {
+    setRevokeError(null);
+    setRevokeMsg(null);
+    setRevoking(prefix);
+    try {
+      const data = await api.revokeSession({ tokenPrefix: prefix, token: getToken() });
+      if (data.ok) {
+        setRevokeMsg("Session revoked — that user is signed out now.");
+        queryClient.invalidateQueries({ queryKey: ["security-overview"] });
+      } else {
+        setRevokeError(data.error ?? "Could not revoke the session.");
+      }
+    } catch {
+      setRevokeError("No response from the server. Please try again in a moment.");
+    }
+    setRevoking(null);
+  }
+
+  const totpEnabled = security.data?.totpEnabled ?? false;
+  const sessions = security.data?.sessions ?? [];
+  const locked = security.data?.lockedAccounts ?? [];
+
+  return (
+    <SectionCard className="bg-[var(--admin-card)]">
+      <h2 className="text-lg font-extrabold">🔒 Security</h2>
+      <p className="mt-1 text-sm text-[var(--admin-dim)]">
+        Login rate limiting is always on: after 5 failed logins for one email within 15 minutes, that email is locked out for 15 minutes. A successful login clears the counter.
+      </p>
+
+      <div className="mt-4 border-t border-[var(--border)] pt-4">
+        <h3 className="text-base font-extrabold">Two-factor authentication (admin)</h3>
+        {security.isPending ? (
+          <Skeleton className="mt-2 h-10 w-full" />
+        ) : totpEnabled ? (
+          <>
+            <p className="mt-1 text-sm font-semibold text-[var(--accent)]">✅ 2FA is ON — admin login needs a 6-digit code after the password.</p>
+            <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+              <input
+                type="password"
+                autoComplete="current-password"
+                value={disablePw}
+                onChange={(e) => setDisablePw(e.target.value)}
+                placeholder="Current admin password"
+                className="min-w-0 flex-1 border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm"
+                style={{ borderRadius: "var(--radius)" }}
+              />
+              <input
+                inputMode="numeric"
+                autoComplete="one-time-code"
+                maxLength={6}
+                value={disableCode}
+                onChange={(e) => setDisableCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                placeholder="6-digit code"
+                className="w-36 border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm"
+                style={{ borderRadius: "var(--radius)" }}
+              />
+              <button
+                type="button"
+                disabled={disableBusy}
+                onClick={handleDisable}
+                className="border border-[rgba(248,113,113,0.5)] px-4 py-2 text-sm font-extrabold text-[var(--err-text)] disabled:opacity-50"
+                style={{ borderRadius: "var(--radius)" }}
+              >
+                {disableBusy ? "Disabling…" : "Disable 2FA"}
+              </button>
+            </div>
+            {disableError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{disableError}</p>}
+            {disableMsg && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{disableMsg}</p>}
+          </>
+        ) : (
+          <>
+            <p className="mt-1 text-sm text-[var(--admin-dim)]">
+              2FA is OFF. Turn it on to require a 6-digit code from an authenticator app (Google Authenticator, Authy, …) after the admin password. Customer accounts do not get 2FA.
+            </p>
+            {!setup && (
+              <button
+                type="button"
+                disabled={setupBusy}
+                onClick={handleStartSetup}
+                className="mt-3 bg-[var(--accent)] px-4 py-2 text-sm font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
+                style={{ borderRadius: "var(--radius)" }}
+              >
+                {setupBusy ? "Generating…" : "Enable two-factor authentication"}
+              </button>
+            )}
+            {setup && (
+              <div className="mt-3 border border-[var(--border)] bg-[var(--surface-alt)] p-4" style={{ borderRadius: "var(--radius)" }}>
+                <p className="text-sm font-bold">1. Scan this QR code with your authenticator app</p>
+                <div className="mt-3 flex justify-center bg-white p-3" style={{ borderRadius: 12, width: "fit-content" }}>
+                  <QrCode value={setup.otpauthUrl} />
+                </div>
+                <p className="mt-3 text-sm font-bold">2. Or enter the secret manually</p>
+                <p className="mt-1 break-all border border-[var(--border)] bg-[var(--bg)] px-3 py-2 font-mono text-sm select-all">{setup.secret}</p>
+                <p className="mt-1 text-xs text-[var(--admin-dim)]">The QR code is drawn in your browser — the secret is never sent to any outside service. Keep it private like a password.</p>
+                <p className="mt-3 text-sm font-bold">3. Enter the 6-digit code to confirm</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <input
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    maxLength={6}
+                    value={setupCode}
+                    onChange={(e) => setSetupCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                    placeholder="6-digit code"
+                    className="w-40 border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-center text-lg font-extrabold tracking-[0.3em]"
+                    style={{ borderRadius: "var(--radius)" }}
+                  />
+                  <button
+                    type="button"
+                    disabled={setupBusy}
+                    onClick={handleConfirmSetup}
+                    className="bg-[var(--accent)] px-4 py-2 text-sm font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
+                    style={{ borderRadius: "var(--radius)" }}
+                  >
+                    {setupBusy ? "Verifying…" : "Confirm & turn on 2FA"}
+                  </button>
+                  <button type="button" onClick={() => { setSetup(null); setSetupCode(""); setSetupError(null); }} className="border border-[var(--border)] px-4 py-2 text-sm font-bold" style={{ borderRadius: "var(--radius)" }}>
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+            {setupError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{setupError}</p>}
+            {setupMsg && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{setupMsg}</p>}
+          </>
+        )}
+      </div>
+
+      <div className="mt-5 border-t border-[var(--border)] pt-4">
+        <h3 className="text-base font-extrabold">Active sessions</h3>
+        <p className="mt-1 text-sm text-[var(--admin-dim)]">Every signed-in session (admin + customers). Revoking a session signs that user out immediately. Your own current session cannot be revoked — use Logout instead.</p>
+        {security.isPending ? (
+          <Skeleton className="mt-2 h-14 w-full" />
+        ) : sessions.length === 0 ? (
+          <p className="mt-2 text-sm text-[var(--admin-dim)]">No active sessions.</p>
+        ) : (
+          <ul className="mt-3 flex flex-col gap-2">
+            {sessions.map((s) => (
+              <li key={s.tokenPrefix + s.email} className="flex flex-wrap items-center justify-between gap-2 border border-[var(--border)] bg-[var(--surface-alt)] p-3 text-sm" style={{ borderRadius: "var(--radius)" }}>
+                <span className="min-w-0">
+                  <span className="block truncate font-extrabold">{s.email} {s.isCurrent && <span className="text-[var(--accent)]">(this session)</span>}</span>
+                  <span className="block text-xs text-[var(--admin-dim)]">
+                    {s.role} · session {s.tokenPrefix} · signed in {new Date(s.createdAt).toLocaleString()}
+                    {s.lastSeenAt ? ` · last seen ${new Date(s.lastSeenAt).toLocaleString()}` : ""}
+                  </span>
+                </span>
+                {!s.isCurrent && (
+                  <button
+                    type="button"
+                    disabled={revoking === s.tokenPrefix}
+                    onClick={() => handleRevoke(s.tokenPrefix)}
+                    className="border border-[rgba(248,113,113,0.5)] px-3 py-1.5 text-xs font-extrabold text-[var(--err-text)] disabled:opacity-50"
+                    style={{ borderRadius: 8 }}
+                  >
+                    {revoking === s.tokenPrefix ? "Revoking…" : "Revoke"}
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        {revokeError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{revokeError}</p>}
+        {revokeMsg && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{revokeMsg}</p>}
+      </div>
+
+      {locked.length > 0 && (
+        <div className="mt-5 border-t border-[var(--border)] pt-4">
+          <h3 className="text-base font-extrabold">🔐 Locked out by failed logins</h3>
+          <ul className="mt-3 flex flex-col gap-2">
+            {locked.map((l) => (
+              <li key={l.email} className="border border-[rgba(248,113,113,0.45)] bg-[rgba(248,113,113,0.08)] p-3 text-sm" style={{ borderRadius: "var(--radius)" }}>
+                <span className="font-extrabold">{l.email}</span>
+                <span className="block text-xs text-[var(--admin-dim)]">
+                  {l.failedCount} failed attempts · locked until {l.lockedUntil ? new Date(l.lockedUntil).toLocaleString() : "—"}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </SectionCard>
+  );
+}
+
+/** Admin → Support → Announcements: write a broadcast that becomes a
+ *  real in-app notification for every registered customer. No email —
+ *  in-app only. */
+function BroadcastAdmin() {
+  const queryClient = useQueryClient();
+  const [title, setTitle] = useState("");
+  const [message, setMessage] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const broadcasts = useQuery({ queryKey: ["broadcasts"], queryFn: () => api.listBroadcasts({ token: getToken() }) });
+
+  async function handleSend(e: React.FormEvent) {
+    e.preventDefault();
+    if (!title.trim() || !message.trim()) {
+      setError("Write a title and a message first.");
+      return;
+    }
+    setError(null);
+    setMsg(null);
+    setBusy(true);
+    try {
+      const data = await api.createBroadcast({ title: title.trim(), message: message.trim(), token: getToken() });
+      if (data.ok) {
+        setMsg(`Announcement sent to ${data.recipientCount} customer${data.recipientCount === 1 ? "" : "s"}. It appears in their Notifications (in-app only — no email is sent).`);
+        setTitle("");
+        setMessage("");
+        queryClient.invalidateQueries({ queryKey: ["broadcasts"] });
+      } else {
+        setError(data.error ?? "Could not send the announcement.");
+      }
+    } catch {
+      setError("No response from the server. Please try again in a moment.");
+    }
+    setBusy(false);
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <SectionCard className="bg-[var(--admin-card)]">
+        <h2 className="text-lg font-extrabold">📢 Send an announcement</h2>
+        <p className="mt-1 text-sm text-[var(--admin-dim)]">
+          Write once, reach every registered customer as an in-app notification. Use it for maintenance notices, new features or plan news. No email is sent — customers see it in Notifications.
+        </p>
+        <form onSubmit={handleSend} className="mt-4 flex flex-col gap-3">
+          <div>
+            <label htmlFor="broadcast-title" className="text-sm font-bold">Title</label>
+            <input
+              id="broadcast-title"
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              maxLength={200}
+              placeholder="e.g. New: Bulk downloads are faster"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          <div>
+            <label htmlFor="broadcast-message" className="text-sm font-bold">Message</label>
+            <textarea
+              id="broadcast-message"
+              value={message}
+              onChange={(e) => setMessage(e.target.value)}
+              maxLength={2000}
+              rows={4}
+              placeholder="Write the announcement…"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          {error && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{error}</p>}
+          {msg && <p className="text-sm font-semibold text-[var(--accent)]" role="status">{msg}</p>}
+          <button
+            type="submit"
+            disabled={busy}
+            className="cta-gradient self-start px-5 py-2.5 font-extrabold disabled:opacity-50"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {busy ? "Sending…" : "Send to all customers"}
+          </button>
+        </form>
+      </SectionCard>
+
+      <SectionCard className="bg-[var(--admin-card)]">
+        <h2 className="text-lg font-extrabold">Past announcements</h2>
+        {broadcasts.isPending && (
+          <div className="mt-3 flex flex-col gap-2">
+            <Skeleton className="h-14 w-full" />
+            <Skeleton className="h-14 w-full" />
+          </div>
+        )}
+        {broadcasts.data && broadcasts.data.broadcasts.length === 0 && (
+          <p className="mt-2 text-sm text-[var(--admin-dim)]">No announcements sent yet.</p>
+        )}
+        <ul className="mt-3 flex flex-col gap-2">
+          {broadcasts.data?.broadcasts.map((b) => (
+            <li key={b.id} className="border border-[var(--border)] bg-[var(--surface-alt)] p-3 text-sm" style={{ borderRadius: "var(--radius)" }}>
+              <p className="font-extrabold">{b.title}</p>
+              <p className="mt-1 whitespace-pre-line">{b.message}</p>
+              <p className="mt-1 text-xs text-[var(--admin-dim)]">
+                Sent to {b.recipientCount} customer{b.recipientCount === 1 ? "" : "s"} · {new Date(b.createdAt).toLocaleString()}
+              </p>
+            </li>
+          ))}
+        </ul>
+      </SectionCard>
+    </div>
   );
 }

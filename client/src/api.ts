@@ -93,6 +93,67 @@ export type AdminTicketItem = TicketItem & {
   customerEmail: string;
 };
 
+// Phase 4 — system logs, broadcasts, reports, security overview.
+
+export type SystemLogItem = {
+  id: number;
+  actorType: string;
+  actorEmail: string | null;
+  action: string;
+  detail: string;
+  createdAt: string;
+};
+
+export type BroadcastItem = {
+  id: number;
+  title: string;
+  message: string;
+  recipientCount: number;
+  createdAt: string;
+};
+
+export type ReportsResult = {
+  ok: boolean;
+  error: string | null;
+  days: {
+    date: string;
+    downloads: number;
+    revenueCents: number;
+    signups: number;
+  }[];
+  totals: {
+    downloads: number;
+    revenueCents: number;
+    signups: number;
+    plansSold: number;
+    mbUsed: number;
+  };
+  topCustomers: {
+    userId: number;
+    name: string;
+    email: string;
+    downloads: number;
+    mb: number;
+  }[];
+};
+
+export type SecurityOverview = {
+  totpEnabled: boolean;
+  sessions: {
+    tokenPrefix: string;
+    email: string;
+    role: string;
+    isCurrent: boolean;
+    createdAt: string;
+    lastSeenAt: string | null;
+  }[];
+  lockedAccounts: {
+    email: string;
+    failedCount: number;
+    lockedUntil: string | null;
+  }[];
+};
+
 export type DownloadQualityPref = "best" | "original" | "720p" | "480p" | "360p";
 export type DownloadModePref = "single" | "bulk";
 
@@ -240,11 +301,13 @@ export interface Actions {
   adminLogin: (args: {
     email: string;
     password: string;
+    totpCode?: string;
   }) => Promise<{
     ok: boolean;
     token: string | null;
     error: string | null;
     admin: AdminUser | null;
+    totpRequired: boolean;
   }>;
   adminLogout: (args: { token?: string }) => Promise<{ ok: true }>;
   adminMe: (args: { token?: string }) => Promise<{
@@ -279,6 +342,7 @@ export interface Actions {
   login: (args: {
     email: string;
     password: string;
+    totpCode?: string;
   }) => Promise<{
     ok: boolean;
     role: "admin" | "customer" | null;
@@ -286,6 +350,7 @@ export interface Actions {
     error: string | null;
     admin: AdminUser | null;
     user: AuthUser | null;
+    totpRequired: boolean;
   }>;
   me: (args: { token?: string }) => Promise<{
     ok: boolean;
@@ -419,6 +484,76 @@ export interface Actions {
   setTicketStatus: (args: {
     id: number;
     status: "open" | "closed";
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  // Phase 4 — System Logs, Backup & Restore, Reports, Security, Broadcasts.
+  listSystemLogs: (args: {
+    action?: string;
+    search?: string;
+    limit?: number;
+    offset?: number;
+    token?: string;
+  }) => Promise<{
+    logs: SystemLogItem[];
+    total: number;
+    actions: string[];
+  }>;
+  exportBackup: (args: { token?: string }) => Promise<{
+    ok: boolean;
+    error: string | null;
+    filename: string;
+    json: string;
+  }>;
+  restoreBackup: (args: {
+    json: string;
+    token?: string;
+  }) => Promise<{
+    ok: boolean;
+    error: string | null;
+    restored: {
+      users: number;
+      plans: number;
+      downloads: number;
+      payments: number;
+      tickets: number;
+    } | null;
+  }>;
+  getReports: (args: {
+    from: string;
+    to: string;
+    token?: string;
+  }) => Promise<ReportsResult>;
+  createBroadcast: (args: {
+    title: string;
+    message: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null; recipientCount: number }>;
+  listBroadcasts: (args: { token?: string }) => Promise<{
+    broadcasts: BroadcastItem[];
+  }>;
+  getSecurityOverview: (args: { token?: string }) => Promise<SecurityOverview>;
+  revokeSession: (args: {
+    tokenPrefix: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  startTotpSetup: (args: { token?: string }) => Promise<{
+    ok: boolean;
+    error: string | null;
+    secret: string | null;
+    otpauthUrl: string | null;
+  }>;
+  confirmTotpSetup: (args: {
+    code: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  disableTotp: (args: {
+    password: string;
+    code: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  resetCustomerPassword: (args: {
+    userId: number;
+    newPassword: string;
     token?: string;
   }) => Promise<{ ok: boolean; error: string | null }>;
   logout: (args: { token?: string }) => Promise<{ ok: true }>;
