@@ -199,3 +199,41 @@ CREATE TABLE IF NOT EXISTS ticket_messages (
 
 CREATE INDEX IF NOT EXISTS ticket_messages_ticket_idx
   ON ticket_messages (ticket_id, created_at);
+
+-- Phase 4 (master spec, ported from the artifact's drizzle/0007
+-- migration): system logs, login rate limiting, broadcasts. The
+-- users.totp_secret / users.totp_enabled and sessions.last_seen_at
+-- columns are added by db.ts at Store startup (PRAGMA-guarded ALTER,
+-- like downloads.user_id / anon_id), so old databases keep working.
+-- Logs are NEVER seeded — rows only appear for real admin actions.
+-- There is no email service: ticket replies and broadcasts are
+-- delivered in-app via notifications.
+CREATE TABLE IF NOT EXISTS system_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor_type TEXT NOT NULL,
+  actor_email TEXT,
+  action TEXT NOT NULL,
+  detail TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS system_logs_created_idx
+  ON system_logs (created_at DESC);
+
+CREATE INDEX IF NOT EXISTS system_logs_action_idx
+  ON system_logs (action, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS login_attempts (
+  email TEXT PRIMARY KEY,
+  failed_count INTEGER NOT NULL DEFAULT 0,
+  first_failed_at INTEGER NOT NULL,
+  locked_until INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  recipient_count INTEGER NOT NULL DEFAULT 0,
+  created_at INTEGER NOT NULL
+);

@@ -8,6 +8,7 @@
 // Login is admin-only (sidebar → Login → Admin Panel). Every admin action
 // checks the session token and the admin role server-side.
 
+import { createHmac, randomBytes } from "node:crypto";
 import type {
   PlanRow,
   Store,
@@ -239,6 +240,187 @@ function createSession(env: Env, userId: number): string {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 4 — system logs, login rate limiting, admin two-factor auth.
+// ---------------------------------------------------------------------------
+
+/** Records one real admin/system event. Logging never breaks the action
+ *  it records: a logging failure is swallowed so the admin's work still
+ *  goes through. Rows are NEVER seeded or faked — they only appear for
+ *  events that actually happened after the system_logs table existed. */
+function logEvent(
+  env: Env,
+  opts: {
+    actorType: "admin" | "user" | "system";
+    actorEmail: string | null;
+    action: string;
+    detail?: string;
+  },
+): void {
+  try {
+    env.store.insertSystemLog({
+      actorType: opts.actorType,
+      actorEmail: opts.actorEmail,
+      action: opts.action,
+      detail: opts.detail ?? "",
+    });
+  } catch {
+    // Logging must never break the action it records.
+  }
+}
+
+// Login rate limiting: 5 failed attempts for one email inside a
+// 15-minute window locks that email out for 15 minutes. A successful
+// login clears the counter. The window/limit are fixed constants —
+// there is no test backdoor.
+
+const LOGIN_LOCK_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_ATTEMPTS = 5;
+
+function checkLoginLock(
+  env: Env,
+  email: string,
+): { locked: boolean; retryInMinutes: number } {
+  const row = env.store.getLoginAttempt(email);
+  if (!row) return { locked: false, retryInMinutes: 0 };
+  const now = Date.now();
+  if (row.lockedUntil && row.lockedUntil.getTime() > now) {
+    return {
+      locked: true,
+      retryInMinutes: Math.max(
+        1,
+        Math.ceil((row.lockedUntil.getTime() - now) / 60000),
+      ),
+    };
+  }
+  // Window expired: the old failures no longer count.
+  if (row.firstFailedAt.getTime() + LOGIN_LOCK_WINDOW_MS <= now) {
+    env.store.deleteLoginAttempt(email);
+  }
+  return { locked: false, retryInMinutes: 0 };
+}
+
+function recordFailedLogin(env: Env, email: string): void {
+  const now = new Date();
+  const row = env.store.getLoginAttempt(email);
+  if (!row) {
+    env.store.upsertLoginAttempt({
+      email,
+      failedCount: 1,
+      firstFailedAt: now,
+      lockedUntil: null,
+    });
+    return;
+  }
+  // A failure outside the window starts a fresh window.
+  const fresh = row.firstFailedAt.getTime() + LOGIN_LOCK_WINDOW_MS <= now.getTime();
+  const failedCount = fresh ? 1 : row.failedCount + 1;
+  const firstFailedAt = fresh ? now : row.firstFailedAt;
+  const lockedUntil =
+    failedCount >= LOGIN_MAX_ATTEMPTS
+      ? new Date(now.getTime() + LOGIN_LOCK_WINDOW_MS)
+      : null;
+  env.store.upsertLoginAttempt({ email, failedCount, firstFailedAt, lockedUntil });
+  if (lockedUntil) {
+    logEvent(env, {
+      actorType: "system",
+      actorEmail: email,
+      action: "security.lockout",
+      detail: `${LOGIN_MAX_ATTEMPTS} failed logins in 15 minutes — locked out for 15 minutes.`,
+    });
+  }
+}
+
+function clearFailedLogins(env: Env, email: string): void {
+  env.store.deleteLoginAttempt(email);
+}
+
+// Admin two-factor auth — TOTP, RFC 6238 (SHA-1, 30-second step,
+// 6 digits). Self-contained: no new dependency. The secret is a
+// 20-byte random value shown to the admin as base32 (the format
+// authenticator apps expect). Customer accounts do not get 2FA.
+
+const TOTP_STEP_SECONDS = 30;
+const TOTP_DIGITS = 6;
+
+const BASE32_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+function base32Encode(bytes: Uint8Array): string {
+  let out = "";
+  let bits = 0;
+  let value = 0;
+  for (const b of bytes) {
+    value = (value << 8) | b;
+    bits += 8;
+    while (bits >= 5) {
+      bits -= 5;
+      out += BASE32_ALPHABET[(value >> bits) & 31]!;
+    }
+  }
+  if (bits > 0) out += BASE32_ALPHABET[(value << (5 - bits)) & 31]!;
+  return out;
+}
+
+function base32Decode(input: string): Uint8Array {
+  const clean = input.replace(/=+$/g, "").toUpperCase();
+  const bytes: number[] = [];
+  let bits = 0;
+  let value = 0;
+  for (const ch of clean) {
+    const idx = BASE32_ALPHABET.indexOf(ch);
+    if (idx < 0) throw new Error("Invalid base32 secret.");
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((value >> bits) & 0xff);
+    }
+  }
+  return new Uint8Array(bytes);
+}
+
+function generateTotpSecret(): string {
+  return base32Encode(randomBytes(20));
+}
+
+function totpCodeAt(secret: string, timeMs: number): string {
+  const key = base32Decode(secret);
+  const counter = Math.floor(timeMs / 1000 / TOTP_STEP_SECONDS);
+  const buf = Buffer.alloc(8);
+  buf.writeBigUInt64BE(BigInt(counter));
+  const hmac = createHmac("sha1", Buffer.from(key)).update(buf).digest();
+  const offset = hmac[hmac.length - 1]! & 0x0f;
+  const code =
+    ((hmac[offset]! & 0x7f) << 24) |
+    ((hmac[offset + 1]! & 0xff) << 16) |
+    ((hmac[offset + 2]! & 0xff) << 8) |
+    (hmac[offset + 3]! & 0xff);
+  return String(code % 10 ** TOTP_DIGITS).padStart(TOTP_DIGITS, "0");
+}
+
+/** Accepts the current step plus one step either side (clock skew). */
+function verifyTotp(secret: string, code: string): boolean {
+  const clean = code.replace(/\s/g, "");
+  if (!/^\d{6}$/.test(clean)) return false;
+  try {
+    const now = Date.now();
+    for (const skew of [-1, 0, 1]) {
+      if (totpCodeAt(secret, now + skew * TOTP_STEP_SECONDS * 1000) === clean) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function totpAuthUrl(secret: string, email: string): string {
+  const issuer = encodeURIComponent("Jimeng Downloader");
+  const account = encodeURIComponent(`Jimeng Downloader:${email}`);
+  return `otpauth://totp/${account}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
+}
+
+// ---------------------------------------------------------------------------
 // Customer accounts, plans, subscriptions and limits.
 // Downloads stay PUBLIC: nobody needs an account to download. Accounts
 // exist so customers can buy a monthly plan (more downloads than the
@@ -268,6 +450,14 @@ function authUser(env: Env, token: string | undefined): AuthedUser | null {
   }
   const u: UserRow | null = env.store.getUserById(sess.userId);
   if (!u || u.status !== "active") return null;
+  // Refresh "last seen" so the admin can tell live sessions apart in
+  // Settings → Security. Best-effort: a failure here must never break
+  // auth (e.g. the column does not exist yet on an old database).
+  try {
+    env.store.updateSessionLastSeen(token);
+  } catch {
+    // Column missing — the Store constructor adds it on the next boot.
+  }
   return {
     id: u.id,
     name: u.name,
@@ -453,7 +643,7 @@ function qualityLabel(url: string, isOrigin: boolean): string {
 // received, plan activated/expired/exhausted, daily limit reached).
 // ---------------------------------------------------------------------------
 
-type NotificationType = "payment" | "plan" | "limit" | "support";
+type NotificationType = "payment" | "plan" | "limit" | "support" | "announcement";
 
 /** Owner key shared by favourites and notifications: one text key per
  *  account ("user:<id>") or anonymous browser ("anon:<browser id>") so
@@ -809,25 +999,27 @@ function getSettings(env: Env, args: unknown): {
 }
 
 function saveApiKey(env: Env, args: unknown): { ok: true; hint: string } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const key = reqString(args, "apiKey", 500).trim();
   if (key.length < 4) throw new HandlerError(400, "API key must be at least 4 characters");
   env.store.setSetting("api_key", key);
   const base = optString(args, "apiBaseUrl", 500).trim();
   if (base) env.store.setSetting("api_base_url", base);
   else env.store.deleteSetting("api_base_url");
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.apikey.save", detail: `Custom resolver API key saved (${keyHint(key) ?? "no hint"}).` });
   return { ok: true as const, hint: keyHint(key) ?? "" };
 }
 
 function clearApiKey(env: Env, args: unknown): { ok: true } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   env.store.deleteSetting("api_key");
   env.store.deleteSetting("api_base_url");
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.apikey.clear", detail: "Custom resolver API key removed." });
   return { ok: true as const };
 }
 
 function saveAdCode(env: Env, args: unknown): { ok: true } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const rec = asRecord(args);
   const slot = rec?.slot;
   if (typeof slot !== "string" || !(AD_SLOTS as readonly string[]).includes(slot)) {
@@ -836,17 +1028,19 @@ function saveAdCode(env: Env, args: unknown): { ok: true } {
   const code = reqString(args, "code", 20000).trim();
   if (!code) throw new HandlerError(400, "code is required");
   env.store.setSetting(`adsense_${slot}`, code);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.ads.save", detail: `Ad code saved for the "${slot}" slot.` });
   return { ok: true as const };
 }
 
 function clearAdCode(env: Env, args: unknown): { ok: true } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const rec = asRecord(args);
   const slot = rec?.slot;
   if (typeof slot !== "string" || !(AD_SLOTS as readonly string[]).includes(slot)) {
     throw new HandlerError(400, "slot must be one of: " + AD_SLOTS.join(", "));
   }
   env.store.deleteSetting(`adsense_${slot}`);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.ads.clear", detail: `Ad code removed from the "${slot}" slot.` });
   return { ok: true as const };
 }
 
@@ -919,32 +1113,61 @@ async function adminLogin(
   token: string | null;
   error: string | null;
   admin: { id: number; name: string; email: string; role: string } | null;
+  totpRequired: boolean;
 }> {
   seedAdmin(env);
   const email = reqString(args, "email", 200).trim().toLowerCase();
   const password = reqString(args, "password", 200);
+  const totpCode = optString(args, "totpCode", 10).trim() || undefined;
+  const lock = checkLoginLock(env, email);
+  if (lock.locked) {
+    return { ok: false, token: null, error: `Too many failed attempts. Try again in ${lock.retryInMinutes} minute${lock.retryInMinutes === 1 ? "" : "s"}.`, admin: null, totpRequired: false };
+  }
   const u = env.store.getUserByEmail(email);
   // Same message for unknown email, wrong password and non-admin accounts —
   // never reveal which one failed.
   if (!u || u.role !== "admin" || !(await verifyPassword(password, u.passwordHash))) {
-    return { ok: false, token: null, error: "Incorrect email or password.", admin: null };
+    recordFailedLogin(env, email);
+    if (u && u.role === "admin") {
+      logEvent(env, { actorType: "admin", actorEmail: email, action: "admin.login.failed", detail: "Wrong password." });
+    }
+    return { ok: false, token: null, error: "Incorrect email or password.", admin: null, totpRequired: false };
   }
   if (u.status !== "active") {
-    return { ok: false, token: null, error: "This account is disabled. Contact the site owner.", admin: null };
+    return { ok: false, token: null, error: "This account is disabled. Contact the site owner.", admin: null, totpRequired: false };
   }
+  if (u.totpEnabled) {
+    if (!totpCode) {
+      return { ok: false, token: null, error: null, admin: null, totpRequired: true };
+    }
+    if (!u.totpSecret || !verifyTotp(u.totpSecret, totpCode)) {
+      recordFailedLogin(env, email);
+      logEvent(env, { actorType: "admin", actorEmail: email, action: "admin.login.failed", detail: "Wrong two-factor code." });
+      return { ok: false, token: null, error: "Incorrect verification code.", admin: null, totpRequired: true };
+    }
+  }
+  clearFailedLogins(env, email);
   const token = createSession(env, u.id);
   env.store.updateUserLastLogin(u.id);
+  logEvent(env, { actorType: "admin", actorEmail: email, action: "admin.login", detail: "Admin signed in." });
   return {
     ok: true,
     token,
     error: null,
     admin: { id: u.id, name: u.name, email: u.email, role: "admin" },
+    totpRequired: false,
   };
 }
 
 function adminLogout(env: Env, args: unknown): { ok: true } {
   const token = optToken(args);
-  if (token) env.store.deleteSession(token);
+  if (token) {
+    const me = authUser(env, token);
+    env.store.deleteSession(token);
+    if (me?.role === "admin") {
+      logEvent(env, { actorType: "admin", actorEmail: me.email, action: "admin.logout", detail: "Admin signed out." });
+    }
+  }
   return { ok: true as const };
 }
 
@@ -1074,6 +1297,7 @@ async function adminChangePassword(
   // Sign out the admin's OTHER sessions so the old password stops working
   // everywhere else — the current session stays logged in.
   env.store.deleteSessionsForUserExcept(admin.id, optToken(args));
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "admin.password_change", detail: "Admin password changed (other sessions signed out)." });
   return { ok: true, error: null };
 }
 
@@ -1134,15 +1358,21 @@ async function userLogin(
   seedAdmin(env);
   const email = reqEmail(args, "email");
   const password = reqString(args, "password", 200);
+  const lock = checkLoginLock(env, email);
+  if (lock.locked) {
+    return { ok: false, token: null, error: `Too many failed attempts. Try again in ${lock.retryInMinutes} minute${lock.retryInMinutes === 1 ? "" : "s"}.`, user: null };
+  }
   const u = env.store.getUserByEmail(email);
   // Same message for unknown email, wrong password and non-customer
   // accounts — never reveal which one failed.
   if (!u || u.role !== "user" || !(await verifyPassword(password, u.passwordHash))) {
+    recordFailedLogin(env, email);
     return { ok: false, token: null, error: "Incorrect email or password.", user: null };
   }
   if (u.status !== "active") {
     return { ok: false, token: null, error: "Your account is suspended. Contact the site owner for help.", user: null };
   }
+  clearFailedLogins(env, email);
   const token = createSession(env, u.id);
   env.store.updateUserLastLogin(u.id);
   return {
@@ -1171,13 +1401,23 @@ async function login(
   error: string | null;
   admin: { id: number; name: string; email: string; role: string } | null;
   user: { id: number; name: string; email: string; role: string } | null;
+  totpRequired: boolean;
 }> {
   seedAdmin(env);
   const email = reqEmail(args, "email");
   const password = reqString(args, "password", 200);
+  const totpCode = optString(args, "totpCode", 10).trim() || undefined;
+  const lock = checkLoginLock(env, email);
+  if (lock.locked) {
+    return { ok: false, role: null, token: null, error: `Too many failed attempts. Try again in ${lock.retryInMinutes} minute${lock.retryInMinutes === 1 ? "" : "s"}.`, admin: null, user: null, totpRequired: false };
+  }
   const u = env.store.getUserByEmail(email);
   if (!u || !(await verifyPassword(password, u.passwordHash))) {
-    return { ok: false, role: null, token: null, error: "Incorrect email or password.", admin: null, user: null };
+    recordFailedLogin(env, email);
+    if (u && u.role === "admin") {
+      logEvent(env, { actorType: "admin", actorEmail: email, action: "admin.login.failed", detail: "Wrong password." });
+    }
+    return { ok: false, role: null, token: null, error: "Incorrect email or password.", admin: null, user: null, totpRequired: false };
   }
   if (u.status !== "active") {
     return {
@@ -1189,11 +1429,24 @@ async function login(
         : "Your account is suspended. Contact the site owner for help.",
       admin: null,
       user: null,
+      totpRequired: false,
     };
   }
+  if (u.role === "admin" && u.totpEnabled) {
+    if (!totpCode) {
+      return { ok: false, role: null, token: null, error: null, admin: null, user: null, totpRequired: true };
+    }
+    if (!u.totpSecret || !verifyTotp(u.totpSecret, totpCode)) {
+      recordFailedLogin(env, email);
+      logEvent(env, { actorType: "admin", actorEmail: email, action: "admin.login.failed", detail: "Wrong two-factor code." });
+      return { ok: false, role: null, token: null, error: "Incorrect verification code.", admin: null, user: null, totpRequired: true };
+    }
+  }
+  clearFailedLogins(env, email);
   const token = createSession(env, u.id);
   env.store.updateUserLastLogin(u.id);
   if (u.role === "admin") {
+    logEvent(env, { actorType: "admin", actorEmail: email, action: "admin.login", detail: "Admin signed in." });
     return {
       ok: true,
       role: "admin" as const,
@@ -1201,6 +1454,7 @@ async function login(
       error: null,
       admin: { id: u.id, name: u.name, email: u.email, role: "admin" },
       user: null,
+      totpRequired: false,
     };
   }
   return {
@@ -1210,6 +1464,7 @@ async function login(
     error: null,
     admin: null,
     user: { id: u.id, name: u.name, email: u.email, role: "user" },
+    totpRequired: false,
   };
 }
 
@@ -1358,7 +1613,7 @@ function createPlan(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null; id: number | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const name = reqString(args, "name", 120).trim();
   const priceCents = reqIntRange(args, "priceCents", 0, 100000000);
   const durationDays = reqIntRange(args, "durationDays", 1, 3650);
@@ -1371,6 +1626,7 @@ function createPlan(
     downloadLimit,
     description,
   });
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "plan.create", detail: `${name} — $${(priceCents / 100).toFixed(2)} / ${downloadLimit} downloads / ${durationDays} days.` });
   return { ok: true, error: null, id };
 }
 
@@ -1378,7 +1634,7 @@ function updatePlan(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const id = reqInt(args, "id");
   const rec = asRecord(args);
   const patch: {
@@ -1412,6 +1668,9 @@ function updatePlan(
     return { ok: false, error: "Nothing to change." };
   }
   env.store.updatePlan(id, patch);
+  const action = rec?.active === true ? "plan.activate" : rec?.active === false ? "plan.deactivate" : "plan.update";
+  const changed = Object.keys(patch).join(", ");
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action, detail: `Plan #${id} — changed: ${changed}.` });
   return { ok: true, error: null };
 }
 
@@ -1534,7 +1793,7 @@ function recordPayment(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null; id: number | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const userId = reqInt(args, "userId");
   const planId = optIntRange(args, "planId", 1, 100000000);
   const amountCents = reqIntRange(args, "amountCents", 1, 100000000);
@@ -1559,6 +1818,7 @@ function recordPayment(
     method,
     note,
   });
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "payment.record", detail: `${user.email} — ${planName} — $${(amountCents / 100).toFixed(2)} via ${method}.` });
   return { ok: true, error: null, id };
 }
 
@@ -1566,7 +1826,7 @@ function markPaid(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const requestId = reqInt(args, "requestId");
   const amountCents = optIntRange(args, "amountCents", 1, 100000000);
   const method = optString(args, "method", 100).trim() || "Manual";
@@ -1597,6 +1857,7 @@ function markPaid(
     title: `Payment received for the ${req.planName} plan`,
     message: `Your payment of $${(amount / 100).toFixed(2)} for the ${req.planName} plan was received. The admin will activate your plan shortly.`,
   });
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "payment.mark_paid", detail: `${user.email} — ${req.planName} — $${(amount / 100).toFixed(2)} via ${method}.` });
   return { ok: true, error: null };
 }
 
@@ -1604,7 +1865,7 @@ function activatePlan(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const requestId = reqInt(args, "requestId");
   const durationDays = optIntRange(args, "durationDays", 1, 3650);
   const downloadLimit = optIntRange(args, "downloadLimit", 1, 1000000);
@@ -1627,6 +1888,7 @@ function activatePlan(
     downloadLimit ?? plan.downloadLimit,
   );
   env.store.updatePurchaseRequestStatus(req.id, "activated");
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "plan.activate", detail: `${user.email} — ${req.planName} (${durationDays ?? plan.durationDays} days, ${downloadLimit ?? plan.downloadLimit} downloads).` });
   return { ok: true, error: null };
 }
 
@@ -1634,7 +1896,7 @@ function assignPlan(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   ensureDefaultPlans(env);
   const userId = reqInt(args, "userId");
   const planId = reqInt(args, "planId");
@@ -1653,6 +1915,7 @@ function assignPlan(
     durationDays ?? plan.durationDays,
     downloadLimit ?? plan.downloadLimit,
   );
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "plan.assign", detail: `${user.email} — ${plan.name} (${durationDays ?? plan.durationDays} days, ${downloadLimit ?? plan.downloadLimit} downloads).` });
   return { ok: true, error: null };
 }
 
@@ -1708,7 +1971,7 @@ function setUserStatus(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const userId = reqInt(args, "userId");
   const rec = asRecord(args);
   const status = rec?.status;
@@ -1720,6 +1983,12 @@ function setUserStatus(
     return { ok: false, error: "Customer not found." };
   }
   env.store.updateUserStatus(userId, status);
+  logEvent(env, {
+    actorType: "admin",
+    actorEmail: admin.email,
+    action: status === "disabled" ? "customer.suspend" : "customer.unsuspend",
+    detail: `${user.email} — account ${status === "disabled" ? "suspended (downloads blocked)" : "re-activated"}.`,
+  });
   // Sessions are deliberately KEPT on suspend: the suspended user's
   // token must still identify them, so prepareDownload can block
   // their downloads with a clear "suspended" message. (The account
@@ -1734,7 +2003,7 @@ function deleteUser(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const userId = reqInt(args, "userId");
   const user = env.store.getUserById(userId);
   if (!user || user.role !== "user") {
@@ -1750,6 +2019,7 @@ function deleteUser(
   env.store.deleteTicketMessagesForTickets(ticketIds);
   env.store.deleteTicketsForUser(userId);
   env.store.deleteUserById(userId);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "customer.delete", detail: `${user.email} — account deleted (recorded payments kept).` });
   // Recorded payments are KEPT (they carry the customer name/email) so
   // revenue history stays correct.
   return { ok: true, error: null };
@@ -1767,9 +2037,10 @@ function getAdminSettings(env: Env, args: unknown): {
 }
 
 function saveAdminSettings(env: Env, args: unknown): { ok: true } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const freeDailyLimit = reqIntRange(args, "freeDailyLimit", 0, 1000);
   env.store.setSetting("free_daily_limit", String(freeDailyLimit));
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.save", detail: `Free daily limit set to ${freeDailyLimit === 0 ? "unlimited" : freeDailyLimit + " downloads"}.` });
   return { ok: true as const };
 }
 
@@ -2111,11 +2382,12 @@ function createHelpArticle(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null; id: number | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const title = reqString(args, "title", 200).trim();
   const category = reqString(args, "category", 100).trim();
   const body = reqString(args, "body", 20000).trim();
   const id = env.store.insertHelpArticle({ title, category, body });
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "help_article.create", detail: `“${title}” (${category}).` });
   return { ok: true, error: null, id };
 }
 
@@ -2123,7 +2395,7 @@ function updateHelpArticle(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const id = reqInt(args, "id");
   const rec = asRecord(args);
   const patch: { title?: string; category?: string; body?: string } = {};
@@ -2138,12 +2410,15 @@ function updateHelpArticle(
     patch[field] = v.trim();
   }
   env.store.updateHelpArticle(id, patch);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "help_article.update", detail: `Article #${id} edited.` });
   return { ok: true, error: null };
 }
 
 function deleteHelpArticle(env: Env, args: unknown): { ok: true } {
-  requireAdmin(env, args);
-  env.store.deleteHelpArticle(reqInt(args, "id"));
+  const admin = requireAdmin(env, args);
+  const id = reqInt(args, "id");
+  env.store.deleteHelpArticle(id);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "help_article.delete", detail: `Article #${id} deleted.` });
   return { ok: true as const };
 }
 
@@ -2385,7 +2660,7 @@ function replyTicketAdmin(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const id = reqInt(args, "id");
   const message = reqString(args, "message", 4000).trim();
   const t = env.store.getTicketById(id);
@@ -2403,6 +2678,7 @@ function replyTicketAdmin(
     title: "Admin replied to your ticket",
     message: `The admin replied to your ticket “${t.subject}”. Open Support Tickets to read the reply.`,
   });
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "ticket.reply", detail: `Ticket #${t.id} “${t.subject}” — admin replied.` });
   return { ok: true, error: null };
 }
 
@@ -2410,7 +2686,7 @@ function setTicketStatus(
   env: Env,
   args: unknown,
 ): { ok: boolean; error: string | null } {
-  requireAdmin(env, args);
+  const admin = requireAdmin(env, args);
   const id = reqInt(args, "id");
   const rec = asRecord(args);
   const status = rec?.status;
@@ -2420,6 +2696,804 @@ function setTicketStatus(
   const t = env.store.getTicketById(id);
   if (!t) return { ok: false, error: "Ticket not found." };
   env.store.updateTicketStatus(id, status);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "ticket.status", detail: `Ticket #${id} marked ${status}.` });
+  return { ok: true, error: null };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — System Logs, Backup & Restore, Reports, Security, Broadcasts
+// (master spec). All admin-only and server-enforced. Logs are NEVER
+// seeded — rows only appear for real admin actions. There is no email
+// service: ticket replies and broadcasts are delivered in-app via
+// notifications. On this hosting (no persistent disk) backups are
+// manual downloads — there is no automatic scheduled backup.
+// ---------------------------------------------------------------------------
+
+function listSystemLogs(env: Env, args: unknown): {
+  logs: {
+    id: number;
+    actorType: string;
+    actorEmail: string | null;
+    action: string;
+    detail: string;
+    createdAt: string;
+  }[];
+  total: number;
+  actions: string[];
+} {
+  requireAdmin(env, args);
+  const rec = asRecord(args);
+  const action = optString(args, "action", 100).trim() || undefined;
+  const search = optString(args, "search", 200).trim() || undefined;
+  let limit = 50;
+  const rawLimit = rec?.limit;
+  if (typeof rawLimit === "number" && Number.isInteger(rawLimit) && rawLimit > 0) {
+    limit = Math.min(rawLimit, 100);
+  }
+  let offset = 0;
+  const rawOffset = rec?.offset;
+  if (typeof rawOffset === "number" && Number.isInteger(rawOffset) && rawOffset >= 0) {
+    offset = rawOffset;
+  }
+  const rows = env.store.listSystemLogs({ action, search, limit, offset });
+  return {
+    logs: rows.map((r) => ({
+      id: r.id,
+      actorType: r.actorType,
+      actorEmail: r.actorEmail,
+      action: r.action,
+      detail: r.detail,
+      createdAt: r.createdAt.toISOString(),
+    })),
+    total: env.store.countSystemLogs({ action, search }),
+    actions: env.store.listSystemLogActions(),
+  };
+}
+
+function exportBackup(env: Env, args: unknown): {
+  ok: boolean;
+  error: string | null;
+  filename: string;
+  json: string;
+} {
+  const admin = requireAdmin(env, args);
+  const users = env.store.listAllUsers();
+  // Date fields serialize to ISO strings (same shape as the artifact's
+  // drizzle export); users carry epoch-ms timestamps, also like the
+  // artifact. Password hashes, 2FA secrets and session tokens are
+  // NEVER included (sessions are excluded entirely).
+  const backup = {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    app: "jimeng-video-downloader",
+    tables: {
+      users: users.map((u) => ({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        role: u.role,
+        status: u.status,
+        createdAt: u.createdAt.getTime(),
+        lastLoginAt: u.lastLoginAt ? u.lastLoginAt.getTime() : null,
+        // passwordHash and totpSecret deliberately excluded.
+        totpEnabled: u.totpEnabled ? 1 : 0,
+      })),
+      plans: env.store.listPlans(false),
+      subscriptions: env.store.listAllSubscriptions(),
+      purchaseRequests: env.store.listPurchaseRequests(),
+      payments: env.store.listPayments(),
+      downloads: env.store.listAllDownloads(),
+      downloadEvents: env.store.listDownloadEvents(),
+      favorites: env.store.listAllFavorites(),
+      userSettings: env.store.listUserSettings(),
+      notifications: env.store.listAllNotifications(),
+      helpArticles: env.store.listHelpArticles(),
+      supportTickets: env.store.listAllTickets(),
+      ticketMessages: env.store.listAllTicketMessages(),
+      systemLogs: env.store.listSystemLogs({ limit: 1000000, offset: 0 }),
+      broadcasts: env.store.listBroadcasts(1000000),
+      settings: env.store.listSettings(),
+      contactMessages: env.store.listContactMessages(),
+      // sessions deliberately excluded — restoring them would revive
+      // revoked logins and could lock the admin out.
+    },
+  };
+  const stamp = new Date().toISOString().slice(0, 10);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "backup.export", detail: `Backup downloaded (${users.length} users, ${backup.tables.downloads.length} downloads).` });
+  return {
+    ok: true,
+    error: null,
+    filename: `jimeng-backup-${stamp}.json`,
+    json: JSON.stringify(backup, null, 2),
+  };
+}
+
+async function restoreBackup(
+  env: Env,
+  args: unknown,
+): Promise<{
+  ok: boolean;
+  error: string | null;
+  restored: {
+    users: number;
+    plans: number;
+    downloads: number;
+    payments: number;
+    tickets: number;
+  } | null;
+}> {
+  const admin = requireAdmin(env, args);
+  const json = reqString(args, "json", 100_000_000);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(json);
+  } catch {
+    return { ok: false, error: "This is not a valid JSON file.", restored: null };
+  }
+  const fail = (msg: string) => ({ ok: false as const, error: msg, restored: null });
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return fail("This is not a Jimeng backup file.");
+  }
+  const root = parsed as Record<string, unknown>;
+  if (root.version !== 1 || root.app !== "jimeng-video-downloader") {
+    return fail("This backup file is from another app or an unsupported version.");
+  }
+  const tables = root.tables;
+  if (!tables || typeof tables !== "object" || Array.isArray(tables)) {
+    return fail("The backup file has no tables section.");
+  }
+  const t = tables as Record<string, unknown>;
+  const tableNames = [
+    "users", "plans", "subscriptions", "purchaseRequests", "payments",
+    "downloads", "downloadEvents", "favorites", "userSettings",
+    "notifications", "helpArticles", "supportTickets", "ticketMessages",
+    "systemLogs", "broadcasts", "settings", "contactMessages",
+  ];
+  for (const name of tableNames) {
+    if (t[name] !== undefined && !Array.isArray(t[name])) {
+      return fail(`The backup file is malformed: table "${name}" is not a list.`);
+    }
+  }
+  const isRow = (r: unknown): r is Record<string, unknown> =>
+    !!r && typeof r === "object" && !Array.isArray(r);
+  const usersRows = ((t.users as unknown[]) ?? []).filter(isRow);
+  const seenEmails = new Set<string>();
+  for (const r of usersRows) {
+    if (typeof r.id !== "number" || typeof r.name !== "string" || typeof r.email !== "string") {
+      return fail("The backup file is malformed: a user row is missing id, name or email.");
+    }
+    if (r.role !== "user" && r.role !== "admin") {
+      return fail("The backup file is malformed: a user row has an unknown role.");
+    }
+    if (r.status !== "active" && r.status !== "disabled") {
+      return fail("The backup file is malformed: a user row has an unknown status.");
+    }
+    const email = (r.email as string).toLowerCase();
+    if (seenEmails.has(email)) return fail("The backup file is malformed: duplicate user email.");
+    seenEmails.add(email);
+  }
+  // Keep the calling admin intact: snapshot the real account first.
+  const currentAdmin = env.store.getUserById(admin.id);
+  if (!currentAdmin) return fail("Your admin account was not found — restore refused.");
+  const toMs = (v: unknown): number | null =>
+    typeof v === "number" ? v : typeof v === "string" ? Date.parse(v) : null;
+  const db = env.store.db;
+  // Replace strategy: wipe child tables first, then parents.
+  db.exec("DELETE FROM download_events");
+  db.exec("DELETE FROM ticket_messages");
+  db.exec("DELETE FROM favorites");
+  db.exec("DELETE FROM notifications");
+  db.exec("DELETE FROM user_settings");
+  db.exec("DELETE FROM purchase_requests");
+  db.exec("DELETE FROM payments");
+  db.exec("DELETE FROM subscriptions");
+  db.exec("DELETE FROM downloads");
+  db.exec("DELETE FROM support_tickets");
+  db.exec("DELETE FROM help_articles");
+  db.exec("DELETE FROM system_logs");
+  db.exec("DELETE FROM broadcasts");
+  db.exec("DELETE FROM settings");
+  db.exec("DELETE FROM contact_messages");
+  db.exec("DELETE FROM plans");
+  db.exec("DELETE FROM users");
+  // Users: every restored customer gets a random unusable password —
+  // password hashes are never stored in a backup file. The admin row
+  // from the backup is skipped; the real admin row is restored below
+  // with its actual hash.
+  const insertUser = db.query(
+    "INSERT INTO users (id, name, email, password_hash, role, status, created_at, last_login_at, totp_secret, totp_enabled) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  const restoredUserIds = new Set<number>();
+  for (const r of usersRows) {
+    if ((r.id as number) === currentAdmin.id) continue;
+    const hash = await hashPassword(randomBytes(16).toString("hex"));
+    insertUser.run(
+      r.id as number,
+      r.name as string,
+      (r.email as string).toLowerCase(),
+      hash,
+      r.role as string,
+      r.status as string,
+      toMs(r.createdAt) ?? Date.now(),
+      toMs(r.lastLoginAt),
+      null,
+      0,
+    );
+    restoredUserIds.add(r.id as number);
+  }
+  insertUser.run(
+    currentAdmin.id,
+    currentAdmin.name,
+    currentAdmin.email,
+    currentAdmin.passwordHash,
+    "admin",
+    currentAdmin.status,
+    currentAdmin.createdAt.getTime(),
+    currentAdmin.lastLoginAt ? currentAdmin.lastLoginAt.getTime() : null,
+    currentAdmin.totpSecret ?? null,
+    currentAdmin.totpEnabled ? 1 : 0,
+  );
+  const plansRows = ((t.plans as unknown[]) ?? []).filter(isRow);
+  const insertPlan = db.query(
+    "INSERT INTO plans (id, name, price_cents, duration_days, download_limit, description, active, created_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of plansRows) {
+    if (typeof r.id !== "number" || typeof r.name !== "string") continue;
+    insertPlan.run(
+      r.id,
+      r.name,
+      typeof r.priceCents === "number" ? r.priceCents : 0,
+      typeof r.durationDays === "number" ? r.durationDays : 30,
+      typeof r.downloadLimit === "number" ? r.downloadLimit : 100,
+      typeof r.description === "string" ? r.description : "",
+      r.active === 0 ? 0 : 1,
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const subsRows = ((t.subscriptions as unknown[]) ?? []).filter(isRow);
+  const insertSub = db.query(
+    "INSERT INTO subscriptions (id, user_id, plan_id, plan_name, price_cents, duration_days, limit_total, limit_used, starts_at, expires_at, status, created_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of subsRows) {
+    if (typeof r.id !== "number" || typeof r.userId !== "number") continue;
+    insertSub.run(
+      r.id,
+      r.userId,
+      typeof r.planId === "number" ? r.planId : 0,
+      typeof r.planName === "string" ? r.planName : "",
+      typeof r.priceCents === "number" ? r.priceCents : 0,
+      typeof r.durationDays === "number" ? r.durationDays : 30,
+      typeof r.limitTotal === "number" ? r.limitTotal : (typeof r.downloadLimit === "number" ? r.downloadLimit : 0),
+      typeof r.limitUsed === "number" ? r.limitUsed : (typeof r.downloadsUsed === "number" ? r.downloadsUsed : 0),
+      toMs(r.startsAt) ?? Date.now(),
+      toMs(r.expiresAt) ?? Date.now(),
+      ["active", "expired", "exhausted", "cancelled"].includes(String(r.status)) ? String(r.status) : "active",
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const reqRows = ((t.purchaseRequests as unknown[]) ?? []).filter(isRow);
+  const insertReq = db.query(
+    "INSERT INTO purchase_requests (id, user_id, plan_id, plan_name, price_cents, status, created_at, decided_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of reqRows) {
+    if (typeof r.id !== "number" || typeof r.userId !== "number") continue;
+    insertReq.run(
+      r.id,
+      r.userId,
+      typeof r.planId === "number" ? r.planId : 0,
+      typeof r.planName === "string" ? r.planName : "",
+      typeof r.priceCents === "number" ? r.priceCents : 0,
+      ["pending", "paid", "activated", "rejected"].includes(String(r.status)) ? String(r.status) : "pending",
+      toMs(r.createdAt) ?? Date.now(),
+      toMs(r.decidedAt),
+    );
+  }
+  const payRows = ((t.payments as unknown[]) ?? []).filter(isRow);
+  const insertPay = db.query(
+    "INSERT INTO payments (id, user_id, purchase_request_id, customer_name, customer_email, plan_name, amount_cents, method, note, created_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of payRows) {
+    if (typeof r.id !== "number") continue;
+    insertPay.run(
+      r.id,
+      typeof r.userId === "number" ? r.userId : null,
+      typeof r.purchaseRequestId === "number" ? r.purchaseRequestId : null,
+      typeof r.customerName === "string" ? r.customerName : "",
+      typeof r.customerEmail === "string" ? r.customerEmail : "",
+      typeof r.planName === "string" ? r.planName : "",
+      typeof r.amountCents === "number" ? r.amountCents : 0,
+      typeof r.method === "string" ? r.method : "Manual",
+      typeof r.note === "string" ? r.note : "",
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const dlRows = ((t.downloads as unknown[]) ?? []).filter(isRow);
+  const insertDl = db.query(
+    "INSERT INTO downloads (id, source_url, title, video_url, cover_url, user_id, anon_id, created_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of dlRows) {
+    if (typeof r.id !== "number" || typeof r.sourceUrl !== "string") continue;
+    insertDl.run(
+      r.id,
+      r.sourceUrl,
+      typeof r.title === "string" ? r.title : "",
+      typeof r.videoUrl === "string" ? r.videoUrl : "",
+      typeof r.coverUrl === "string" ? r.coverUrl : null,
+      typeof r.userId === "number" ? r.userId : null,
+      typeof r.anonId === "string" ? r.anonId : null,
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const evRows = ((t.downloadEvents as unknown[]) ?? []).filter(isRow);
+  const insertEv = db.query(
+    "INSERT INTO download_events (id, user_id, anon_id, size_bytes, created_at) " +
+      "VALUES (?, ?, ?, ?, ?)",
+  );
+  for (const r of evRows) {
+    if (typeof r.id !== "number") continue;
+    insertEv.run(
+      r.id,
+      typeof r.userId === "number" ? r.userId : null,
+      typeof r.anonId === "string" ? r.anonId : null,
+      typeof r.sizeBytes === "number" ? r.sizeBytes : (typeof r.bytes === "number" ? r.bytes : 0),
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const favRows = ((t.favorites as unknown[]) ?? []).filter(isRow);
+  const insertFav = db.query(
+    "INSERT INTO favorites (id, download_id, user_id, anon_id, owner_key, title, cover_url, video_url, quality_label, source_url, created_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of favRows) {
+    if (typeof r.id !== "number") continue;
+    insertFav.run(
+      r.id,
+      typeof r.downloadId === "number" ? r.downloadId : 0,
+      typeof r.userId === "number" ? r.userId : null,
+      typeof r.anonId === "string" ? r.anonId : null,
+      typeof r.ownerKey === "string" ? r.ownerKey : "",
+      typeof r.title === "string" ? r.title : "",
+      typeof r.coverUrl === "string" ? r.coverUrl : null,
+      typeof r.videoUrl === "string" ? r.videoUrl : "",
+      typeof r.qualityLabel === "string" ? r.qualityLabel : "",
+      typeof r.sourceUrl === "string" ? r.sourceUrl : "",
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const usRows = ((t.userSettings as unknown[]) ?? []).filter(isRow);
+  const insertUs = db.query(
+    "INSERT INTO user_settings (user_id, default_quality, default_mode, updated_at) " +
+      "VALUES (?, ?, ?, ?)",
+  );
+  for (const r of usRows) {
+    if (typeof r.userId !== "number") continue;
+    insertUs.run(
+      r.userId,
+      typeof r.defaultQuality === "string" ? r.defaultQuality : "best",
+      typeof r.defaultMode === "string" ? r.defaultMode : "single",
+      toMs(r.updatedAt) ?? Date.now(),
+    );
+  }
+  const notifRows = ((t.notifications as unknown[]) ?? []).filter(isRow);
+  const insertNotif = db.query(
+    "INSERT INTO notifications (id, user_id, anon_id, owner_key, type, title, message, read, created_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of notifRows) {
+    if (typeof r.id !== "number") continue;
+    insertNotif.run(
+      r.id,
+      typeof r.userId === "number" ? r.userId : null,
+      typeof r.anonId === "string" ? r.anonId : null,
+      typeof r.ownerKey === "string" ? r.ownerKey : "",
+      ["payment", "plan", "limit", "support", "announcement"].includes(String(r.type)) ? String(r.type) : "announcement",
+      typeof r.title === "string" ? r.title : "",
+      typeof r.message === "string" ? r.message : "",
+      r.read === 1 ? 1 : 0,
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const artRows = ((t.helpArticles as unknown[]) ?? []).filter(isRow);
+  const insertArt = db.query(
+    "INSERT INTO help_articles (id, title, body, category, created_at, updated_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of artRows) {
+    if (typeof r.id !== "number" || typeof r.title !== "string") continue;
+    insertArt.run(
+      r.id,
+      r.title,
+      typeof r.body === "string" ? r.body : "",
+      typeof r.category === "string" ? r.category : "General",
+      toMs(r.createdAt) ?? Date.now(),
+      toMs(r.updatedAt) ?? Date.now(),
+    );
+  }
+  const tickRows = ((t.supportTickets as unknown[]) ?? []).filter(isRow);
+  const insertTick = db.query(
+    "INSERT INTO support_tickets (id, user_id, anon_id, owner_key, subject, category, status, created_at, updated_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of tickRows) {
+    if (typeof r.id !== "number" || typeof r.subject !== "string") continue;
+    insertTick.run(
+      r.id,
+      typeof r.userId === "number" ? r.userId : null,
+      typeof r.anonId === "string" ? r.anonId : null,
+      typeof r.ownerKey === "string" ? r.ownerKey : "",
+      r.subject,
+      ["billing", "download", "account", "problem", "other"].includes(String(r.category)) ? String(r.category) : "other",
+      ["open", "answered", "closed"].includes(String(r.status)) ? String(r.status) : "open",
+      toMs(r.createdAt) ?? Date.now(),
+      toMs(r.updatedAt) ?? Date.now(),
+    );
+  }
+  const msgRows = ((t.ticketMessages as unknown[]) ?? []).filter(isRow);
+  const insertMsg = db.query(
+    "INSERT INTO ticket_messages (id, ticket_id, author_role, message, created_at) " +
+      "VALUES (?, ?, ?, ?, ?)",
+  );
+  for (const r of msgRows) {
+    if (typeof r.id !== "number" || typeof r.ticketId !== "number") continue;
+    insertMsg.run(
+      r.id,
+      r.ticketId,
+      r.authorRole === "admin" ? "admin" : "user",
+      typeof r.message === "string" ? r.message : "",
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const logRows = ((t.systemLogs as unknown[]) ?? []).filter(isRow);
+  const insertLog = db.query(
+    "INSERT INTO system_logs (id, actor_type, actor_email, action, detail, created_at) " +
+      "VALUES (?, ?, ?, ?, ?, ?)",
+  );
+  for (const r of logRows) {
+    if (typeof r.id !== "number" || typeof r.action !== "string") continue;
+    insertLog.run(
+      r.id,
+      ["admin", "user", "system"].includes(String(r.actorType)) ? String(r.actorType) : "system",
+      typeof r.actorEmail === "string" ? r.actorEmail : null,
+      r.action,
+      typeof r.detail === "string" ? r.detail : "",
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const bcRows = ((t.broadcasts as unknown[]) ?? []).filter(isRow);
+  const insertBc = db.query(
+    "INSERT INTO broadcasts (id, title, message, recipient_count, created_at) " +
+      "VALUES (?, ?, ?, ?, ?)",
+  );
+  for (const r of bcRows) {
+    if (typeof r.id !== "number" || typeof r.title !== "string") continue;
+    insertBc.run(
+      r.id,
+      r.title,
+      typeof r.message === "string" ? r.message : "",
+      typeof r.recipientCount === "number" ? r.recipientCount : 0,
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  const setRows = ((t.settings as unknown[]) ?? []).filter(isRow);
+  const insertSet = db.query(
+    "INSERT INTO settings (key, value) VALUES (?, ?)",
+  );
+  for (const r of setRows) {
+    if (typeof r.key !== "string") continue;
+    insertSet.run(r.key, typeof r.value === "string" ? r.value : String(r.value ?? ""));
+  }
+  const cmRows = ((t.contactMessages as unknown[]) ?? []).filter(isRow);
+  const insertCm = db.query(
+    "INSERT INTO contact_messages (id, name, email, message, created_at) " +
+      "VALUES (?, ?, ?, ?, ?)",
+  );
+  for (const r of cmRows) {
+    if (typeof r.id !== "number") continue;
+    insertCm.run(
+      r.id,
+      typeof r.name === "string" ? r.name : "",
+      typeof r.email === "string" ? r.email : "",
+      typeof r.message === "string" ? r.message : "",
+      toMs(r.createdAt) ?? Date.now(),
+    );
+  }
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "backup.restore", detail: `Backup restored (${restoredUserIds.size} customers, ${plansRows.length} plans, ${dlRows.length} downloads). Restored customer accounts need a password reset before they can log in.` });
+  return {
+    ok: true,
+    error: null,
+    restored: {
+      users: usersRows.length,
+      plans: plansRows.length,
+      downloads: dlRows.length,
+      payments: payRows.length,
+      tickets: tickRows.length,
+    },
+  };
+}
+
+function getReports(env: Env, args: unknown): {
+  ok: boolean;
+  error: string | null;
+  days: { date: string; downloads: number; revenueCents: number; signups: number }[];
+  totals: { downloads: number; revenueCents: number; signups: number; plansSold: number; mbUsed: number };
+  topCustomers: { userId: number; name: string; email: string; downloads: number; mb: number }[];
+} {
+  requireAdmin(env, args);
+  const from = reqString(args, "from", 10).trim();
+  const to = reqString(args, "to", 10).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+    throw new HandlerError(400, "from and to must be dates like 2026-11-01");
+  }
+  const empty = {
+    ok: false as const,
+    error: "",
+    days: [] as { date: string; downloads: number; revenueCents: number; signups: number }[],
+    totals: { downloads: 0, revenueCents: 0, signups: 0, plansSold: 0, mbUsed: 0 },
+    topCustomers: [] as { userId: number; name: string; email: string; downloads: number; mb: number }[],
+  };
+  const fromMs = Date.parse(`${from}T00:00:00.000Z`);
+  const toMs = Date.parse(`${to}T00:00:00.000Z`) + 24 * 60 * 60 * 1000;
+  if (Number.isNaN(fromMs) || Number.isNaN(toMs) || fromMs >= toMs) {
+    return { ...empty, error: "Pick a valid date range." };
+  }
+  if ((toMs - fromMs) / (24 * 60 * 60 * 1000) > 366) {
+    return { ...empty, error: "The range is too long — pick at most 366 days." };
+  }
+  const dayKeys: string[] = [];
+  for (let d = new Date(fromMs); d.getTime() < toMs; d = new Date(d.getTime() + 24 * 60 * 60 * 1000)) {
+    dayKeys.push(d.toISOString().slice(0, 10));
+  }
+  const perDay = new Map<string, { downloads: number; revenueCents: number; signups: number }>();
+  for (const k of dayKeys) perDay.set(k, { downloads: 0, revenueCents: 0, signups: 0 });
+  const events = env.store.listDownloadEventsInRange(fromMs, toMs);
+  let totalBytes = 0;
+  const perUser = new Map<number, { downloads: number; bytes: number }>();
+  for (const e of events) {
+    const key = e.createdAt.toISOString().slice(0, 10);
+    const bucket = perDay.get(key);
+    if (bucket) bucket.downloads += 1;
+    totalBytes += e.sizeBytes;
+    if (e.userId) {
+      const u = perUser.get(e.userId) ?? { downloads: 0, bytes: 0 };
+      u.downloads += 1;
+      u.bytes += e.sizeBytes;
+      perUser.set(e.userId, u);
+    }
+  }
+  const pays = env.store.listPaymentsInRange(fromMs, toMs);
+  for (const p of pays) {
+    const key = p.createdAt.toISOString().slice(0, 10);
+    const bucket = perDay.get(key);
+    if (bucket) bucket.revenueCents += p.amountCents;
+  }
+  const signups = env.store.listUserSignupsInRange(fromMs, toMs);
+  for (const s of signups) {
+    const key = s.createdAt.toISOString().slice(0, 10);
+    const bucket = perDay.get(key);
+    if (bucket) bucket.signups += 1;
+  }
+  const sold = env.store.countActivatedRequestsInRange(fromMs, toMs);
+  const topIds = [...perUser.entries()].sort((a, b) => b[1].downloads - a[1].downloads).slice(0, 10);
+  const topCustomers: { userId: number; name: string; email: string; downloads: number; mb: number }[] = [];
+  for (const [userId, stats] of topIds) {
+    const u = env.store.getUserById(userId);
+    topCustomers.push({
+      userId,
+      name: u?.name ?? `Customer #${userId}`,
+      email: u?.email ?? "",
+      downloads: stats.downloads,
+      mb: stats.bytes / (1024 * 1024),
+    });
+  }
+  const days = dayKeys.map((date) => ({ date, ...perDay.get(date)! }));
+  const totals = {
+    downloads: events.length,
+    revenueCents: pays.reduce((s, p) => s + p.amountCents, 0),
+    signups: signups.length,
+    plansSold: sold,
+    mbUsed: totalBytes / (1024 * 1024),
+  };
+  return { ok: true, error: null, days, totals, topCustomers };
+}
+
+function createBroadcast(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null; recipientCount: number } {
+  const admin = requireAdmin(env, args);
+  const title = reqString(args, "title", 200).trim();
+  const message = reqString(args, "message", 2000).trim();
+  const customers = env.store.listUsersByRole("user");
+  const id = env.store.insertBroadcast({
+    title,
+    message,
+    recipientCount: customers.length,
+  });
+  if (!id) return { ok: false, error: "Could not send the announcement — please try again.", recipientCount: 0 };
+  for (const c of customers) {
+    createNotification(env, {
+      userId: c.id,
+      anonId: null,
+      type: "announcement",
+      title,
+      message,
+    });
+  }
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "broadcast.send", detail: `“${title}” sent to ${customers.length} customers.` });
+  return { ok: true, error: null, recipientCount: customers.length };
+}
+
+function listBroadcasts(env: Env, args: unknown): {
+  broadcasts: {
+    id: number;
+    title: string;
+    message: string;
+    recipientCount: number;
+    createdAt: string;
+  }[];
+} {
+  requireAdmin(env, args);
+  return {
+    broadcasts: env.store.listBroadcasts(50).map((r) => ({
+      id: r.id,
+      title: r.title,
+      message: r.message,
+      recipientCount: r.recipientCount,
+      createdAt: r.createdAt.toISOString(),
+    })),
+  };
+}
+
+function getSecurityOverview(env: Env, args: unknown): {
+  totpEnabled: boolean;
+  sessions: {
+    tokenPrefix: string;
+    email: string;
+    role: string;
+    isCurrent: boolean;
+    createdAt: string;
+    lastSeenAt: string | null;
+  }[];
+  lockedAccounts: {
+    email: string;
+    failedCount: number;
+    lockedUntil: string | null;
+  }[];
+} {
+  const admin = requireAdmin(env, args);
+  const adminUser = env.store.getUserById(admin.id);
+  const now = Date.now();
+  const sessRows = env.store
+    .listSessions()
+    .filter((s) => s.expiresAt.getTime() >= now);
+  const sessions: {
+    tokenPrefix: string;
+    email: string;
+    role: string;
+    isCurrent: boolean;
+    createdAt: string;
+    lastSeenAt: string | null;
+  }[] = [];
+  for (const s of sessRows) {
+    const u = env.store.getUserById(s.userId);
+    if (!u) continue;
+    sessions.push({
+      tokenPrefix: `${s.token.slice(0, 8)}…`,
+      email: u.email,
+      role: u.role,
+      isCurrent: optToken(args) === s.token,
+      createdAt: s.createdAt.toISOString(),
+      lastSeenAt: s.lastSeenAt ? s.lastSeenAt.toISOString() : null,
+    });
+  }
+  const locks = env.store.listLoginAttempts();
+  const lockedAccounts = locks
+    .filter((l) => l.lockedUntil && l.lockedUntil.getTime() > now)
+    .map((l) => ({
+      email: l.email,
+      failedCount: l.failedCount,
+      lockedUntil: l.lockedUntil ? l.lockedUntil.toISOString() : null,
+    }));
+  return {
+    totpEnabled: adminUser?.totpEnabled ?? false,
+    sessions,
+    lockedAccounts,
+  };
+}
+
+function revokeSession(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null } {
+  const admin = requireAdmin(env, args);
+  const tokenPrefix = reqString(args, "tokenPrefix", 20).trim();
+  if (tokenPrefix.length < 8) {
+    throw new HandlerError(400, "tokenPrefix must be at least 8 characters");
+  }
+  const prefix = tokenPrefix.replace(/…$/, "");
+  const rows = env.store.listSessions();
+  const match = rows.find((s) => s.token.startsWith(prefix));
+  if (!match) return { ok: false, error: "Session not found — it may already be gone." };
+  if (optToken(args) && match.token === optToken(args)) {
+    return { ok: false, error: "You cannot revoke your own current session." };
+  }
+  const u = env.store.getUserById(match.userId);
+  env.store.deleteSession(match.token);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "security.session_revoke", detail: `Session revoked for ${u?.email ?? `user #${match.userId}`}.` });
+  return { ok: true, error: null };
+}
+
+function startTotpSetup(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null; secret: string | null; otpauthUrl: string | null } {
+  const admin = requireAdmin(env, args);
+  const secret = generateTotpSecret();
+  env.store.updateUserTotp(admin.id, { totpSecret: secret });
+  return { ok: true, error: null, secret, otpauthUrl: totpAuthUrl(secret, admin.email) };
+}
+
+function confirmTotpSetup(
+  env: Env,
+  args: unknown,
+): { ok: boolean; error: string | null } {
+  const admin = requireAdmin(env, args);
+  const code = reqString(args, "code", 10).trim();
+  const u = env.store.getUserById(admin.id);
+  if (!u || !u.totpSecret) {
+    return { ok: false, error: "Start 2FA setup first — no secret was generated." };
+  }
+  if (!verifyTotp(u.totpSecret, code)) {
+    return { ok: false, error: "That code is not correct. Check the authenticator app and try again." };
+  }
+  env.store.updateUserTotp(admin.id, { totpEnabled: true });
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "security.totp_enabled", detail: "Two-factor authentication enabled for the admin account." });
+  return { ok: true, error: null };
+}
+
+async function disableTotp(
+  env: Env,
+  args: unknown,
+): Promise<{ ok: boolean; error: string | null }> {
+  const admin = requireAdmin(env, args);
+  const password = reqString(args, "password", 200);
+  const code = reqString(args, "code", 10).trim();
+  const u = env.store.getUserById(admin.id);
+  if (!u) return { ok: false, error: "Admin account not found." };
+  if (!(await verifyPassword(password, u.passwordHash))) {
+    return { ok: false, error: "The password is incorrect." };
+  }
+  if (!u.totpEnabled || !u.totpSecret || !verifyTotp(u.totpSecret, code)) {
+    return { ok: false, error: "That code is not correct." };
+  }
+  env.store.updateUserTotp(admin.id, { totpEnabled: false, totpSecret: null });
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "security.totp_disabled", detail: "Two-factor authentication disabled for the admin account." });
+  return { ok: true, error: null };
+}
+
+async function resetCustomerPassword(
+  env: Env,
+  args: unknown,
+): Promise<{ ok: boolean; error: string | null }> {
+  const admin = requireAdmin(env, args);
+  const userId = reqInt(args, "userId");
+  const newPassword = reqString(args, "newPassword", 200);
+  if (newPassword.length < 8) {
+    return { ok: false, error: "The new password must be at least 8 characters." };
+  }
+  const u = env.store.getUserById(userId);
+  if (!u || u.role !== "user") {
+    return { ok: false, error: "Customer not found." };
+  }
+  env.store.updateUserPassword(userId, await hashPassword(newPassword));
+  env.store.deleteSessionsForUser(userId);
+  logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "customer.password_reset", detail: `${u.email} — password reset by the admin (sessions revoked).` });
   return { ok: true, error: null };
 }
 
@@ -2488,4 +3562,16 @@ export const ACTIONS: Record<string, ActionHandler> = {
   getAdminTicket,
   replyTicketAdmin,
   setTicketStatus,
+  listSystemLogs,
+  exportBackup,
+  restoreBackup,
+  getReports,
+  createBroadcast,
+  listBroadcasts,
+  getSecurityOverview,
+  revokeSession,
+  startTotpSetup,
+  confirmTotpSetup,
+  disableTotp,
+  resetCustomerPassword,
 };

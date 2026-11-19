@@ -78,6 +78,11 @@ export type UserRow = {
   status: string;
   createdAt: Date;
   lastLoginAt: Date | null;
+  // Phase 4 — admin two-factor auth (TOTP, RFC 6238): the secret is set
+  // when 2FA setup starts, totpEnabled only flips on after the admin
+  // confirms a valid code. Customer accounts do not get 2FA.
+  totpSecret: string | null;
+  totpEnabled: boolean;
 };
 
 export type SessionRow = {
@@ -85,6 +90,9 @@ export type SessionRow = {
   userId: number;
   expiresAt: Date;
   createdAt: Date;
+  // Phase 4 — refreshed whenever the token is used, so the admin can
+  // tell live sessions apart in Settings → Security.
+  lastSeenAt: Date | null;
 };
 
 // Phase 2 — favourites, per-account download settings, notifications.
@@ -153,6 +161,32 @@ export type TicketMessageRow = {
   createdAt: Date;
 };
 
+// Phase 4 — system logs, login rate limiting, broadcasts.
+
+export type SystemLogRow = {
+  id: number;
+  actorType: string;
+  actorEmail: string | null;
+  action: string;
+  detail: string;
+  createdAt: Date;
+};
+
+export type LoginAttemptRow = {
+  email: string;
+  failedCount: number;
+  firstFailedAt: Date;
+  lockedUntil: Date | null;
+};
+
+export type BroadcastRow = {
+  id: number;
+  title: string;
+  message: string;
+  recipientCount: number;
+  createdAt: Date;
+};
+
 type UserRaw = {
   id: number;
   name: string;
@@ -162,6 +196,8 @@ type UserRaw = {
   status: string;
   created_at: number;
   last_login_at: number | null;
+  totp_secret?: string | null;
+  totp_enabled?: number | null;
 };
 
 export class Store {
@@ -189,6 +225,30 @@ export class Store {
     }
     if (!names.has("anon_id")) {
       this.db.exec("ALTER TABLE downloads ADD COLUMN anon_id TEXT");
+    }
+    // Phase 4 columns (added after the first release): the admin's
+    // two-factor secret/enabled flag and the session last-seen stamp.
+    // Added here at startup, BEFORE any auth query — this is the
+    // standalone equivalent of the artifact's ensurePhase4Schema-first
+    // fix: an old database without these columns must still log in.
+    const userCols = this.db.query("PRAGMA table_info(users)").all() as {
+      name: string;
+    }[];
+    const userNames = new Set(userCols.map((c) => c.name));
+    if (!userNames.has("totp_secret")) {
+      this.db.exec("ALTER TABLE users ADD COLUMN totp_secret TEXT");
+    }
+    if (!userNames.has("totp_enabled")) {
+      this.db.exec(
+        "ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0",
+      );
+    }
+    const sessCols = this.db.query("PRAGMA table_info(sessions)").all() as {
+      name: string;
+    }[];
+    const sessNames = new Set(sessCols.map((c) => c.name));
+    if (!sessNames.has("last_seen_at")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN last_seen_at INTEGER");
     }
   }
 
@@ -361,6 +421,8 @@ export class Store {
       status: r.status,
       createdAt: new Date(r.created_at),
       lastLoginAt: r.last_login_at === null ? null : new Date(r.last_login_at),
+      totpSecret: r.totp_secret ?? null,
+      totpEnabled: r.totp_enabled === 1,
     };
   }
 
@@ -430,6 +492,7 @@ export class Store {
       user_id: number;
       expires_at: number;
       created_at: number;
+      last_seen_at?: number | null;
     } | null;
     if (!row) return null;
     return {
@@ -437,7 +500,63 @@ export class Store {
       userId: row.user_id,
       expiresAt: new Date(row.expires_at),
       createdAt: new Date(row.created_at),
+      lastSeenAt: row.last_seen_at == null ? null : new Date(row.last_seen_at),
     };
+  }
+
+  /** All sessions, newest first (used by the Security overview). */
+  listSessions(): SessionRow[] {
+    const rows = this.db
+      .query("SELECT * FROM sessions ORDER BY created_at DESC")
+      .all() as {
+      token: string;
+      user_id: number;
+      expires_at: number;
+      created_at: number;
+      last_seen_at?: number | null;
+    }[];
+    return rows.map((row) => ({
+      token: row.token,
+      userId: row.user_id,
+      expiresAt: new Date(row.expires_at),
+      createdAt: new Date(row.created_at),
+      lastSeenAt: row.last_seen_at == null ? null : new Date(row.last_seen_at),
+    }));
+  }
+
+  updateSessionLastSeen(token: string): void {
+    this.db
+      .query("UPDATE sessions SET last_seen_at = ? WHERE token = ?")
+      .run(Date.now(), token);
+  }
+
+  /** Phase 4 — admin two-factor auth: set the TOTP secret and/or the
+   *  enabled flag. Pass totpSecret: null to clear the secret. */
+  updateUserTotp(
+    id: number,
+    patch: { totpSecret?: string | null; totpEnabled?: boolean },
+  ): void {
+    const sets: string[] = [];
+    const params: (string | number | null)[] = [];
+    if (patch.totpSecret !== undefined) {
+      sets.push("totp_secret = ?");
+      params.push(patch.totpSecret);
+    }
+    if (patch.totpEnabled !== undefined) {
+      sets.push("totp_enabled = ?");
+      params.push(patch.totpEnabled ? 1 : 0);
+    }
+    if (sets.length === 0) return;
+    params.push(id);
+    this.db
+      .query(`UPDATE users SET ${sets.join(", ")} WHERE id = ?`)
+      .run(...params);
+  }
+
+  /** All accounts (used by the backup export). */
+  listAllUsers(): UserRow[] {
+    const rows = this.db.query("SELECT * FROM users ORDER BY id ASC").all() as UserRaw[];
+    return rows.map((r) => this.toUserRow(r));
   }
 
   deleteSession(token: string): void {
@@ -1600,10 +1719,435 @@ export class Store {
       .run(userId);
   }
 
+  /** All subscriptions (used by the backup export). */
+  listAllSubscriptions(): SubscriptionRow[] {
+    const rows = this.db
+      .query("SELECT * FROM subscriptions ORDER BY id ASC")
+      .all() as {
+      id: number;
+      user_id: number;
+      plan_id: number;
+      plan_name: string;
+      price_cents: number;
+      duration_days: number;
+      limit_total: number;
+      limit_used: number;
+      starts_at: number;
+      expires_at: number;
+      status: string;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toSubscriptionRow(r));
+  }
+
+  /** All history rows (used by the backup export). */
+  listAllDownloads(): DownloadRow[] {
+    const rows = this.db
+      .query(
+        "SELECT id, source_url, title, video_url, cover_url, user_id, anon_id, created_at " +
+          "FROM downloads ORDER BY id ASC",
+      )
+      .all() as {
+      id: number;
+      source_url: string;
+      title: string;
+      video_url: string;
+      cover_url: string | null;
+      user_id: number | null;
+      anon_id: string | null;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toDownloadRow(r));
+  }
+
+  /** All favourites (used by the backup export). */
+  listAllFavorites(): FavoriteRow[] {
+    const rows = this.db
+      .query("SELECT * FROM favorites ORDER BY id ASC")
+      .all() as {
+      id: number;
+      download_id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      owner_key: string;
+      title: string;
+      cover_url: string | null;
+      video_url: string;
+      quality_label: string;
+      source_url: string;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toFavoriteRow(r));
+  }
+
   listTicketIdsForUser(userId: number): number[] {
     const rows = this.db
       .query("SELECT id FROM support_tickets WHERE user_id = ?")
       .all(userId) as { id: number }[];
     return rows.map((r) => r.id);
+  }
+
+  // -- Phase 4: system logs, login rate limiting, broadcasts, reports --
+  // The log is NEVER seeded — rows only appear for real admin actions.
+
+  private toSystemLogRow(r: {
+    id: number;
+    actor_type: string;
+    actor_email: string | null;
+    action: string;
+    detail: string;
+    created_at: number;
+  }): SystemLogRow {
+    return {
+      id: r.id,
+      actorType: r.actor_type,
+      actorEmail: r.actor_email,
+      action: r.action,
+      detail: r.detail,
+      createdAt: new Date(r.created_at),
+    };
+  }
+
+  insertSystemLog(row: {
+    actorType: string;
+    actorEmail: string | null;
+    action: string;
+    detail: string;
+  }): number {
+    const info = this.db
+      .query(
+        "INSERT INTO system_logs (actor_type, actor_email, action, detail, created_at) " +
+          "VALUES (?, ?, ?, ?, ?)",
+      )
+      .run(row.actorType, row.actorEmail, row.action, row.detail, Date.now());
+    return Number(info.lastInsertRowid);
+  }
+
+  listSystemLogs(opts: {
+    action?: string;
+    search?: string;
+    limit: number;
+    offset: number;
+  }): SystemLogRow[] {
+    const where: string[] = [];
+    const params: (string | number)[] = [];
+    if (opts.action) {
+      where.push("action = ?");
+      params.push(opts.action);
+    }
+    if (opts.search) {
+      const q = `%${opts.search}%`;
+      where.push("(actor_email LIKE ? OR detail LIKE ? OR action LIKE ?)");
+      params.push(q, q, q);
+    }
+    const sql =
+      "SELECT * FROM system_logs" +
+      (where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "") +
+      " ORDER BY id DESC LIMIT ? OFFSET ?";
+    const rows = this.db.query(sql).all(...params, opts.limit, opts.offset) as {
+      id: number;
+      actor_type: string;
+      actor_email: string | null;
+      action: string;
+      detail: string;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toSystemLogRow(r));
+  }
+
+  countSystemLogs(opts: { action?: string; search?: string }): number {
+    const where: string[] = [];
+    const params: (string | number)[] = [];
+    if (opts.action) {
+      where.push("action = ?");
+      params.push(opts.action);
+    }
+    if (opts.search) {
+      const q = `%${opts.search}%`;
+      where.push("(actor_email LIKE ? OR detail LIKE ? OR action LIKE ?)");
+      params.push(q, q, q);
+    }
+    const sql =
+      "SELECT COUNT(*) AS n FROM system_logs" +
+      (where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "");
+    const row = this.db.query(sql).get(...params) as { n: number };
+    return row.n;
+  }
+
+  /** Distinct action names present in the log (for the filter list). */
+  listSystemLogActions(): string[] {
+    const rows = this.db
+      .query("SELECT DISTINCT action FROM system_logs ORDER BY action")
+      .all() as { action: string }[];
+    return rows.map((r) => r.action);
+  }
+
+  deleteSystemLogs(): void {
+    this.db.query("DELETE FROM system_logs").run();
+  }
+
+  // -- login attempts (rate limiting) --------------------------------------
+
+  getLoginAttempt(email: string): LoginAttemptRow | null {
+    const row = this.db
+      .query("SELECT * FROM login_attempts WHERE email = ? LIMIT 1")
+      .get(email) as {
+      email: string;
+      failed_count: number;
+      first_failed_at: number;
+      locked_until: number | null;
+    } | null;
+    if (!row) return null;
+    return {
+      email: row.email,
+      failedCount: row.failed_count,
+      firstFailedAt: new Date(row.first_failed_at),
+      lockedUntil: row.locked_until === null ? null : new Date(row.locked_until),
+    };
+  }
+
+  upsertLoginAttempt(row: {
+    email: string;
+    failedCount: number;
+    firstFailedAt: Date;
+    lockedUntil: Date | null;
+  }): void {
+    this.db
+      .query(
+        "INSERT INTO login_attempts (email, failed_count, first_failed_at, locked_until) " +
+          "VALUES (?, ?, ?, ?) " +
+          "ON CONFLICT(email) DO UPDATE SET failed_count = excluded.failed_count, " +
+          "first_failed_at = excluded.first_failed_at, locked_until = excluded.locked_until",
+      )
+      .run(
+        row.email,
+        row.failedCount,
+        row.firstFailedAt.getTime(),
+        row.lockedUntil ? row.lockedUntil.getTime() : null,
+      );
+  }
+
+  deleteLoginAttempt(email: string): void {
+    this.db.query("DELETE FROM login_attempts WHERE email = ?").run(email);
+  }
+
+  listLoginAttempts(): LoginAttemptRow[] {
+    const rows = this.db
+      .query("SELECT * FROM login_attempts ORDER BY email ASC")
+      .all() as {
+      email: string;
+      failed_count: number;
+      first_failed_at: number;
+      locked_until: number | null;
+    }[];
+    return rows.map((r) => ({
+      email: r.email,
+      failedCount: r.failed_count,
+      firstFailedAt: new Date(r.first_failed_at),
+      lockedUntil: r.locked_until === null ? null : new Date(r.locked_until),
+    }));
+  }
+
+  // -- broadcasts ------------------------------------------------------------
+
+  insertBroadcast(row: {
+    title: string;
+    message: string;
+    recipientCount: number;
+  }): number {
+    const info = this.db
+      .query(
+        "INSERT INTO broadcasts (title, message, recipient_count, created_at) " +
+          "VALUES (?, ?, ?, ?)",
+      )
+      .run(row.title, row.message, row.recipientCount, Date.now());
+    return Number(info.lastInsertRowid);
+  }
+
+  private toBroadcastRow(r: {
+    id: number;
+    title: string;
+    message: string;
+    recipient_count: number;
+    created_at: number;
+  }): BroadcastRow {
+    return {
+      id: r.id,
+      title: r.title,
+      message: r.message,
+      recipientCount: r.recipient_count,
+      createdAt: new Date(r.created_at),
+    };
+  }
+
+  listBroadcasts(limit = 50): BroadcastRow[] {
+    const rows = this.db
+      .query("SELECT * FROM broadcasts ORDER BY id DESC LIMIT ?")
+      .all(limit) as {
+      id: number;
+      title: string;
+      message: string;
+      recipient_count: number;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toBroadcastRow(r));
+  }
+
+  deleteBroadcasts(): void {
+    this.db.query("DELETE FROM broadcasts").run();
+  }
+
+  // -- reports (real aggregates over a UTC date range) ----------------------
+
+  /** Download events in [fromMs, toMs) with the fields reports need. */
+  listDownloadEventsInRange(
+    fromMs: number,
+    toMs: number,
+  ): { userId: number | null; sizeBytes: number; createdAt: Date }[] {
+    const rows = this.db
+      .query(
+        "SELECT user_id, size_bytes, created_at FROM download_events " +
+          "WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC",
+      )
+      .all(fromMs, toMs) as {
+      user_id: number | null;
+      size_bytes: number;
+      created_at: number;
+    }[];
+    return rows.map((r) => ({
+      userId: r.user_id,
+      sizeBytes: r.size_bytes,
+      createdAt: new Date(r.created_at),
+    }));
+  }
+
+  listPaymentsInRange(
+    fromMs: number,
+    toMs: number,
+  ): { amountCents: number; createdAt: Date }[] {
+    const rows = this.db
+      .query(
+        "SELECT amount_cents, created_at FROM payments " +
+          "WHERE created_at >= ? AND created_at < ? ORDER BY created_at ASC",
+      )
+      .all(fromMs, toMs) as { amount_cents: number; created_at: number }[];
+    return rows.map((r) => ({
+      amountCents: r.amount_cents,
+      createdAt: new Date(r.created_at),
+    }));
+  }
+
+  listUserSignupsInRange(fromMs: number, toMs: number): { createdAt: Date }[] {
+    const rows = this.db
+      .query(
+        "SELECT created_at FROM users WHERE role = 'user' " +
+          "AND created_at >= ? AND created_at < ? ORDER BY created_at ASC",
+      )
+      .all(fromMs, toMs) as { created_at: number }[];
+    return rows.map((r) => ({ createdAt: new Date(r.created_at) }));
+  }
+
+  countActivatedRequestsInRange(fromMs: number, toMs: number): number {
+    const row = this.db
+      .query(
+        "SELECT COUNT(*) AS n FROM purchase_requests WHERE status = 'activated' " +
+          "AND decided_at >= ? AND decided_at < ?",
+      )
+      .get(fromMs, toMs) as { n: number };
+    return row.n;
+  }
+
+  // -- backup export helpers (whole-table reads) ----------------------------
+
+  listDownloadEvents(): { id: number; userId: number | null; anonId: string | null; sizeBytes: number; createdAt: Date }[] {
+    const rows = this.db
+      .query("SELECT * FROM download_events ORDER BY id ASC")
+      .all() as {
+      id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      size_bytes: number;
+      created_at: number;
+    }[];
+    return rows.map((r) => ({
+      id: r.id,
+      userId: r.user_id,
+      anonId: r.anon_id,
+      sizeBytes: r.size_bytes,
+      createdAt: new Date(r.created_at),
+    }));
+  }
+
+  listSettings(): { key: string; value: string }[] {
+    return this.db.query("SELECT key, value FROM settings ORDER BY key ASC").all() as {
+      key: string;
+      value: string;
+    }[];
+  }
+
+  listContactMessages(): { id: number; name: string; email: string; message: string; createdAt: Date }[] {
+    const rows = this.db
+      .query("SELECT * FROM contact_messages ORDER BY id ASC")
+      .all() as {
+      id: number;
+      name: string;
+      email: string;
+      message: string;
+      created_at: number;
+    }[];
+    return rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      message: r.message,
+      createdAt: new Date(r.created_at),
+    }));
+  }
+
+  listAllNotifications(): NotificationRow[] {
+    const rows = this.db
+      .query("SELECT * FROM notifications ORDER BY id ASC")
+      .all() as {
+      id: number;
+      user_id: number | null;
+      anon_id: string | null;
+      owner_key: string;
+      type: string;
+      title: string;
+      message: string;
+      read: number;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toNotificationRow(r));
+  }
+
+  listAllTicketMessages(): TicketMessageRow[] {
+    const rows = this.db
+      .query("SELECT * FROM ticket_messages ORDER BY id ASC")
+      .all() as {
+      id: number;
+      ticket_id: number;
+      author_role: string;
+      message: string;
+      created_at: number;
+    }[];
+    return rows.map((r) => this.toTicketMessageRow(r));
+  }
+
+  listUserSettings(): UserSettingsRow[] {
+    const rows = this.db
+      .query("SELECT * FROM user_settings ORDER BY user_id ASC")
+      .all() as {
+      user_id: number;
+      default_quality: string;
+      default_mode: string;
+      updated_at: number;
+    }[];
+    return rows.map((r) => ({
+      userId: r.user_id,
+      defaultQuality: r.default_quality,
+      defaultMode: r.default_mode,
+      updatedAt: new Date(r.updated_at),
+    }));
   }
 }
