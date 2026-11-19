@@ -111,6 +111,21 @@ export class FileStore {
     return this.existing(key);
   }
 
+  /** Total bytes currently stored in the cache (admin dashboard). */
+  totalBytes(): number {
+    try {
+      return readdirSync(this.dir).reduce((sum, name) => {
+        try {
+          return sum + statSync(join(this.dir, name)).size;
+        } catch {
+          return sum;
+        }
+      }, 0);
+    } catch {
+      return 0;
+    }
+  }
+
   /** Read a byte range (or the whole file when range is null). */
   async readSlice(
     filename: string,

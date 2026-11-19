@@ -17,6 +17,35 @@ export type DownloadRow = {
   createdAt: Date;
 };
 
+export type UserRow = {
+  id: number;
+  name: string;
+  email: string;
+  passwordHash: string;
+  role: string;
+  status: string;
+  createdAt: Date;
+  lastLoginAt: Date | null;
+};
+
+export type SessionRow = {
+  token: string;
+  userId: number;
+  expiresAt: Date;
+  createdAt: Date;
+};
+
+type UserRaw = {
+  id: number;
+  name: string;
+  email: string;
+  password_hash: string;
+  role: string;
+  status: string;
+  created_at: number;
+  last_login_at: number | null;
+};
+
 export class Store {
   readonly db: Database;
   readonly dataDir: string;
@@ -122,5 +151,131 @@ export class Store {
           "VALUES (?, ?, ?, ?)",
       )
       .run(row.name, row.email, row.message, Date.now());
+  }
+
+  // -- admin users + sessions -------------------------------------------------
+  // Admin-only login: the admin account is the only login on the site.
+
+  private toUserRow(r: UserRaw): UserRow {
+    return {
+      id: r.id,
+      name: r.name,
+      email: r.email,
+      passwordHash: r.password_hash,
+      role: r.role,
+      status: r.status,
+      createdAt: new Date(r.created_at),
+      lastLoginAt: r.last_login_at === null ? null : new Date(r.last_login_at),
+    };
+  }
+
+  getUserByEmail(email: string): UserRow | null {
+    const row = this.db
+      .query("SELECT * FROM users WHERE email = ? LIMIT 1")
+      .get(email) as UserRaw | null;
+    return row ? this.toUserRow(row) : null;
+  }
+
+  getUserById(id: number): UserRow | null {
+    const row = this.db
+      .query("SELECT * FROM users WHERE id = ? LIMIT 1")
+      .get(id) as UserRaw | null;
+    return row ? this.toUserRow(row) : null;
+  }
+
+  countAdmins(): number {
+    const row = this.db
+      .query("SELECT COUNT(*) AS n FROM users WHERE role = 'admin'")
+      .get() as { n: number };
+    return row.n;
+  }
+
+  insertUser(row: {
+    name: string;
+    email: string;
+    passwordHash: string;
+    role: string;
+    status: string;
+  }): number {
+    const info = this.db
+      .query(
+        "INSERT INTO users (name, email, password_hash, role, status, created_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?)",
+      )
+      .run(row.name, row.email, row.passwordHash, row.role, row.status, Date.now());
+    return Number(info.lastInsertRowid);
+  }
+
+  updateUserLastLogin(id: number): void {
+    this.db
+      .query("UPDATE users SET last_login_at = ? WHERE id = ?")
+      .run(Date.now(), id);
+  }
+
+  updateUserPassword(id: number, passwordHash: string): void {
+    this.db
+      .query("UPDATE users SET password_hash = ? WHERE id = ?")
+      .run(passwordHash, id);
+  }
+
+  insertSession(token: string, userId: number, expiresAt: Date): void {
+    this.db
+      .query(
+        "INSERT INTO sessions (token, user_id, expires_at, created_at) " +
+          "VALUES (?, ?, ?, ?)",
+      )
+      .run(token, userId, expiresAt.getTime(), Date.now());
+  }
+
+  getSession(token: string): SessionRow | null {
+    const row = this.db
+      .query("SELECT * FROM sessions WHERE token = ? LIMIT 1")
+      .get(token) as {
+      token: string;
+      user_id: number;
+      expires_at: number;
+      created_at: number;
+    } | null;
+    if (!row) return null;
+    return {
+      token: row.token,
+      userId: row.user_id,
+      expiresAt: new Date(row.expires_at),
+      createdAt: new Date(row.created_at),
+    };
+  }
+
+  deleteSession(token: string): void {
+    this.db.query("DELETE FROM sessions WHERE token = ?").run(token);
+  }
+
+  deleteSessionsForUserExcept(userId: number, keepToken: string | null | undefined): void {
+    if (keepToken) {
+      this.db
+        .query("DELETE FROM sessions WHERE user_id = ? AND token != ?")
+        .run(userId, keepToken);
+    } else {
+      this.db.query("DELETE FROM sessions WHERE user_id = ?").run(userId);
+    }
+  }
+
+  // -- download stats (admin dashboard) --------------------------------------
+
+  countDownloads(): number {
+    const row = this.db
+      .query("SELECT COUNT(*) AS n FROM downloads")
+      .get() as { n: number };
+    return row.n;
+  }
+
+  countDownloadsSince(ms: number): number {
+    const row = this.db
+      .query("SELECT COUNT(*) AS n FROM downloads WHERE created_at >= ?")
+      .get(ms) as { n: number };
+    return row.n;
+  }
+
+  recentDownloads(limit: number): DownloadRow[] {
+    return this.listDownloads(limit);
   }
 }

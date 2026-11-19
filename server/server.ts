@@ -13,7 +13,7 @@ import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Store } from "./db";
 import { FileStore } from "./files";
-import { ACTIONS, HandlerError, type Env } from "./handlers";
+import { ACTIONS, HandlerError, seedAdmin, type Env } from "./handlers";
 
 const ROOT = resolve(import.meta.dir, "..");
 const PUBLIC_DIR = join(ROOT, "public");
@@ -26,6 +26,11 @@ const MAX_CACHE_BYTES = Number(process.env.MAX_CACHE_BYTES ?? 5_000_000_000);
 const store = new Store(DATA_DIR);
 const files = new FileStore(DATA_DIR, MAX_CACHE_BYTES);
 const env: Env = { store, files };
+
+// Seed the admin account on every boot when none exists, so the admin
+// login always works even after the free host resets the database
+// (Render Free has no persistent disk).
+seedAdmin(env);
 
 const MIME: Record<string, string> = {
   ".html": "text/html; charset=utf-8",
