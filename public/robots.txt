@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://jimeng-video-downloader.onrender.com/sitemap.xml

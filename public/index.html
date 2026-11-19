@@ -1,15 +1,42 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
     <meta name="color-scheme" content="light dark" />
-    <!-- Empty inline icon: stops the browser fetching /favicon.ico, which
-         lives outside the space's routes and fails auth. -->
-    <link rel="icon" href="data:," />
-    <title>Jimeng Video Downloader</title>
+    <title>Jimeng Video Downloader — No Watermark</title>
+    <meta name="description" content="Download Jimeng AI videos without watermark — free, no login required. Paste a public Jimeng share link and save the original MP4 in seconds." />
+    <meta name="keywords" content="jimeng downloader, jimeng video downloader, download jimeng video without watermark, dreamina downloader, jimeng mp4" />
+    <meta name="robots" content="index, follow" />
+    <meta name="theme-color" content="#050b12" />
+    <link rel="canonical" href="https://jimeng-video-downloader.onrender.com/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Jimeng Video Downloader" />
+    <meta property="og:title" content="Jimeng Video Downloader — No Watermark" />
+    <meta property="og:description" content="Download Jimeng AI videos without watermark — free, no login required. Paste a public Jimeng share link and save the original MP4 in seconds." />
+    <meta property="og:url" content="https://jimeng-video-downloader.onrender.com/" />
+    <meta property="og:image" content="https://jimeng-video-downloader.onrender.com/icon-512.png" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Jimeng Video Downloader — No Watermark" />
+    <meta name="twitter:description" content="Download Jimeng AI videos without watermark — free, no login required. Paste a public Jimeng share link and save the original MP4 in seconds." />
+    <meta name="twitter:image" content="https://jimeng-video-downloader.onrender.com/icon-512.png" />
+    <!-- The icon + manifest links are injected at runtime by main.tsx
+         (the static icons/manifest are served from the site root). Static
+         link tags here make Bun.build try to bundle them and fail. -->
+    <script>
+      // First paint: apply the saved theme before any CSS renders, so the
+      // page never flashes the wrong theme. Logged-in customers also keep
+      // their theme on their account; localStorage is the first-paint
+      // source and the account value is applied once it loads.
+      try {
+        var t = localStorage.getItem("jimeng_theme");
+        document.documentElement.setAttribute("data-theme", t === "light" ? "light" : "dark");
+      } catch (e) {
+        document.documentElement.setAttribute("data-theme", "dark");
+      }
+    </script>
     
-  <link rel="stylesheet" crossorigin href="./assets/index-cb8vgzrj.css"><script type="module" crossorigin src="./assets/index-0hnbe4r5.js"></script></head>
+  <link rel="stylesheet" crossorigin href="./assets/index-a80phnkp.css"><script type="module" crossorigin src="./assets/index-fp1kbksf.js"></script></head>
   <body>
     <div
       data-generated-space-root=""

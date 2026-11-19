@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Jimeng Video Downloader — sitemap. These are the app's real pages
+     (the site is a single-page app; the server serves the app shell for
+     each of these paths, and the client renders the matching view). -->
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://jimeng-video-downloader.onrender.com/</loc><lastmod>2026-11-19</lastmod><changefreq>weekly</changefreq><priority>1.0</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/jimeng</loc><lastmod>2026-11-19</lastmod><changefreq>weekly</changefreq><priority>0.9</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/history</loc><lastmod>2026-11-19</lastmod><changefreq>monthly</changefreq><priority>0.6</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/plans</loc><lastmod>2026-11-19</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/help</loc><lastmod>2026-11-19</lastmod><changefreq>monthly</changefreq><priority>0.8</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/faq</loc><lastmod>2026-11-19</lastmod><changefreq>monthly</changefreq><priority>0.7</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/about</loc><lastmod>2026-11-19</lastmod><changefreq>monthly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/privacy</loc><lastmod>2026-11-19</lastmod><changefreq>yearly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/terms</loc><lastmod>2026-11-19</lastmod><changefreq>yearly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/copyright</loc><lastmod>2026-11-19</lastmod><changefreq>yearly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/disclaimer</loc><lastmod>2026-11-19</lastmod><changefreq>yearly</changefreq><priority>0.5</priority></url>
+  <url><loc>https://jimeng-video-downloader.onrender.com/contact</loc><lastmod>2026-11-19</lastmod><changefreq>monthly</changefreq><priority>0.5</priority></url>
+</urlset>
