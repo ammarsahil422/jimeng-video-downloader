@@ -3,7 +3,19 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { SafeAreaTopScrim } from "./safe-area";
 import { api, type ApiResponse } from "./api";
 
+// The Hatch-hosted client attaches SDK field metadata to inputs via
+// actionFields; the standalone client has no SDK, so these spreads are
+// inert empty props.
+const FIELDS = {
+  resolveLink: { text: {} },
+  saveApiKey: { apiKey: {}, apiBaseUrl: {} },
+  saveAdCode: { code: {} },
+  submitContact: { name: {}, email: {}, message: {} },
+} as const;
+
 type ResolveResult = ApiResponse<typeof api, "resolveLink">;
+type AdminMeResult = ApiResponse<typeof api, "adminMe">;
+type AdminUser = NonNullable<AdminMeResult["admin"]>;
 type View =
   | "home"
   | "history"
@@ -14,8 +26,29 @@ type View =
   | "sora"
   | "about"
   | "privacy"
-  | "contact";
+  | "contact"
+  | "admin";
 type AdSlotKey = "head" | "top" | "incontent" | "sidebar" | "bottom";
+
+/** Admin session token storage — the token lives in the browser only; the
+ *  server validates it on every admin action. Downloads are public and
+ *  need no login. */
+const TOKEN_KEY = "jimeng_admin_token";
+function getToken(): string | undefined {
+  try {
+    return localStorage.getItem(TOKEN_KEY) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+function setToken(token: string | null): void {
+  try {
+    if (token) localStorage.setItem(TOKEN_KEY, token);
+    else localStorage.removeItem(TOKEN_KEY);
+  } catch {
+    // Private mode / storage blocked — the admin just stays logged out.
+  }
+}
 
 const AD_SLOTS: { key: AdSlotKey; label: string; size: string }[] = [
   { key: "top", label: "Top Banner", size: "728 × 90 · Leaderboard" },
@@ -149,7 +182,39 @@ export function App() {
   const [menuOpen, setMenuOpen] = useState(false);
   const queryClient = useQueryClient();
 
-  const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.getSettings({}) });
+  // --- Admin session: login is admin-only. Downloads are public and need
+  // no account. The token is stored in the browser and validated by the
+  // server on every admin action.
+  const [admin, setAdmin] = useState<AdminUser | null>(null);
+  const [adminChecked, setAdminChecked] = useState(false);
+
+  useEffect(() => {
+    const token = getToken();
+    if (!token) {
+      setAdminChecked(true);
+      return;
+    }
+    api.adminMe({ token }).then((data) => {
+      if (data.ok && data.admin) setAdmin(data.admin);
+      else setToken(null);
+    }).catch(() => {
+      /* offline — stay logged out until the server answers */
+    }).finally(() => setAdminChecked(true));
+  }, []);
+
+  async function handleLogout() {
+    const token = getToken();
+    setToken(null);
+    setAdmin(null);
+    setView("home");
+    setMenuOpen(false);
+    queryClient.invalidateQueries({ queryKey: ["settings"] });
+    if (token) {
+      try { await api.adminLogout({ token }); } catch { /* already signed out */ }
+    }
+  }
+
+  const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.getSettings({ token: getToken() }) });
   const history = useQuery({ queryKey: ["history"], queryFn: () => api.listHistory({ limit: 30 }) });
   const historyCount = history.data?.items.length ?? 0;
 
@@ -301,6 +366,20 @@ export function App() {
               </button>
             </div>
             <nav aria-label="Menu" className="flex flex-col px-3 py-2">
+              {admin ? (
+                <div className="mb-1 border-b border-[var(--border)] px-3 pt-1 pb-3">
+                  <p className="text-base font-extrabold break-words">Admin</p>
+                  <p className="text-xs text-[var(--dim)] break-all">{admin.email}</p>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => go("admin")}
+                  className="mb-1 flex items-center justify-between gap-2 border-b border-[var(--border)] px-3 py-3.5 text-left text-lg font-semibold"
+                >
+                  <span>🔑 Login</span>
+                </button>
+              )}
               {MENU_ITEMS.map((item) => (
                 <button
                   key={item.view}
@@ -321,6 +400,24 @@ export function App() {
                   )}
                 </button>
               ))}
+              {admin && (
+                <button
+                  type="button"
+                  onClick={() => go("admin")}
+                  className={`flex items-center justify-between gap-2 px-3 py-3.5 text-left text-lg font-semibold ${view === "admin" ? "text-[var(--accent)]" : ""}`}
+                >
+                  <span>🛡 Admin Panel</span>
+                </button>
+              )}
+              {admin && (
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="mt-1 flex items-center justify-between gap-2 border-t border-[var(--border)] px-3 py-3.5 text-left text-lg font-semibold text-[var(--err-text)]"
+                >
+                  <span>🚪 Logout</span>
+                </button>
+              )}
             </nav>
           </div>
         </div>
@@ -374,6 +471,7 @@ export function App() {
                   Open the video in the Jimeng app → share arrow ↗ → link icon 🔗 → copy the link and paste it here. Links look like: <span className="font-mono text-xs">https://jimeng.jianying.com/s/xxxxx</span> — You can also paste Jimeng's full share text; the link will be extracted from it automatically.
                 </p>
                 <textarea
+                  {...FIELDS.resolveLink.text}
                   id="jimeng-link"
                   aria-label="Jimeng share link"
                   value={linkText}
@@ -537,13 +635,10 @@ export function App() {
               </SectionCard>
 
               <AdSlot label="In-Content" size="Responsive · In-article" saved={Boolean(settings.data?.adSlots.incontent)} />
-
-              <AdsSetup settings={settings.data} />
             </main>
 
             {/* Sidebar */}
             <aside className="flex min-w-0 flex-col gap-6">
-              <ApiKeyBox settings={settings.data} />
               <AdSlot label="Sidebar" size="300 × 250 · Rectangle" saved={Boolean(settings.data?.adSlots.sidebar)} tall />
               <SectionCard>
                 <h2 className="text-lg font-extrabold">Supported links</h2>
@@ -579,6 +674,17 @@ export function App() {
             onDownload={handleDownload}
             onShare={handleShareSave}
           />
+        )}
+        {view === "admin" && !adminChecked && (
+          <main className="mx-auto max-w-3xl py-16 text-center">
+            <p className="text-base text-[var(--dim)]">Loading…</p>
+          </main>
+        )}
+        {view === "admin" && adminChecked && !admin && (
+          <AdminLoginPage onLoggedIn={(a) => { setAdmin(a); queryClient.invalidateQueries({ queryKey: ["settings"] }); }} />
+        )}
+        {view === "admin" && admin && (
+          <AdminPanel admin={admin} onLoggedOut={handleLogout} />
         )}
         {view === "sora" && <SoraPage onGoHome={() => go("home")} />}
         {view === "about" && <AboutPage />}
@@ -980,7 +1086,7 @@ function ApiKeyBox({ settings }: { settings: ApiResponse<typeof api, "getSetting
   const [keyError, setKeyError] = useState<string | null>(null);
 
   const save = useMutation({
-    mutationFn: async () => await api.saveApiKey({ apiKey: key.trim(), apiBaseUrl: base.trim() }),
+    mutationFn: async () => await api.saveApiKey({ apiKey: key.trim(), apiBaseUrl: base.trim(), token: getToken() }),
     onSuccess: (r) => {
       setMsg(`Key saved (${r.hint}) — stored securely on the server.`);
       setKey("");
@@ -989,7 +1095,7 @@ function ApiKeyBox({ settings }: { settings: ApiResponse<typeof api, "getSetting
     onError: (error) => setMsg(error.message),
   });
   const clear = useMutation({
-    mutationFn: () => api.clearApiKey({}),
+    mutationFn: () => api.clearApiKey({ token: getToken() }),
     onSuccess: () => { setMsg("Key removed."); queryClient.invalidateQueries({ queryKey: ["settings"] }); },
   });
 
@@ -1024,12 +1130,12 @@ function ApiKeyBox({ settings }: { settings: ApiResponse<typeof api, "getSetting
 
       <label htmlFor="api-base" className="mt-4 block text-sm font-bold">API endpoint (base URL)</label>
       <div className="mt-1 flex gap-2">
-        <input id="api-base" aria-label="API endpoint base URL" value={base} onChange={(e) => setBase(e.target.value)} placeholder="https://example-api.com/resolve" className="min-w-0 flex-1 border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm" style={{ borderRadius: "var(--radius)" }} />
+        <input {...FIELDS.saveApiKey.apiBaseUrl} id="api-base" aria-label="API endpoint base URL" value={base} onChange={(e) => setBase(e.target.value)} placeholder="https://example-api.com/resolve" className="min-w-0 flex-1 border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm" style={{ borderRadius: "var(--radius)" }} />
         <button type="button" onClick={() => pasteInto(setBase)} className="border border-[var(--border)] px-3 text-sm font-bold" style={{ borderRadius: "var(--radius)" }}>Paste</button>
       </div>
       <label htmlFor="api-key" className="mt-3 block text-sm font-bold">API key</label>
       <div className="mt-1 flex gap-2">
-        <input id="api-key" aria-label="API key" type="password" autoComplete="off" value={key} onChange={(e) => { setKey(e.target.value); if (keyError) setKeyError(null); }} placeholder="Paste your API key" className="min-w-0 flex-1 border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm" style={{ borderRadius: "var(--radius)" }} />
+        <input {...FIELDS.saveApiKey.apiKey} id="api-key" aria-label="API key" type="password" autoComplete="off" value={key} onChange={(e) => { setKey(e.target.value); if (keyError) setKeyError(null); }} placeholder="Paste your API key" className="min-w-0 flex-1 border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm" style={{ borderRadius: "var(--radius)" }} />
         <button type="button" onClick={() => pasteInto(setKey)} className="border border-[var(--border)] px-3 text-sm font-bold" style={{ borderRadius: "var(--radius)" }}>Paste</button>
       </div>
       {keyError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{keyError}</p>}
@@ -1071,12 +1177,12 @@ function AdSlotEditor({ slot, label, size, saved }: { slot: AdSlotKey; label: st
   const [msg, setMsg] = useState<string | null>(null);
   const [codeError, setCodeError] = useState<string | null>(null);
   const save = useMutation({
-    mutationFn: async () => await api.saveAdCode({ slot, code }),
+    mutationFn: async () => await api.saveAdCode({ slot, code, token: getToken() }),
     onSuccess: () => { setMsg("Code saved ✓"); setCode(""); queryClient.invalidateQueries({ queryKey: ["settings"] }); },
     onError: (error) => setMsg(error.message),
   });
   const clear = useMutation({
-    mutationFn: () => api.clearAdCode({ slot }),
+    mutationFn: () => api.clearAdCode({ slot, token: getToken() }),
     onSuccess: () => { setMsg("Code removed."); queryClient.invalidateQueries({ queryKey: ["settings"] }); },
   });
 
@@ -1099,6 +1205,7 @@ function AdSlotEditor({ slot, label, size, saved }: { slot: AdSlotKey; label: st
       </div>
       <label htmlFor={`ad-${slot}`} className="sr-only">{label} AdSense code</label>
       <textarea
+        {...FIELDS.saveAdCode.code}
         id={`ad-${slot}`}
         value={code}
         onChange={(e) => { setCode(e.target.value); if (codeError) setCodeError(null); }}
@@ -1221,15 +1328,15 @@ function ContactPage() {
         <form className="mt-4 flex flex-col gap-3" onSubmit={handleSubmit}>
           <div>
             <label htmlFor="contact-name" className="text-sm font-bold">Your name</label>
-            <input id="contact-name" aria-label="Your name" value={name} onChange={(e) => setName(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+            <input {...FIELDS.submitContact.name} id="contact-name" aria-label="Your name" value={name} onChange={(e) => setName(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
           </div>
           <div>
             <label htmlFor="contact-email" className="text-sm font-bold">Email</label>
-            <input id="contact-email" aria-label="Email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+            <input {...FIELDS.submitContact.email} id="contact-email" aria-label="Email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
           </div>
           <div>
             <label htmlFor="contact-message" className="text-sm font-bold">Message</label>
-            <textarea id="contact-message" aria-label="Message" value={message} onChange={(e) => setMessage(e.target.value)} rows={5} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
+            <textarea {...FIELDS.submitContact.message} id="contact-message" aria-label="Message" value={message} onChange={(e) => setMessage(e.target.value)} rows={5} className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2" style={{ borderRadius: "var(--radius)" }} />
           </div>
           {formError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{formError}</p>}
           <button type="submit" disabled={mut.isPending} className="bg-[var(--accent)] px-5 py-2.5 font-extrabold text-[var(--accent-ink)] disabled:opacity-50" style={{ borderRadius: "var(--radius)" }}>
@@ -1238,5 +1345,297 @@ function ContactPage() {
         </form>
       </SectionCard>
     </main>
+  );
+}
+
+/* -------------------------------------------------------------------------
+ * Admin login + Admin Panel.
+ *
+ * Login is admin-only: the sidebar Login item opens this page, and the
+ * admin email/password opens the panel. Downloads stay public — regular
+ * visitors never see a login wall. The Ads Setup and API Key sections
+ * live here only; they do not render anywhere on the public site.
+ * ------------------------------------------------------------------------- */
+
+function AdminLoginPage({ onLoggedIn }: { onLoggedIn: (admin: AdminUser) => void }) {
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!email.trim() || !password) {
+      setError("Enter your admin email and password.");
+      return;
+    }
+    setError(null);
+    setBusy(true);
+    try {
+      const data = await api.adminLogin({ email: email.trim(), password });
+      if (data.ok && data.token && data.admin) {
+        setToken(data.token);
+        onLoggedIn(data.admin);
+      } else {
+        setError(data.error ?? "Incorrect email or password.");
+      }
+    } catch {
+      setError("No response from the server. Please try again in a moment.");
+    }
+    setBusy(false);
+  }
+
+  return (
+    <main className="mx-auto flex max-w-md flex-col gap-5">
+      <div>
+        <h1 className="text-3xl font-extrabold">Admin Login</h1>
+        <p className="mt-2 text-base text-[var(--dim)]">
+          This login is only for the site admin. Downloads on this site are free and need no login.
+        </p>
+      </div>
+      <SectionCard>
+        <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+          <div>
+            <label htmlFor="admin-email" className="text-sm font-bold">Admin email</label>
+            <input
+              id="admin-email"
+              type="email"
+              autoComplete="username"
+              value={email}
+              onChange={(e) => { setEmail(e.target.value); if (error) setError(null); }}
+              placeholder="admin@jimengdownloader.com"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          <div>
+            <label htmlFor="admin-password" className="text-sm font-bold">Password</label>
+            <input
+              id="admin-password"
+              type="password"
+              autoComplete="current-password"
+              value={password}
+              onChange={(e) => { setPassword(e.target.value); if (error) setError(null); }}
+              placeholder="Admin password"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          {error && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{error}</p>}
+          <button
+            type="submit"
+            disabled={busy}
+            className="bg-[var(--accent)] px-5 py-2.5 font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {busy ? "Logging in…" : "🔑 Log in as Admin"}
+          </button>
+        </form>
+      </SectionCard>
+    </main>
+  );
+}
+
+type AdminTab = "dashboard" | "ads" | "apikey" | "settings";
+
+function AdminPanel({ admin, onLoggedOut }: { admin: AdminUser; onLoggedOut: () => void }) {
+  const [tab, setTab] = useState<AdminTab>("dashboard");
+  const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.getSettings({ token: getToken() }) });
+  const stats = useQuery({
+    queryKey: ["admin-stats"],
+    queryFn: () => api.adminStats({ token: getToken() }),
+  });
+
+  const tabs: { key: AdminTab; label: string }[] = [
+    { key: "dashboard", label: "📊 Dashboard" },
+    { key: "ads", label: "📢 Ads" },
+    { key: "apikey", label: "🔑 API Key" },
+    { key: "settings", label: "⚙️ Settings" },
+  ];
+
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="text-3xl font-extrabold">Admin Panel</h1>
+          <p className="mt-1 text-sm text-[var(--dim)]">Logged in as {admin.email}</p>
+        </div>
+        <button
+          type="button"
+          onClick={onLoggedOut}
+          className="border border-[var(--border)] bg-[var(--surface)] px-4 py-2 text-sm font-extrabold text-[var(--err-text)]"
+          style={{ borderRadius: "var(--radius)" }}
+        >
+          🚪 Logout
+        </button>
+      </div>
+
+      <div className="flex flex-wrap gap-2" role="tablist" aria-label="Admin sections">
+        {tabs.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            role="tab"
+            aria-selected={tab === t.key}
+            onClick={() => setTab(t.key)}
+            className={`border px-4 py-2 text-sm font-extrabold ${tab === t.key ? "border-[var(--accent)] bg-[var(--surface-alt)] text-[var(--accent)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "dashboard" && (
+        <SectionCard>
+          <h2 className="text-lg font-extrabold">Dashboard</h2>
+          {stats.isPending && <p className="mt-3 text-sm text-[var(--dim)]">Loading…</p>}
+          {stats.isError && (
+            <p className="mt-3 text-sm font-semibold text-[var(--err-text)]">
+              Could not load the dashboard — your session may have expired. Log out and log in again.
+            </p>
+          )}
+          {stats.data && (
+            <>
+              <div className="mt-3 grid grid-cols-3 gap-3 text-center">
+                <div className="border border-[var(--border)] bg-[var(--surface-alt)] p-3" style={{ borderRadius: "var(--radius)" }}>
+                  <p className="text-2xl font-extrabold">{stats.data.downloadsToday}</p>
+                  <p className="text-xs font-bold text-[var(--dim)]">Downloads today</p>
+                </div>
+                <div className="border border-[var(--border)] bg-[var(--surface-alt)] p-3" style={{ borderRadius: "var(--radius)" }}>
+                  <p className="text-2xl font-extrabold">{stats.data.downloadsTotal}</p>
+                  <p className="text-xs font-bold text-[var(--dim)]">Downloads total</p>
+                </div>
+                <div className="border border-[var(--border)] bg-[var(--surface-alt)] p-3" style={{ borderRadius: "var(--radius)" }}>
+                  <p className="text-2xl font-extrabold">{formatBytes(stats.data.storageBytes) ?? "0 B"}</p>
+                  <p className="text-xs font-bold text-[var(--dim)]">Storage used</p>
+                </div>
+              </div>
+              <h3 className="mt-5 text-base font-extrabold">Recent downloads</h3>
+              {stats.data.recentDownloads.length === 0 ? (
+                <p className="mt-2 text-sm text-[var(--dim)]">No downloads yet.</p>
+              ) : (
+                <ul className="mt-2 flex flex-col gap-2">
+                  {stats.data.recentDownloads.map((d) => (
+                    <li key={d.id} className="border border-[var(--border)] p-3" style={{ borderRadius: "var(--radius)" }}>
+                      <p className="truncate text-sm font-bold">{d.title || "Jimeng video"}</p>
+                      <p className="truncate text-xs text-[var(--dim)]">{d.sourceUrl}</p>
+                      <p className="text-xs text-[var(--dim)]">{new Date(d.createdAt).toLocaleString()}</p>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
+        </SectionCard>
+      )}
+
+      {tab === "ads" && (
+        <AdsSetup settings={settings.data} />
+      )}
+
+      {tab === "apikey" && (
+        <ApiKeyBox settings={settings.data} />
+      )}
+
+      {tab === "settings" && (
+        <AdminSettings admin={admin} />
+      )}
+    </main>
+  );
+}
+
+function AdminSettings({ admin }: { admin: AdminUser }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [msg, setMsg] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function handleChange(e: React.FormEvent) {
+    e.preventDefault();
+    if (next.length < 8) {
+      setError("The new password must be at least 8 characters.");
+      return;
+    }
+    if (next !== confirm) {
+      setError("The new passwords do not match.");
+      return;
+    }
+    setError(null);
+    setMsg(null);
+    setBusy(true);
+    try {
+      const data = await api.adminChangePassword({ currentPassword: current, newPassword: next, token: getToken() });
+      if (data.ok) {
+        setMsg("Password changed. Your other sessions were signed out.");
+        setCurrent("");
+        setNext("");
+        setConfirm("");
+      } else {
+        setError(data.error ?? "Could not change the password.");
+      }
+    } catch {
+      setError("No response from the server. Please try again in a moment.");
+    }
+    setBusy(false);
+  }
+
+  return (
+    <SectionCard>
+      <h2 className="text-lg font-extrabold">Settings</h2>
+      <p className="mt-2 text-sm text-[var(--dim)]">
+        Admin account: <span className="font-bold text-[var(--text)]">{admin.email}</span>
+      </p>
+      <form onSubmit={handleChange} className="mt-4 flex flex-col gap-3">
+        <div>
+          <label htmlFor="pw-current" className="text-sm font-bold">Current password</label>
+          <input
+            id="pw-current"
+            type="password"
+            autoComplete="current-password"
+            value={current}
+            onChange={(e) => { setCurrent(e.target.value); if (error) setError(null); }}
+            className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+            style={{ borderRadius: "var(--radius)" }}
+          />
+        </div>
+        <div>
+          <label htmlFor="pw-new" className="text-sm font-bold">New password</label>
+          <input
+            id="pw-new"
+            type="password"
+            autoComplete="new-password"
+            value={next}
+            onChange={(e) => { setNext(e.target.value); if (error) setError(null); }}
+            className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+            style={{ borderRadius: "var(--radius)" }}
+          />
+        </div>
+        <div>
+          <label htmlFor="pw-confirm" className="text-sm font-bold">Confirm new password</label>
+          <input
+            id="pw-confirm"
+            type="password"
+            autoComplete="new-password"
+            value={confirm}
+            onChange={(e) => { setConfirm(e.target.value); if (error) setError(null); }}
+            className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+            style={{ borderRadius: "var(--radius)" }}
+          />
+        </div>
+        {error && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{error}</p>}
+        {msg && <p className="text-sm font-semibold text-[var(--accent)]" role="status">{msg}</p>}
+        <button
+          type="submit"
+          disabled={busy}
+          className="bg-[var(--accent)] px-5 py-2.5 font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
+          style={{ borderRadius: "var(--radius)" }}
+        >
+          {busy ? "Changing…" : "Change password"}
+        </button>
+      </form>
+    </SectionCard>
   );
 }

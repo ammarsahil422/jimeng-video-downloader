@@ -60,6 +60,25 @@ export type HistoryItem = {
   createdAt: string;
 };
 
+export type AdminUser = {
+  id: number;
+  name: string;
+  email: string;
+  role: string;
+};
+
+export type AdminStatsResult = {
+  downloadsToday: number;
+  downloadsTotal: number;
+  storageBytes: number;
+  recentDownloads: {
+    id: number;
+    title: string;
+    sourceUrl: string;
+    createdAt: string;
+  }[];
+};
+
 /** Action signatures — these must match server/handlers.ts exactly. */
 export interface Actions {
   resolveLink: (args: { text: string }) => Promise<ResolveResult>;
@@ -69,18 +88,21 @@ export interface Actions {
     sizeBytes: number;
     error: string | null;
   }>;
-  getSettings: (args: Record<string, never>) => Promise<SettingsResult>;
+  getSettings: (args: { token?: string }) => Promise<SettingsResult>;
   saveApiKey: (args: {
     apiKey: string;
     apiBaseUrl: string;
+    token?: string;
   }) => Promise<{ ok: true; hint: string }>;
-  clearApiKey: (args: Record<string, never>) => Promise<{ ok: true }>;
+  clearApiKey: (args: { token?: string }) => Promise<{ ok: true }>;
   saveAdCode: (args: {
     slot: "head" | "top" | "incontent" | "sidebar" | "bottom";
     code: string;
+    token?: string;
   }) => Promise<{ ok: true }>;
   clearAdCode: (args: {
     slot: "head" | "top" | "incontent" | "sidebar" | "bottom";
+    token?: string;
   }) => Promise<{ ok: true }>;
   listHistory: (args: { limit?: number }) => Promise<{ items: HistoryItem[] }>;
   deleteHistoryItem: (args: { id: number }) => Promise<{ ok: true }>;
@@ -90,6 +112,26 @@ export interface Actions {
     email: string;
     message: string;
   }) => Promise<{ ok: true }>;
+  adminLogin: (args: {
+    email: string;
+    password: string;
+  }) => Promise<{
+    ok: boolean;
+    token: string | null;
+    error: string | null;
+    admin: AdminUser | null;
+  }>;
+  adminLogout: (args: { token?: string }) => Promise<{ ok: true }>;
+  adminMe: (args: { token?: string }) => Promise<{
+    ok: boolean;
+    admin: AdminUser | null;
+  }>;
+  adminStats: (args: { token?: string }) => Promise<AdminStatsResult>;
+  adminChangePassword: (args: {
+    currentPassword: string;
+    newPassword: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
 }
 
 function resolveEndpoint(): string {
