@@ -34,7 +34,31 @@ export type ResolveResult = {
   usedCustomApi: boolean;
   note: string | null;
   error: string | null;
+  downloadId: number | null;
 };
+
+export type FavoriteItem = {
+  id: number;
+  downloadId: number;
+  title: string;
+  coverUrl: string | null;
+  videoUrl: string;
+  qualityLabel: string;
+  sourceUrl: string;
+  createdAt: string;
+};
+
+export type NotificationItem = {
+  id: number;
+  type: string;
+  title: string;
+  message: string;
+  read: boolean;
+  createdAt: string;
+};
+
+export type DownloadQualityPref = "best" | "original" | "720p" | "480p" | "360p";
+export type DownloadModePref = "single" | "bulk";
 
 export type AdSlots = {
   head: boolean;
@@ -235,7 +259,61 @@ export interface Actions {
     downloadsTotal: number;
     freeDailyLimit: number;
     freeRemaining: number;
+    joinedAt: string | null;
   }>;
+  toggleFavorite: (args: {
+    downloadId: number;
+    label?: string;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ ok: boolean; favorited: boolean; error: string | null }>;
+  listFavorites: (args: {
+    limit?: number;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ items: FavoriteItem[] }>;
+  removeFavorite: (args: {
+    id: number;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ ok: true }>;
+  updateProfileName: (args: {
+    name: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  changeUserPassword: (args: {
+    currentPassword: string;
+    newPassword: string;
+    token?: string;
+  }) => Promise<{ ok: boolean; error: string | null }>;
+  getDownloadSettings: (args: { token?: string }) => Promise<{
+    defaultQuality: DownloadQualityPref;
+    defaultMode: DownloadModePref;
+  }>;
+  saveDownloadSettings: (args: {
+    defaultQuality: DownloadQualityPref;
+    defaultMode: DownloadModePref;
+    token?: string;
+  }) => Promise<{ ok: true }>;
+  listNotifications: (args: {
+    limit?: number;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ items: NotificationItem[]; unreadCount: number }>;
+  markNotificationRead: (args: {
+    id: number;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ ok: true }>;
+  markAllNotificationsRead: (args: {
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ ok: true }>;
+  deleteNotification: (args: {
+    id: number;
+    token?: string;
+    anonId?: string;
+  }) => Promise<{ ok: true }>;
   logout: (args: { token?: string }) => Promise<{ ok: true }>;
   myRequests: (args: { token?: string }) => Promise<{
     requests: {

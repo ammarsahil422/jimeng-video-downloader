@@ -16,6 +16,17 @@ const FIELDS = {
   createPlan: { name: {}, durationDays: {}, downloadLimit: {}, description: {} },
   recordPayment: { amountCents: {}, method: {}, note: {} },
   saveAdminSettings: { freeDailyLimit: {} },
+  toggleFavorite: { downloadId: {}, label: {} },
+  listFavorites: { limit: {} },
+  removeFavorite: { id: {} },
+  updateProfileName: { name: {} },
+  changeUserPassword: { currentPassword: {}, newPassword: {} },
+  getDownloadSettings: {},
+  saveDownloadSettings: { defaultQuality: {}, defaultMode: {} },
+  listNotifications: { limit: {} },
+  markNotificationRead: { id: {} },
+  markAllNotificationsRead: {},
+  deleteNotification: { id: {} },
 } as const;
 
 type ResolveResult = ApiResponse<typeof api, "resolveLink">;
@@ -27,6 +38,10 @@ type View =
   | "home"
   | "jimeng"
   | "history"
+  | "favorites"
+  | "profile"
+  | "download-settings"
+  | "notifications"
   | "plans"
   | "auth"
   | "myplan"
@@ -101,6 +116,81 @@ function getAnonId(): string {
   } catch {
     return "anon-unavailable";
   }
+}
+
+/** Download preferences (Phase 2). Logged-in customers keep them on
+ *  their account (server); anonymous visitors keep the same preferences
+ *  in this browser's localStorage. Quality values are real options only
+ *  — "best" means the default first option (720p Origin). */
+type QualityPref = "best" | "original" | "720p" | "480p" | "360p";
+type DownloadModePref = "single" | "bulk";
+type DownloadSettingsPref = { defaultQuality: QualityPref; defaultMode: DownloadModePref };
+const DEFAULT_DOWNLOAD_SETTINGS: DownloadSettingsPref = { defaultQuality: "best", defaultMode: "single" };
+const QUALITY_OPTIONS: { value: QualityPref; label: string }[] = [
+  { value: "best", label: "Best available (720p Origin)" },
+  { value: "original", label: "Original master" },
+  { value: "720p", label: "720p" },
+  { value: "480p", label: "480p" },
+  { value: "360p", label: "360p" },
+];
+
+const LOCAL_SETTINGS_KEY = "jimeng_download_settings";
+function getLocalDownloadSettings(): DownloadSettingsPref {
+  try {
+    const raw = localStorage.getItem(LOCAL_SETTINGS_KEY);
+    if (!raw) return DEFAULT_DOWNLOAD_SETTINGS;
+    const parsed = JSON.parse(raw) as Partial<DownloadSettingsPref>;
+    const quality = QUALITY_OPTIONS.some((o) => o.value === parsed.defaultQuality)
+      ? (parsed.defaultQuality as QualityPref)
+      : "best";
+    const mode: DownloadModePref = parsed.defaultMode === "bulk" ? "bulk" : "single";
+    return { defaultQuality: quality, defaultMode: mode };
+  } catch {
+    return DEFAULT_DOWNLOAD_SETTINGS;
+  }
+}
+function setLocalDownloadSettings(pref: DownloadSettingsPref): void {
+  try {
+    localStorage.setItem(LOCAL_SETTINGS_KEY, JSON.stringify(pref));
+  } catch {
+    /* storage blocked — the preference just doesn't stick */
+  }
+}
+
+/** Index of the video matching a saved quality preference, falling back
+ *  to the best available (index 0) when the preferred quality does not
+ *  exist for this video. */
+function pickVideoIndex(videos: { label: string }[], pref: QualityPref): number {
+  if (videos.length === 0) return 0;
+  if (pref === "best") return 0;
+  if (pref === "original") {
+    const i = videos.findIndex((v) => v.label.toLowerCase().startsWith("original"));
+    return i >= 0 ? i : 0;
+  }
+  const i = videos.findIndex((v) => v.label.includes(pref));
+  return i >= 0 ? i : 0;
+}
+
+/** Effective download preferences for this visitor: a logged-in
+ *  customer's server settings (once loaded), otherwise the browser's
+ *  localStorage settings. */
+function useDownloadSettings(): DownloadSettingsPref {
+  const loggedIn = Boolean(getUserToken());
+  const server = useQuery({
+    queryKey: ["download-settings"],
+    queryFn: () => api.getDownloadSettings({ token: getUserToken() }),
+    enabled: loggedIn,
+  });
+  if (loggedIn) {
+    if (server.data) {
+      return {
+        defaultQuality: server.data.defaultQuality as QualityPref,
+        defaultMode: server.data.defaultMode as DownloadModePref,
+      };
+    }
+    return DEFAULT_DOWNLOAD_SETTINGS;
+  }
+  return getLocalDownloadSettings();
 }
 
 const AD_SLOTS: { key: AdSlotKey; label: string; size: string }[] = [
@@ -373,7 +463,10 @@ const MENU_ITEMS: { view: View; label: string; icon: string; badge?: string }[] 
   { view: "home", label: "Home", icon: "🏠" },
   { view: "jimeng", label: "Jimeng Downloader", icon: "🎬" },
   { view: "history", label: "Download History", icon: "🕘" },
+  { view: "favorites", label: "Favourites", icon: "❤️" },
+  { view: "notifications", label: "Notifications", icon: "🔔" },
   { view: "plans", label: "Plans", icon: "💎" },
+  { view: "download-settings", label: "Download Settings", icon: "⚙️" },
   { view: "whatis", label: "What is Jimeng?", icon: "❓" },
   { view: "howto", label: "How to Use", icon: "📖" },
   { view: "faq", label: "FAQ", icon: "💬" },
@@ -383,6 +476,39 @@ const MENU_ITEMS: { view: View; label: string; icon: string; badge?: string }[] 
   { view: "about", label: "About", icon: "ℹ️" },
   { view: "privacy", label: "Privacy Policy", icon: "🔒" },
 ];
+
+/** Heart toggle for one history video. Shows the filled heart when the
+ *  video is already a favourite; the server decides the state, so the
+ *  button never lies about it. */
+function FavoriteButton({ downloadId, label }: { downloadId: number | null; label?: string }) {
+  const queryClient = useQueryClient();
+  const favorites = useQuery({
+    queryKey: ["favorites"],
+    queryFn: () => api.listFavorites({ limit: 50, token: getUserToken(), anonId: getAnonId() }),
+  });
+  const isFav = downloadId !== null && (favorites.data?.items.some((f) => f.downloadId === downloadId) ?? false);
+  const mut = useMutation({
+    mutationFn: () =>
+      api.toggleFavorite({ downloadId: downloadId!, label, token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["favorites"] });
+    },
+  });
+  if (downloadId === null) return null;
+  return (
+    <button
+      type="button"
+      disabled={mut.isPending}
+      onClick={() => mut.mutate()}
+      aria-pressed={isFav}
+      aria-label={isFav ? "Remove from favourites" : "Save to favourites"}
+      className={`border px-3 py-1.5 text-xs font-extrabold disabled:opacity-50 ${isFav ? "border-[rgba(248,113,113,0.5)] text-[var(--err-text)]" : "border-[var(--border)]"}`}
+      style={{ borderRadius: 8 }}
+    >
+      {isFav ? "♥ Favourited" : "♡ Favourite"}
+    </button>
+  );
+}
 
 export function App() {
   const [view, setView] = useState<View>("home");
@@ -465,6 +591,9 @@ export function App() {
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api.getSettings({ token: getToken() }) });
   const history = useQuery({ queryKey: ["history"], queryFn: () => api.listHistory({ limit: 30, token: getUserToken(), anonId: getAnonId() }) });
   const historyCount = history.data?.items.length ?? 0;
+  const notifications = useQuery({ queryKey: ["notifications"], queryFn: () => api.listNotifications({ limit: 50, token: getUserToken(), anonId: getAnonId() }) });
+  const unreadCount = notifications.data?.unreadCount ?? 0;
+  const dlSettings = useDownloadSettings();
 
   const [downloading, setDownloading] = useState<string | null>(null);
   const [downloadNote, setDownloadNote] = useState<string | null>(null);
@@ -641,13 +770,22 @@ export function App() {
                 </button>
               ))}
               {user && !admin && (
-                <button
-                  type="button"
-                  onClick={() => go("myplan")}
-                  className={`flex items-center justify-between gap-2 px-3 py-3.5 text-left text-lg font-semibold ${view === "myplan" ? "text-[var(--accent)]" : ""}`}
-                >
-                  <span>💎 My Plan</span>
-                </button>
+                <>
+                  <button
+                    type="button"
+                    onClick={() => go("myplan")}
+                    className={`flex items-center justify-between gap-2 px-3 py-3.5 text-left text-lg font-semibold ${view === "myplan" ? "text-[var(--accent)]" : ""}`}
+                  >
+                    <span>💎 My Plan</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => go("profile")}
+                    className={`flex items-center justify-between gap-2 px-3 py-3.5 text-left text-lg font-semibold ${view === "profile" ? "text-[var(--accent)]" : ""}`}
+                  >
+                    <span>👤 My Profile</span>
+                  </button>
+                </>
               )}
               {admin && (
                 <button
@@ -694,18 +832,34 @@ export function App() {
               ☰ Menu <span aria-hidden="true" className="text-xs">▾</span>
             </button>
           </div>
-          <button
-            type="button"
-            onClick={() => go("history")}
-            aria-label="Open download history"
-            className={`glass flex items-center gap-2 border px-4 py-2 text-sm font-extrabold ${view === "history" ? "border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
-            style={{ borderRadius: "var(--radius)" }}
-          >
-            🕘 History
-            <span className="flex h-5 min-w-5 items-center justify-center bg-[var(--accent)] px-1 text-xs font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>
-              {historyCount}
-            </span>
-          </button>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={() => go("notifications")}
+              aria-label={unreadCount > 0 ? `Notifications — ${unreadCount} unread` : "Notifications"}
+              className={`glass relative flex items-center gap-2 border px-3 py-2 text-sm font-extrabold ${view === "notifications" ? "border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
+              style={{ borderRadius: "var(--radius)" }}
+            >
+              <span aria-hidden="true">🔔</span>
+              {unreadCount > 0 && (
+                <span className="flex h-5 min-w-5 items-center justify-center bg-[var(--err-text)] px-1 text-xs font-extrabold text-white" style={{ borderRadius: 999 }}>
+                  {unreadCount > 99 ? "99+" : unreadCount}
+                </span>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => go("history")}
+              aria-label="Open download history"
+              className={`glass flex items-center gap-2 border px-4 py-2 text-sm font-extrabold ${view === "history" ? "border-[var(--accent)] text-[var(--accent)]" : "border-[var(--border)] bg-[var(--surface)]"}`}
+              style={{ borderRadius: "var(--radius)" }}
+            >
+              🕘 History
+              <span className="flex h-5 min-w-5 items-center justify-center bg-[var(--accent)] px-1 text-xs font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>
+                {historyCount}
+              </span>
+            </button>
+          </div>
         </header>
 
         {view === "home" && (
@@ -854,6 +1008,33 @@ export function App() {
             onGoHome={() => go("jimeng")}
           />
         )}
+        {view === "favorites" && (
+          <FavouritesPage
+            downloading={downloading}
+            prepared={prepared}
+            downloadNote={downloadNote}
+            onDownload={handleDownload}
+            onShare={handleShareSave}
+            onGoHome={() => go("jimeng")}
+          />
+        )}
+        {view === "notifications" && <NotificationsPage />}
+        {view === "download-settings" && <DownloadSettingsPage />}
+        {view === "profile" && !userChecked && (
+          <main className="mx-auto max-w-3xl py-16 text-center">
+            <span className="spinner" aria-hidden="true" />
+            <p className="mt-3 text-base text-[var(--dim)]">Loading…</p>
+          </main>
+        )}
+        {view === "profile" && userChecked && !user && (
+          <AuthPage
+            onLoggedIn={(u) => { handleUserLoggedIn(u); }}
+            onAdminLoggedIn={(a) => { setAdmin(a); queryClient.invalidateQueries({ queryKey: ["settings"] }); go("admin"); }}
+          />
+        )}
+        {view === "profile" && userChecked && user && (
+          <MyProfilePage user={user} onUserChanged={setUser} />
+        )}
         {view === "plans" && (
           <PlansPage
             user={user}
@@ -912,7 +1093,7 @@ export function App() {
         {view === "faq" && <FaqPage />}
         {view === "jimeng" && (
           <JimengDownloaderPage
-            initialMode="single"
+            initialMode={dlSettings.defaultMode}
             downloading={downloading}
             prepared={prepared}
             downloadNote={downloadNote}
@@ -1046,6 +1227,7 @@ function HistoryPage({ downloading, prepared, downloadNote, onDownload, onShare,
                   <button type="button" disabled={downloading === `h-${item.id}`} onClick={() => onDownload(item.videoUrl, "jimeng-no-watermark.mp4", `h-${item.id}`)} className="bg-[var(--accent)] px-4 py-1.5 text-xs font-extrabold text-[var(--accent-ink)] disabled:opacity-50" style={{ borderRadius: 8 }}>
                     {downloading === `h-${item.id}` ? "Preparing file…" : "⬇ Download"}
                   </button>
+                  <FavoriteButton downloadId={item.id} />
                   <DeleteHistoryButton id={item.id} />
                 </div>
               </div>
@@ -1053,6 +1235,506 @@ function HistoryPage({ downloading, prepared, downloadNote, onDownload, onShare,
             {prepared?.tag === `h-${item.id}` && (
               <SavePanel prepared={prepared} onShare={() => onShare(prepared.tag)} />
             )}
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Favourites — videos the visitor saved with the heart button.        */
+/* Scoped exactly like History: per account when logged in, per        */
+/* browser when anonymous.                                             */
+/* ------------------------------------------------------------------ */
+
+function FavouritesPage({ downloading, prepared, downloadNote, onDownload, onShare, onGoHome }: DownloadFlowProps) {
+  const queryClient = useQueryClient();
+  const favorites = useQuery({ queryKey: ["favorites"], queryFn: () => api.listFavorites({ limit: 50, token: getUserToken(), anonId: getAnonId() }) });
+  const removeMut = useMutation({
+    mutationFn: (id: number) => api.removeFavorite({ id, token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["favorites"] }),
+  });
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="❤️" title="Your Favourites" subtitle="Videos you saved with the heart button" />
+      <p className="text-sm font-bold text-[var(--dim)]">
+        {favorites.data ? `${favorites.data.items.length} favourite${favorites.data.items.length === 1 ? "" : "s"}` : "Loading…"}
+      </p>
+      {favorites.isPending && (
+        <div className="flex flex-col gap-3">
+          <Skeleton className="h-24" />
+          <Skeleton className="h-24" />
+        </div>
+      )}
+      {favorites.data && favorites.data.items.length === 0 && (
+        <SectionCard className="py-12 text-center">
+          <p className="text-6xl" aria-hidden="true">❤️</p>
+          <h2 className="mt-4 text-xl font-extrabold">No favourites yet</h2>
+          <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
+            Tap the “♡ Favourite” button on any video result or history item and it will be saved here for quick access.
+          </p>
+          <button
+            type="button"
+            onClick={onGoHome}
+            className="cta-gradient mt-5 px-6 py-3 text-base font-extrabold"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            ⬇ Go to Downloader
+          </button>
+        </SectionCard>
+      )}
+      {downloadNote && <p className="text-sm font-semibold text-[var(--accent)]" role="status">{downloadNote}</p>}
+      <ul className="flex flex-col gap-3">
+        {favorites.data?.items.map((item) => (
+          <li key={item.id} className="glass card-hover border border-[var(--border)] bg-[var(--surface)] p-3" style={{ borderRadius: "var(--radius)" }}>
+            <div className="flex gap-3">
+              {item.coverUrl ? (
+                <img src={item.coverUrl} alt="" className="h-20 w-16 shrink-0 object-cover" style={{ borderRadius: 10 }} />
+              ) : (
+                <div className="flex h-20 w-16 shrink-0 items-center justify-center bg-[var(--surface-alt)] text-2xl" style={{ borderRadius: 10 }}>🎬</div>
+              )}
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-base font-extrabold">{item.title || "Jimeng video"}</p>
+                <p className="truncate text-xs text-[var(--dim)]">{item.qualityLabel}</p>
+                <p className="truncate text-xs text-[var(--dim)]">{item.sourceUrl}</p>
+                <p className="text-xs text-[var(--dim)]">Saved {new Date(item.createdAt).toLocaleString()}</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button type="button" disabled={downloading === `f-${item.id}`} onClick={() => onDownload(item.videoUrl, slugFilename(item.title, "jimeng-no-watermark.mp4"), `f-${item.id}`)} className="bg-[var(--accent)] px-4 py-1.5 text-xs font-extrabold text-[var(--accent-ink)] disabled:opacity-50" style={{ borderRadius: 8 }}>
+                    {downloading === `f-${item.id}` ? "Preparing file…" : "⬇ Download again"}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={removeMut.isPending && removeMut.variables === item.id}
+                    onClick={() => removeMut.mutate(item.id)}
+                    className="border border-[rgba(248,113,113,0.5)] px-3 py-1.5 text-xs font-extrabold text-[var(--err-text)] disabled:opacity-50"
+                    style={{ borderRadius: 8 }}
+                  >
+                    ♥ Remove
+                  </button>
+                </div>
+              </div>
+            </div>
+            {prepared?.tag === `f-${item.id}` && (
+              <SavePanel prepared={prepared} onShare={() => onShare(prepared.tag)} />
+            )}
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* My Profile — logged-in customers only: name, email, joined date,    */
+/* plan, download stats, favourites count, name edit + password        */
+/* change.                                                             */
+/* ------------------------------------------------------------------ */
+
+function MyProfilePage({ user, onUserChanged }: { user: MeUser; onUserChanged: (u: MeUser) => void }) {
+  const queryClient = useQueryClient();
+  const me = useQuery({ queryKey: ["me"], queryFn: () => api.me({ token: getUserToken() }) });
+  const favorites = useQuery({ queryKey: ["favorites"], queryFn: () => api.listFavorites({ limit: 50, token: getUserToken(), anonId: getAnonId() }) });
+  const data = me.data;
+
+  const [name, setName] = useState(user.name);
+  const [nameMsg, setNameMsg] = useState<string | null>(null);
+  const [nameError, setNameError] = useState<string | null>(null);
+  const nameMut = useMutation({
+    mutationFn: (next: string) => api.updateProfileName({ name: next, token: getUserToken() }),
+    onSuccess: (res, next) => {
+      if (res.ok) {
+        onUserChanged({ ...user, name: next });
+        queryClient.invalidateQueries({ queryKey: ["me"] });
+        setNameMsg("Name updated ✓");
+        setNameError(null);
+      } else {
+        setNameError(res.error ?? "Could not update the name.");
+        setNameMsg(null);
+      }
+    },
+    onError: () => {
+      setNameError("No response from the server. Please try again in a moment.");
+      setNameMsg(null);
+    },
+  });
+
+  const [currentPw, setCurrentPw] = useState("");
+  const [newPw, setNewPw] = useState("");
+  const [confirmPw, setConfirmPw] = useState("");
+  const [pwMsg, setPwMsg] = useState<string | null>(null);
+  const [pwError, setPwError] = useState<string | null>(null);
+  const pwMut = useMutation({
+    mutationFn: () => api.changeUserPassword({ currentPassword: currentPw, newPassword: newPw, token: getUserToken() }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setPwMsg("Password changed ✓ — your other sessions were signed out.");
+        setPwError(null);
+        setCurrentPw("");
+        setNewPw("");
+        setConfirmPw("");
+      } else {
+        setPwError(res.error ?? "Could not change the password.");
+        setPwMsg(null);
+      }
+    },
+    onError: () => {
+      setPwError("No response from the server. Please try again in a moment.");
+      setPwMsg(null);
+    },
+  });
+
+  function handlePasswordSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    if (!currentPw || !newPw) {
+      setPwError("Enter your current password and a new password.");
+      setPwMsg(null);
+      return;
+    }
+    if (newPw.length < 8) {
+      setPwError("The new password must be at least 8 characters.");
+      setPwMsg(null);
+      return;
+    }
+    if (newPw !== confirmPw) {
+      setPwError("The new passwords do not match.");
+      setPwMsg(null);
+      return;
+    }
+    setPwError(null);
+    setPwMsg(null);
+    pwMut.mutate();
+  }
+
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="👤" title="My Profile" subtitle="Your account details and settings" />
+      <SectionCard className="flex items-center gap-4">
+        <span className="flex h-14 w-14 shrink-0 items-center justify-center bg-[var(--accent)] text-2xl font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>
+          {user.name.charAt(0).toUpperCase()}
+        </span>
+        <div className="min-w-0">
+          <p className="truncate text-lg font-extrabold">{user.name}</p>
+          <p className="truncate text-sm text-[var(--dim)]">{user.email}</p>
+          {data?.joinedAt && (
+            <p className="text-xs text-[var(--dim)]">Joined {new Date(data.joinedAt).toLocaleDateString()}</p>
+          )}
+        </div>
+        <span className="ml-auto shrink-0">
+          <StatusPill tone={data?.plan ? "green" : "gray"} label={data?.plan ? data.plan.planName : "Free Plan"} />
+        </span>
+      </SectionCard>
+
+      {data?.ok && (
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <StatCard value={String(data.downloadsToday)} label="Downloads today" />
+          <StatCard value={String(data.downloadsTotal)} label="Total downloads" />
+          <StatCard value={String(favorites.data?.items.length ?? 0)} label="Favourites" />
+          <StatCard value={data.plan ? new Date(data.plan.expiresAt).toLocaleDateString() : data.freeDailyLimit === 0 ? "—" : `${data.freeDailyLimit}/day`} label={data.plan ? "Plan expires" : "Free daily limit"} />
+        </div>
+      )}
+
+      <SectionCard>
+        <h2 className="text-lg font-extrabold">Edit name</h2>
+        <p className="mt-1 text-sm text-[var(--dim)]">Your email cannot be changed.</p>
+        <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+          <input
+            aria-label="Your name"
+            value={name}
+            onChange={(e) => { setName(e.target.value); if (nameError) setNameError(null); if (nameMsg) setNameMsg(null); }}
+            placeholder="Your name"
+            maxLength={100}
+            className="min-w-0 flex-1 border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+            style={{ borderRadius: "var(--radius)" }}
+          />
+          <button
+            type="button"
+            disabled={nameMut.isPending || !name.trim() || name.trim() === user.name}
+            onClick={() => nameMut.mutate(name.trim())}
+            className="bg-[var(--accent)] px-5 py-2 font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {nameMut.isPending ? "Saving…" : "Save name"}
+          </button>
+        </div>
+        {nameMsg && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{nameMsg}</p>}
+        {nameError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{nameError}</p>}
+      </SectionCard>
+
+      <SectionCard>
+        <h2 className="text-lg font-extrabold">Change password</h2>
+        <p className="mt-1 text-sm text-[var(--dim)]">Your other sessions will be signed out; this session stays logged in.</p>
+        <form onSubmit={handlePasswordSubmit} className="mt-3 flex flex-col gap-3">
+          <div>
+            <label htmlFor="profile-current-pw" className="text-sm font-bold">Current password</label>
+            <input
+              id="profile-current-pw"
+              type="password"
+              autoComplete="current-password"
+              value={currentPw}
+              onChange={(e) => { setCurrentPw(e.target.value); if (pwError) setPwError(null); }}
+              placeholder="Your current password"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          <div>
+            <label htmlFor="profile-new-pw" className="text-sm font-bold">New password</label>
+            <input
+              id="profile-new-pw"
+              type="password"
+              autoComplete="new-password"
+              value={newPw}
+              onChange={(e) => { setNewPw(e.target.value); if (pwError) setPwError(null); }}
+              placeholder="At least 8 characters"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          <div>
+            <label htmlFor="profile-confirm-pw" className="text-sm font-bold">Confirm new password</label>
+            <input
+              id="profile-confirm-pw"
+              type="password"
+              autoComplete="new-password"
+              value={confirmPw}
+              onChange={(e) => { setConfirmPw(e.target.value); if (pwError) setPwError(null); }}
+              placeholder="Repeat the new password"
+              className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2"
+              style={{ borderRadius: "var(--radius)" }}
+            />
+          </div>
+          {pwMsg && <p className="text-sm font-semibold text-[var(--accent)]" role="status">{pwMsg}</p>}
+          {pwError && <p className="text-sm font-semibold text-[var(--err-text)]" role="alert">{pwError}</p>}
+          <button
+            type="submit"
+            disabled={pwMut.isPending}
+            className="cta-gradient px-5 py-2.5 font-extrabold disabled:opacity-50"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {pwMut.isPending ? "Please wait…" : "Change password"}
+          </button>
+        </form>
+      </SectionCard>
+    </main>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Download Settings — default quality + default mode. Logged-in       */
+/* customers save theirs on the account; anonymous visitors save       */
+/* theirs in this browser. Nothing else lives here (no theme or        */
+/* language options — those come in a later phase).                    */
+/* ------------------------------------------------------------------ */
+
+function DownloadSettingsPage() {
+  const queryClient = useQueryClient();
+  const loggedIn = Boolean(getUserToken());
+  const server = useQuery({
+    queryKey: ["download-settings"],
+    queryFn: () => api.getDownloadSettings({ token: getUserToken() }),
+    enabled: loggedIn,
+  });
+  const [quality, setQuality] = useState<QualityPref>(() => getLocalDownloadSettings().defaultQuality);
+  const [mode, setMode] = useState<DownloadModePref>(() => getLocalDownloadSettings().defaultMode);
+  const [savedMsg, setSavedMsg] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const didInit = useRef(false);
+
+  // Logged-in customers start from their saved server settings.
+  useEffect(() => {
+    if (loggedIn && server.data && !didInit.current) {
+      didInit.current = true;
+      setQuality(server.data.defaultQuality as QualityPref);
+      setMode(server.data.defaultMode as DownloadModePref);
+    }
+  }, [loggedIn, server.data]);
+
+  const saveMut = useMutation({
+    mutationFn: () => api.saveDownloadSettings({ defaultQuality: quality, defaultMode: mode, token: getUserToken() }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["download-settings"] });
+      setSavedMsg("Settings saved ✓ — they will apply to your next video.");
+      setSaveError(null);
+    },
+    onError: () => {
+      setSaveError("No response from the server. Please try again in a moment.");
+      setSavedMsg(null);
+    },
+  });
+
+  function handleSave() {
+    setSavedMsg(null);
+    setSaveError(null);
+    if (loggedIn) {
+      saveMut.mutate();
+    } else {
+      setLocalDownloadSettings({ defaultQuality: quality, defaultMode: mode });
+      setSavedMsg("Settings saved in this browser ✓ — they will apply to your next video.");
+    }
+  }
+
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="⚙️" title="Download Settings" subtitle="Choose how your videos download by default" />
+      <SectionCard>
+        <div>
+          <label htmlFor="settings-quality" className="text-sm font-bold">Default quality</label>
+          <p className="mt-0.5 text-xs text-[var(--dim)]">Pre-selected when a video is fetched. If a video does not offer your chosen quality, the best available is used instead.</p>
+          <select
+            id="settings-quality"
+            value={quality}
+            onChange={(e) => setQuality(e.target.value as QualityPref)}
+            className="mt-2 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-sm font-semibold"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            {QUALITY_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+        </div>
+        <div className="mt-5">
+          <label htmlFor="settings-mode" className="text-sm font-bold">Default mode</label>
+          <p className="mt-0.5 text-xs text-[var(--dim)]">Which mode opens when you tap “Jimeng Downloader”. The Bulk menu item always opens Bulk mode.</p>
+          <select
+            id="settings-mode"
+            value={mode}
+            onChange={(e) => setMode(e.target.value as DownloadModePref)}
+            className="mt-2 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2.5 text-sm font-semibold"
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            <option value="single">Single — 1 video</option>
+            <option value="bulk">Bulk — up to 10 videos</option>
+          </select>
+        </div>
+        <p className="mt-4 text-xs text-[var(--dim)]">
+          {loggedIn
+            ? "These settings are saved on your account, so they follow you to any device."
+            : "You are not logged in, so these settings are saved in this browser only. Log in to keep them on your account."}
+        </p>
+        {savedMsg && <p className="mt-3 text-sm font-semibold text-[var(--accent)]" role="status">{savedMsg}</p>}
+        {saveError && <p className="mt-3 text-sm font-semibold text-[var(--err-text)]" role="alert">{saveError}</p>}
+        <button
+          type="button"
+          disabled={saveMut.isPending}
+          onClick={handleSave}
+          className="cta-gradient mt-4 w-full px-5 py-2.5 font-extrabold disabled:opacity-50"
+          style={{ borderRadius: "var(--radius)" }}
+        >
+          {saveMut.isPending ? "Saving…" : "Save settings"}
+        </button>
+      </SectionCard>
+    </main>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* Notifications — created only by real server events: payment         */
+/* received, plan activated/expired/used up, daily free limit          */
+/* reached. The header bell badge shows the real unread count.         */
+/* ------------------------------------------------------------------ */
+
+function NotificationsPage() {
+  const queryClient = useQueryClient();
+  const notifications = useQuery({
+    queryKey: ["notifications"],
+    queryFn: () => api.listNotifications({ limit: 50, token: getUserToken(), anonId: getAnonId() }),
+  });
+  const readMut = useMutation({
+    mutationFn: (id: number) => api.markNotificationRead({ id, token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+  });
+  const readAllMut = useMutation({
+    mutationFn: () => api.markAllNotificationsRead({ token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+  });
+  const deleteMut = useMutation({
+    mutationFn: (id: number) => api.deleteNotification({ id, token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ["notifications"] }),
+  });
+  const items = notifications.data?.items ?? [];
+  const unreadCount = notifications.data?.unreadCount ?? 0;
+  const typeIcon: Record<string, string> = { payment: "💳", plan: "💎", limit: "⚠️" };
+
+  return (
+    <main className="mx-auto flex max-w-3xl flex-col gap-5">
+      <PageHero icon="🔔" title="Notifications" subtitle="Payment, plan and download updates" />
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <p className="text-sm font-bold text-[var(--dim)]">
+          {notifications.data
+            ? unreadCount > 0
+              ? `${unreadCount} unread · ${items.length} total`
+              : `${items.length} notification${items.length === 1 ? "" : "s"}`
+            : "Loading…"}
+        </p>
+        {unreadCount > 0 && (
+          <button
+            type="button"
+            disabled={readAllMut.isPending}
+            onClick={() => readAllMut.mutate()}
+            className="text-sm font-bold text-[var(--accent)] disabled:opacity-50"
+          >
+            Mark all as read
+          </button>
+        )}
+      </div>
+      {notifications.isPending && (
+        <div className="flex flex-col gap-3">
+          <Skeleton className="h-24" />
+          <Skeleton className="h-24" />
+        </div>
+      )}
+      {notifications.data && items.length === 0 && (
+        <SectionCard className="py-12 text-center">
+          <p className="text-6xl" aria-hidden="true">🔔</p>
+          <h2 className="mt-4 text-xl font-extrabold">No notifications yet</h2>
+          <p className="mx-auto mt-2 max-w-sm text-sm leading-relaxed text-[var(--dim)]">
+            You will see a notification here when a payment is received, a plan is activated or ends, or your free daily limit is reached.
+          </p>
+        </SectionCard>
+      )}
+      <ul className="flex flex-col gap-3">
+        {items.map((n) => (
+          <li
+            key={n.id}
+            className={`glass border bg-[var(--surface)] p-4 ${n.read ? "border-[var(--border)]" : "border-[rgba(0,233,154,0.45)] shadow-[0_0_24px_rgba(0,233,154,0.08)]"}`}
+            style={{ borderRadius: "var(--radius)" }}
+          >
+            <div className="flex items-start gap-3">
+              <span className="flex h-10 w-10 shrink-0 items-center justify-center bg-[var(--surface-alt)] text-xl" style={{ borderRadius: 999 }} aria-hidden="true">
+                {typeIcon[n.type] ?? "🔔"}
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="text-base font-extrabold">{n.title}</p>
+                  {!n.read && <StatusPill tone="green" label="● New" pulse />}
+                </div>
+                <p className="mt-1 text-sm leading-relaxed text-[var(--dim)]">{n.message}</p>
+                <p className="mt-1 text-xs text-[var(--dim)]">{new Date(n.createdAt).toLocaleString()}</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {!n.read && (
+                    <button
+                      type="button"
+                      disabled={readMut.isPending && readMut.variables === n.id}
+                      onClick={() => readMut.mutate(n.id)}
+                      className="border border-[var(--border)] px-3 py-1.5 text-xs font-extrabold disabled:opacity-50"
+                      style={{ borderRadius: 8 }}
+                    >
+                      Mark as read
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    disabled={deleteMut.isPending && deleteMut.variables === n.id}
+                    onClick={() => deleteMut.mutate(n.id)}
+                    className="border border-[rgba(248,113,113,0.5)] px-3 py-1.5 text-xs font-extrabold text-[var(--err-text)] disabled:opacity-50"
+                    style={{ borderRadius: 8 }}
+                  >
+                    Delete
+                  </button>
+                </div>
+              </div>
+            </div>
           </li>
         ))}
       </ul>
@@ -1141,6 +1823,15 @@ function JimengDownloaderPage({
 }: JimengDownloaderPageProps) {
   const queryClient = useQueryClient();
   const [mode, setMode] = useState<"single" | "bulk">(initialMode);
+  const dlSettings = useDownloadSettings();
+
+  // The saved default mode (Single/Bulk) applies when this page opens.
+  // initialMode changes once when the server settings finish loading, so
+  // the mode follows the preference without resetting a manual switch
+  // afterwards (initialMode only changes on load or view change).
+  useEffect(() => {
+    setMode(initialMode);
+  }, [initialMode]);
 
   /* ---------------- Single mode state ---------------- */
   const [linkText, setLinkText] = useState("");
@@ -1154,13 +1845,15 @@ function JimengDownloaderPage({
     mutationFn: (text: string) => api.resolveLink({ text, token: getUserToken(), anonId: getAnonId() }),
     onSuccess: (data) => {
       setResult(data);
-      setSelectedVideo(0);
+      // The saved default quality is pre-selected; when this video does
+      // not offer it, the best available is used instead.
+      setSelectedVideo(pickVideoIndex(data.videos, dlSettings.defaultQuality));
       if (data.ok) queryClient.invalidateQueries({ queryKey: ["history"] });
     },
     onError: () => {
       setResult({
         ok: false, sourceUrl: "", title: "", coverUrl: null, videos: [], images: [],
-        usedCustomApi: false, note: null,
+        usedCustomApi: false, note: null, downloadId: null,
         error: "No response from the server. Please try again in a moment.",
       });
     },
@@ -1219,7 +1912,7 @@ function JimengDownloaderPage({
       try {
         const data = await api.resolveLink({ text: line, token: getUserToken(), anonId: getAnonId() });
         setItems((prev) =>
-          prev.map((it, j) => (j === i ? { ...it, status: data.ok ? "done" : "error", result: data, selectedVideo: 0 } : it)),
+          prev.map((it, j) => (j === i ? { ...it, status: data.ok ? "done" : "error", result: data, selectedVideo: pickVideoIndex(data.videos, dlSettings.defaultQuality) } : it)),
         );
         if (data.ok) queryClient.invalidateQueries({ queryKey: ["history"] });
       } catch {
@@ -1231,7 +1924,7 @@ function JimengDownloaderPage({
                   status: "error",
                   result: {
                     ok: false, sourceUrl: line, title: "", coverUrl: null, videos: [], images: [],
-                    usedCustomApi: false, note: null,
+                    usedCustomApi: false, note: null, downloadId: null,
                     error: "No response from the server. Please try again in a moment.",
                   },
                 }
@@ -1569,6 +2262,7 @@ function JimengDownloaderPage({
                     >
                       🕘 Saved to History — view it
                     </button>
+                    <FavoriteButton downloadId={result.downloadId} label={chosenVideo.label} />
                   </div>
                   <p className="mt-3 flex items-center justify-center gap-2 border border-[rgba(0,233,154,0.35)] bg-[rgba(0,233,154,0.08)] px-4 py-2.5 text-sm font-bold text-[var(--accent)]" style={{ borderRadius: "var(--radius)" }}>
                     ✓ Tip: Save this video for offline viewing!
@@ -1767,6 +2461,9 @@ function JimengDownloaderPage({
                                   >
                                     {downloading === tag ? "Preparing file…" : "⬇ Download MP4 — No Watermark"}
                                   </button>
+                                  <span className="mt-1.5 inline-block">
+                                    <FavoriteButton downloadId={item.result.downloadId} label={video.label} />
+                                  </span>
                                 </>
                               ) : (
                                 <p className="mt-1 text-sm font-semibold">No video was found for this link (it may be an image post) — paste it in Single mode to see the images.</p>
