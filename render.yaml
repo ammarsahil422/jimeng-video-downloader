@@ -18,6 +18,7 @@ services:
     runtime: docker
     plan: free
     region: frankfurt
+    autoDeploy: true
     dockerfilePath: ./Dockerfile
     healthCheckPath: /
     envVars:

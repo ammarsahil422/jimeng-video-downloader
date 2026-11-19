@@ -73,6 +73,17 @@ This package now matches the latest Muse-app version:
 - **How to Use** now also documents the phone method the user found:
   on the playing video, tap the three dots (⋮) → Share → Save at the
   end of the share sheet, and the video saves to the gallery.
+- **Admin Panel (admin-only login):** downloads stay public — no login,
+  no user accounts. The sidebar has a Login item; entering the admin
+  email/password opens the Admin Panel with Dashboard (downloads today /
+  total, storage used, recent downloads), Ads (the AdSense slots moved
+  here — they no longer appear on the public site), API Key settings,
+  and Settings (change the admin password, shows the admin email). The
+  admin account is seeded automatically on first boot
+  (`admin@jimengdownloader.com`); the password is set by the site owner
+  and is not written in this repo. On Render Free the database resets
+  on restart/redeploy, so the admin account is re-seeded on every boot
+  and the same admin login keeps working.
 
 ## What you need
 
@@ -289,7 +300,9 @@ Your download history stays on the server, not in the repo.)
    (the exact address is the service name you chose).
 
 Or use the blueprint: **New → Blueprint** → pick the repo — Render
-reads `render.yaml` and creates the same service.
+reads `render.yaml` and creates the same service. `render.yaml` has
+`autoDeploy: true`, so every push to GitHub redeploys the site
+automatically.
 
 ### 3. Use your own domain (optional, free)
 
@@ -311,8 +324,9 @@ Render shows you a CNAME record to add at your domain registrar
   files live inside the container, so they **reset when the service
   restarts or redeploys**. Downloading itself works normally — paste a
   link, get the clean video, save it — only the saved history list does
-  not survive a restart. (On a VPS with a disk, Path A/B above, history
-  is kept permanently.)
+  not survive a restart. The admin account is an exception by design:
+  it is re-seeded on every boot, so the admin login always works.
+  (On a VPS with a disk, Path A/B above, history is kept permanently.)
 
 If you later move to a VPS (Path A/B) or Oracle Cloud, the same package
 works there unchanged — just copy this folder to the server and follow
