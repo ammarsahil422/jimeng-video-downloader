@@ -271,3 +271,14 @@ button:active {
 .animate-drawer-in {
   animation: drawer-in 0.25s ease both;
 }
+
+/* Mobile-only ad slot (320×50 banner): visible on phones, hidden on
+   desktop (min-width 768px) so it never disturbs the desktop layout. */
+.mobile-only-ad {
+  display: block;
+}
+@media (min-width: 768px) {
+  .mobile-only-ad {
+    display: none;
+  }
+}
