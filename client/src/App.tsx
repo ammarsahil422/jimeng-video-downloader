@@ -81,7 +81,7 @@ type View =
   | "privacy"
   | "contact"
   | "admin";
-type AdSlotKey = "head" | "top" | "incontent" | "sidebar" | "bottom" | "socialbar";
+type AdSlotKey = "head" | "top" | "incontent" | "sidebar" | "bottom" | "socialbar" | "mobile";
 
 /** Admin session token storage — the token lives in the browser only; the
  *  server validates it on every admin action. Downloads are public and
@@ -267,6 +267,7 @@ const AD_SLOTS: { key: AdSlotKey; label: string; size: string }[] = [
   { key: "incontent", label: "In-Content", size: "Native Banner · In-article" },
   { key: "sidebar", label: "Sidebar", size: "300 × 250 · Rectangle" },
   { key: "bottom", label: "Bottom Banner", size: "728 × 90 · Leaderboard" },
+  { key: "mobile", label: "Mobile Banner", size: "320 × 50 · Mobile only" },
   { key: "head", label: "Head Code", size: "Site-wide · Popunder / verification" },
   { key: "socialbar", label: "Social Bar", size: "Site-wide · Floating corner bar" },
 ];
@@ -1424,6 +1425,15 @@ function AppShell() {
             script injection — only the position moved. */}
         <div className="mt-10">
           <AdSlot label="Advertisement · Top Banner 728 × 90" saved={Boolean(settings.data?.adSlots.top)} code={settings.data?.adCodes.top} />
+        </div>
+
+        {/* Mobile banner ad 320×50 — same position (below the page
+            content, just above the footer, next to the Bottom slot) but
+            visible only on phones: the .mobile-only-ad wrapper hides it
+            on desktop via a media query, so the desktop layout is
+            untouched. Same real script injection as the other slots. */}
+        <div className="mobile-only-ad mt-6">
+          <AdSlot label="Advertisement · Mobile Banner 320 × 50" saved={Boolean(settings.data?.adSlots.mobile)} code={settings.data?.adCodes.mobile} />
         </div>
 
         <footer className="mt-10 border-t border-[var(--border)] pt-6 text-center">
@@ -3188,7 +3198,7 @@ function AdsSetup({ settings }: { settings: ApiResponse<typeof api, "getSettings
       <AdminPageHead
         icon="📢"
         title="Advertisement Settings"
-        subtitle="Paste each slot's code here and save it — the code renders live in that slot on the site. Four slots already have your Adsterra codes: Top Banner, Head Popunder, In-Content Native Banner, and Social Bar; change or remove any of them any time. No publisher ID is pre-filled — only add your own code."
+        subtitle="Paste each slot's code here and save it — the code renders live in that slot on the site. Seven slots already have your Adsterra codes: Top Banner, Bottom Banner, Sidebar, Head Popunder, In-Content Native Banner, Social Bar, and Mobile Banner; change or remove any of them any time. No publisher ID is pre-filled — only add your own code."
       />
       <SmartLinkEditor settings={settings} />
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
