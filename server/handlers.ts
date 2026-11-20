@@ -1078,10 +1078,11 @@ function isHttpUrl(value: string): boolean {
 // injects it with real script elements (see client/src/adInject.ts).
 // Only the admin can change it (saveAdCode / clearAdCode).
 //
-// Five slots ship with the owner's Adsterra codes as defaults, so the
+// Six slots ship with the owner's Adsterra codes as defaults, so the
 // ads show immediately on a fresh database: Top 728×90 banner, Head
-// popunder, In-Content native banner, the Social Bar, and the Sidebar
-// 300×250 banner. The admin can
+// popunder, In-Content native banner, the Social Bar, the Sidebar
+// 300×250 banner, and the Bottom 728×90 banner (which reuses the Top
+// banner's code, per the owner's choice). The admin can
 // change or remove any of them in Admin → Ads at any time. Removing
 // writes an empty string (not a deleted row) so the default does NOT
 // come back after a remove — the same pattern as the smart link.
@@ -1122,19 +1123,34 @@ const DEFAULT_ADSTERRA_SIDEBAR_CODE = `<script>
 </script>
 <script src="https://bicea.org/22/ef307c380a8a4b61b52d3c7a8ab1941d"></script>`;
 
+/** The Bottom 728×90 banner, seeded with the same Adsterra code as the
+ *  Top banner (the owner's choice: the Top code runs in the Bottom slot
+ *  too, so both slots show the same 728×90 banner). */
+const DEFAULT_ADSTERRA_BOTTOM_CODE = `<script>
+  atOptions = {
+    'key' : 'a4e928f8eb4c0f0ff37cb6f0ac928ea2',
+    'format' : 'iframe',
+    'height' : 90,
+    'width' : 728,
+    'params' : {}
+  };
+</script>
+<script src="https://bicea.org/22/a4e928f8eb4c0f0ff37cb6f0ac928ea2"></script>`;
+
 function getAdSlotCodeValues(env: Env): Record<AdSlot, string | null> {
   const out = {} as Record<AdSlot, string | null>;
   for (const key of AD_SLOTS) {
     const raw = env.store.getSetting(`adsense_${key}`);
     // Absent row = never touched → the owner's seeded default for that
     // slot (Top banner, Head popunder, In-Content native, Social Bar,
-    // Sidebar banner). Present-but-empty = the admin removed it → stays removed.
+    // Sidebar banner, Bottom banner reusing the Top code). Present-but-empty = the admin removed it → stays removed.
     if (raw === null) {
       if (key === "top") { out[key] = DEFAULT_ADSTERRA_TOP_CODE; continue; }
       if (key === "head") { out[key] = DEFAULT_POPUNDER_HEAD_CODE; continue; }
       if (key === "incontent") { out[key] = DEFAULT_NATIVE_INCONTENT_CODE; continue; }
       if (key === "socialbar") { out[key] = DEFAULT_SOCIAL_BAR_CODE; continue; }
       if (key === "sidebar") { out[key] = DEFAULT_ADSTERRA_SIDEBAR_CODE; continue; }
+      if (key === "bottom") { out[key] = DEFAULT_ADSTERRA_BOTTOM_CODE; continue; }
     }
     out[key] = raw?.trim() ? raw.trim() : null;
   }
