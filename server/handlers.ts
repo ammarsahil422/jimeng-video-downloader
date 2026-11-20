@@ -127,7 +127,7 @@ function asRecord(v: unknown): Record<string, unknown> | null {
     : null;
 }
 
-const AD_SLOTS = ["head", "top", "incontent", "sidebar", "bottom", "socialbar"] as const;
+const AD_SLOTS = ["head", "top", "incontent", "sidebar", "bottom", "socialbar", "mobile"] as const;
 type AdSlot = (typeof AD_SLOTS)[number];
 
 // ---------------------------------------------------------------------------
@@ -1071,8 +1071,8 @@ function isHttpUrl(value: string): boolean {
 // Ad slot codes (Admin → Ads).
 //
 // The site owner's own ad code per slot, stored in the settings table as
-// adsense_<slot> (head / top / incontent / sidebar / bottom / socialbar).
-// The code is a PUBLIC embed snippet by design — the same bytes any
+// adsense_<slot> (head / top / incontent / sidebar / bottom / socialbar /
+// mobile). The code is a PUBLIC embed snippet by design — the same bytes any
 // visitor's browser would receive inside the page HTML — so getSettings
 // returns the effective code for every slot to everyone, and the client
 // injects it with real script elements (see client/src/adInject.ts).
@@ -1137,13 +1137,27 @@ const DEFAULT_ADSTERRA_BOTTOM_CODE = `<script>
 </script>
 <script src="https://bicea.org/22/a4e928f8eb4c0f0ff37cb6f0ac928ea2"></script>`;
 
+/** The owner's Adsterra Mobile banner 320×50, seeded as the Mobile slot
+ *  default. Shown only on phones (the slot is hidden on desktop). */
+const DEFAULT_MOBILE_BANNER_CODE = `<script>
+  atOptions = {
+    'key' : '9de93bd0abe30b979546875a0ff4a60a',
+    'format' : 'iframe',
+    'height' : 50,
+    'width' : 320,
+    'params' : {}
+  };
+</script>
+<script src="https://bicea.org/22/9de93bd0abe30b979546875a0ff4a60a"></script>`;
+
 function getAdSlotCodeValues(env: Env): Record<AdSlot, string | null> {
   const out = {} as Record<AdSlot, string | null>;
   for (const key of AD_SLOTS) {
     const raw = env.store.getSetting(`adsense_${key}`);
     // Absent row = never touched → the owner's seeded default for that
     // slot (Top banner, Head popunder, In-Content native, Social Bar,
-    // Sidebar banner, Bottom banner reusing the Top code). Present-but-empty = the admin removed it → stays removed.
+    // Sidebar banner, Bottom banner reusing the Top code, Mobile banner).
+    // Present-but-empty = the admin removed it → stays removed.
     if (raw === null) {
       if (key === "top") { out[key] = DEFAULT_ADSTERRA_TOP_CODE; continue; }
       if (key === "head") { out[key] = DEFAULT_POPUNDER_HEAD_CODE; continue; }
@@ -1151,6 +1165,7 @@ function getAdSlotCodeValues(env: Env): Record<AdSlot, string | null> {
       if (key === "socialbar") { out[key] = DEFAULT_SOCIAL_BAR_CODE; continue; }
       if (key === "sidebar") { out[key] = DEFAULT_ADSTERRA_SIDEBAR_CODE; continue; }
       if (key === "bottom") { out[key] = DEFAULT_ADSTERRA_BOTTOM_CODE; continue; }
+      if (key === "mobile") { out[key] = DEFAULT_MOBILE_BANNER_CODE; continue; }
     }
     out[key] = raw?.trim() ? raw.trim() : null;
   }
@@ -1282,7 +1297,8 @@ function clearAdCode(env: Env, args: unknown): { ok: true } {
     throw new HandlerError(400, "slot must be one of: " + AD_SLOTS.join(", "));
   }
   // Writes an empty value (not a deleted row) so a seeded default —
-  // the Top banner, Head popunder, In-Content native, or Social Bar —
+  // the Top banner, Bottom banner, Sidebar banner, Head popunder,
+  // In-Content native, Social Bar, or Mobile banner —
   // does not come back after a remove.
   env.store.setSetting(`adsense_${slot}`, "");
   logEvent(env, { actorType: "admin", actorEmail: admin.email, action: "settings.ads.clear", detail: `Ad code removed from the "${slot}" slot.` });
