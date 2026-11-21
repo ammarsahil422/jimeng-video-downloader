@@ -194,6 +194,7 @@ export type HistoryItem = {
   title: string;
   videoUrl: string;
   coverUrl: string | null;
+  platform: "jimeng" | "douyin";
   createdAt: string;
 };
 
@@ -271,6 +272,11 @@ export type PlanRow = {
 
 export interface Actions {
   resolveLink: (args: {
+    text: string;
+    token?: string;
+    anonId?: string;
+  }) => Promise<ResolveResult>;
+  resolveDouyinLink: (args: {
     text: string;
     token?: string;
     anonId?: string;

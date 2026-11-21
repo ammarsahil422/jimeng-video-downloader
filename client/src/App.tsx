@@ -21,6 +21,7 @@ import {
 
 const FIELDS = {
   resolveLink: { text: {} },
+  resolveDouyinLink: { text: {} },
   saveApiKey: { apiKey: {}, apiBaseUrl: {} },
   saveAdCode: { code: {} },
   saveSmartLink: { url: {} },
@@ -58,6 +59,7 @@ type MeUser = NonNullable<MeResult["user"]>;
 type View =
   | "home"
   | "jimeng"
+  | "douyin"
   | "history"
   | "favorites"
   | "profile"
@@ -605,6 +607,7 @@ function HeroArt() {
 const MENU_ITEMS: { view: View; label: string; icon: string; badge?: string }[] = [
   { view: "home", label: "menu.home", icon: "🏠" },
   { view: "jimeng", label: "menu.jimeng", icon: "🎬" },
+  { view: "douyin", label: "menu.douyin", icon: "🎵" },
   { view: "history", label: "menu.history", icon: "🕘" },
   { view: "favorites", label: "menu.favorites", icon: "❤️" },
   { view: "notifications", label: "menu.notifications", icon: "🔔" },
@@ -1174,7 +1177,7 @@ function AppShell() {
                 <p className="mt-1 text-sm text-[var(--dim)]">
                   {t("home.choose_sub")}
                 </p>
-                <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <div className="mt-4 grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
                   <div className="glass card-hover flex flex-col border border-[rgba(0,233,154,0.35)] bg-[var(--surface)] p-5 shadow-[0_0_45px_rgba(0,233,154,0.10)]" style={{ borderRadius: "var(--radius)" }}>
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-3xl" aria-hidden="true">🎬</span>
@@ -1187,6 +1190,24 @@ function AppShell() {
                     <button
                       type="button"
                       onClick={() => go("jimeng")}
+                      className="cta-gradient mt-4 w-full px-5 py-3 text-base font-extrabold"
+                      style={{ borderRadius: "var(--radius)" }}
+                    >
+                      {t("home.open_downloader")}
+                    </button>
+                  </div>
+                  <div className="glass card-hover flex flex-col border border-[rgba(0,233,154,0.35)] bg-[var(--surface)] p-5 shadow-[0_0_45px_rgba(0,233,154,0.10)]" style={{ borderRadius: "var(--radius)" }}>
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-3xl" aria-hidden="true">🎵</span>
+                      <StatusPill tone="green" label="● LIVE" pulse />
+                    </div>
+                    <h3 className="mt-3 text-xl font-extrabold">{t("home.douyin_title")}</h3>
+                    <p className="mt-1 flex-1 text-sm leading-relaxed text-[var(--dim)]">
+                      {t("home.douyin_desc")}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => go("douyin")}
                       className="cta-gradient mt-4 w-full px-5 py-3 text-base font-extrabold"
                       style={{ borderRadius: "var(--radius)" }}
                     >
@@ -1381,6 +1402,21 @@ function AppShell() {
             smartLink={settings.data?.smartLink}
           />
         )}
+        {view === "douyin" && (
+          <DouyinDownloaderPage
+            initialMode={dlSettings.defaultMode}
+            downloading={downloading}
+            prepared={prepared}
+            downloadNote={downloadNote}
+            onDownload={handleDownload}
+            onShare={handleShareSave}
+            onGoPlans={() => go("plans")}
+            onGoHistory={() => go("history")}
+            sidebarAdSaved={Boolean(settings.data?.adSlots.sidebar)}
+            sidebarAdCode={settings.data?.adCodes.sidebar}
+            smartLink={settings.data?.smartLink}
+          />
+        )}
         {view === "bulk" && (
           <JimengDownloaderPage
             initialMode="bulk"
@@ -1440,6 +1476,7 @@ function AppShell() {
           <BrandBanner />
           <nav aria-label="Footer" className="mt-6 flex flex-wrap justify-center gap-x-6 gap-y-2 text-sm font-bold">
             <button type="button" onClick={() => go("jimeng")} className="py-1">{t("menu.jimeng")}</button>
+            <button type="button" onClick={() => go("douyin")} className="py-1">{t("menu.douyin")}</button>
             <button type="button" onClick={() => go("history")} className="py-1">{t("menu.history")}</button>
             <button type="button" onClick={() => go("plans")} className="py-1">{t("menu.plans")}</button>
             <button type="button" onClick={() => go("howto")} className="py-1">{t("menu.howto")}</button>
@@ -1529,11 +1566,19 @@ function HistoryPage({ downloading, prepared, downloadNote, onDownload, onShare,
                 <div className="flex h-20 w-16 shrink-0 items-center justify-center bg-[var(--surface-alt)] text-2xl" style={{ borderRadius: 10 }}>🎬</div>
               )}
               <div className="min-w-0 flex-1">
-                <p className="truncate text-base font-extrabold">{item.title || t("dl.jimeng_video")}</p>
+                <p className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate text-base font-extrabold">{item.title || (item.platform === "douyin" ? t("dy.douyin_video") : t("dl.jimeng_video"))}</span>
+                  <span
+                    className={`shrink-0 px-2 py-0.5 text-[11px] font-extrabold ${item.platform === "douyin" ? "bg-[rgba(0,233,154,0.15)] text-[var(--accent)]" : "bg-[var(--surface-alt)] text-[var(--dim)]"}`}
+                    style={{ borderRadius: 999 }}
+                  >
+                    {item.platform === "douyin" ? `🎵 ${t("history.douyin")}` : `🎬 ${t("history.jimeng")}`}
+                  </span>
+                </p>
                 <p className="truncate text-xs text-[var(--dim)]">{item.sourceUrl}</p>
                 <p className="text-xs text-[var(--dim)]">{new Date(item.createdAt).toLocaleString()}</p>
                 <div className="mt-2 flex flex-wrap gap-2">
-                  <button type="button" disabled={downloading === `h-${item.id}`} onClick={() => onDownload(item.videoUrl, "jimeng-no-watermark.mp4", `h-${item.id}`)} className="bg-[var(--accent)] px-4 py-1.5 text-xs font-extrabold text-[var(--accent-ink)] disabled:opacity-50" style={{ borderRadius: 8 }}>
+                  <button type="button" disabled={downloading === `h-${item.id}`} onClick={() => onDownload(item.videoUrl, item.platform === "douyin" ? "douyin-no-watermark.mp4" : "jimeng-no-watermark.mp4", `h-${item.id}`)} className="bg-[var(--accent)] px-4 py-1.5 text-xs font-extrabold text-[var(--accent-ink)] disabled:opacity-50" style={{ borderRadius: 8 }}>
                     {downloading === `h-${item.id}` ? t("dl.preparing") : t("history.download")}
                   </button>
                   <FavoriteButton downloadId={item.id} />
@@ -2888,6 +2933,688 @@ function JimengDownloaderPage({
     </div>
   );
 }
+/* ------------------------------------------------------------------ */
+/* Douyin downloader page — Single + Bulk (max 5) modes, mirroring    */
+/* the Jimeng page's structure and behaviour. Downloads go through    */
+/* the same prepareDownload flow (same free daily limit / plan        */
+/* quota, same Save panel), and resolves land in the same History,    */
+/* labelled Douyin. The default quality is 720p: Douyin files are     */
+/* large, and only the tiers the resolver actually confirmed for      */
+/* that video are listed.                                             */
+/* ------------------------------------------------------------------ */
+
+const DOUYIN_BULK_MAX_LINKS = 5;
+
+function DouyinDownloaderPage({
+  initialMode,
+  downloading,
+  prepared,
+  downloadNote,
+  onDownload,
+  onShare,
+  onGoPlans,
+  onGoHistory,
+  sidebarAdSaved,
+  sidebarAdCode,
+  smartLink,
+}: JimengDownloaderPageProps) {
+  const t = useT();
+  const queryClient = useQueryClient();
+  const [mode, setMode] = useState<"single" | "bulk">(initialMode);
+
+  // Same saved-default-mode behaviour as the Jimeng page.
+  useEffect(() => {
+    setMode(initialMode);
+  }, [initialMode]);
+
+  /* ---------------- Single mode state ---------------- */
+  const [linkText, setLinkText] = useState("");
+  const [linkError, setLinkError] = useState<string | null>(null);
+  const [result, setResult] = useState<ResolveResult | null>(null);
+  const [selectedVideo, setSelectedVideo] = useState(0);
+  const [pasteMsg, setPasteMsg] = useState<string | null>(null);
+  const chosenVideo = result?.ok ? result.videos[selectedVideo] : undefined;
+
+  const resolve = useMutation({
+    mutationFn: (text: string) => api.resolveDouyinLink({ text, token: getUserToken(), anonId: getAnonId() }),
+    onSuccess: (data) => {
+      setResult(data);
+      // Douyin's default quality is 720p (its files are large); when
+      // this video does not offer 720p, the best available is used.
+      setSelectedVideo(pickVideoIndex(data.videos, "720p"));
+      if (data.ok) queryClient.invalidateQueries({ queryKey: ["history"] });
+    },
+    onError: () => {
+      setResult({
+        ok: false, sourceUrl: "", title: "", coverUrl: null, videos: [], images: [],
+        usedCustomApi: false, note: null, downloadId: null,
+        error: t("common.error_server"),
+      });
+    },
+  });
+
+  function handleResolve() {
+    if (!linkText.trim()) {
+      setLinkError(t("dy.link_empty"));
+      return;
+    }
+    setLinkError(null);
+    resolve.mutate(linkText.trim());
+  }
+
+  async function handlePaste() {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text) {
+        setLinkText(text);
+        setLinkError(null);
+        setPasteMsg(t("dl.pasted"));
+      } else setPasteMsg(t("dy.clipboard_empty"));
+    } catch {
+      setPasteMsg(t("dl.paste_failed"));
+    }
+  }
+
+  /* ---------------- Bulk mode state (max 5) ---------------- */
+  const [bulkText, setBulkText] = useState("");
+  const [bulkTextError, setBulkTextError] = useState<string | null>(null);
+  const [items, setItems] = useState<BulkItem[]>([]);
+  const [bulkRunning, setBulkRunning] = useState(false);
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchStatus, setBatchStatus] = useState<string | null>(null);
+  const [batchSummary, setBatchSummary] = useState<string | null>(null);
+  const [zipRunning, setZipRunning] = useState(false);
+  const [zipStatus, setZipStatus] = useState<string | null>(null);
+  const [zipSummary, setZipSummary] = useState<string | null>(null);
+
+  async function handleBulk() {
+    const lines = bulkText.split("\n").map((l) => l.trim()).filter(Boolean);
+    if (lines.length === 0) {
+      setBulkTextError(t("dy.bulk_empty"));
+      return;
+    }
+    setBulkTextError(null);
+    setBatchSummary(null);
+    setZipSummary(null);
+    const batch = lines.slice(0, DOUYIN_BULK_MAX_LINKS);
+    setItems(batch.map((line) => ({ line, status: "waiting", result: null, selectedVideo: 0 })));
+    setBulkRunning(true);
+    for (let i = 0; i < batch.length; i++) {
+      const line = batch[i];
+      if (!line) continue;
+      setItems((prev) => prev.map((it, j) => (j === i ? { ...it, status: "working" } : it)));
+      try {
+        const data = await api.resolveDouyinLink({ text: line, token: getUserToken(), anonId: getAnonId() });
+        setItems((prev) =>
+          prev.map((it, j) => (j === i ? { ...it, status: data.ok ? "done" : "error", result: data, selectedVideo: pickVideoIndex(data.videos, "720p") } : it)),
+        );
+        if (data.ok) queryClient.invalidateQueries({ queryKey: ["history"] });
+      } catch {
+        setItems((prev) =>
+          prev.map((it, j) =>
+            j === i
+              ? {
+                  ...it,
+                  status: "error",
+                  result: {
+                    ok: false, sourceUrl: line, title: "", coverUrl: null, videos: [], images: [],
+                    usedCustomApi: false, note: null, downloadId: null,
+                    error: t("common.error_server"),
+                  },
+                }
+              : it,
+          ),
+        );
+      }
+    }
+    setBulkRunning(false);
+  }
+
+  /** Videos that fetched successfully, with their chosen export quality. */
+  function batchTargets() {
+    return items
+      .map((it, i) => ({ it, i }))
+      .filter(({ it }) => it.status === "done" && it.result?.ok && it.result.videos[it.selectedVideo]);
+  }
+
+  /** Same prepareDownload as the Jimeng page: each video counts toward
+   *  the free daily limit / plan quota, and a hit limit returns
+   *  limitReached so the Plans page can open. */
+  async function prepareOne(
+    videoUrl: string,
+  ): Promise<
+    | { ok: true; downloadUrl: string; sizeBytes: number }
+    | { ok: false; error: string; limitReached: boolean }
+  > {
+    try {
+      const prep = await api.prepareDownload({ url: videoUrl, token: getUserToken(), anonId: getAnonId() });
+      if (prep.ok && prep.downloadUrl) {
+        return { ok: true, downloadUrl: prep.downloadUrl, sizeBytes: prep.sizeBytes };
+      }
+      return { ok: false, error: prep.error ?? t("dl.prepare_failed"), limitReached: prep.limitReached };
+    } catch {
+      return { ok: false, error: t("dl.no_response_short"), limitReached: false };
+    }
+  }
+
+  async function handleDownloadAll() {
+    const targets = batchTargets();
+    if (targets.length === 0 || batchRunning) return;
+    setBatchRunning(true);
+    setBatchSummary(null);
+    let okCount = 0;
+    const failed: string[] = [];
+    let hitLimit = false;
+    for (let n = 0; n < targets.length; n++) {
+      const entry = targets[n];
+      if (!entry) continue;
+      const { it, i } = entry;
+      const video = it.result!.videos[it.selectedVideo]!;
+      const name = it.result!.title || t("dy.douyin_video") + ` ${i + 1}`;
+      setBatchStatus(t("dl.downloading_n", { n: String(n + 1), total: String(targets.length), name }));
+      const prep = await prepareOne(video.url);
+      if (!prep.ok) {
+        failed.push(`${name}: ${prep.error}`);
+        if (prep.limitReached) {
+          hitLimit = true;
+          break;
+        }
+        continue;
+      }
+      triggerBrowserDownload(prep.downloadUrl, slugFilename(it.result!.title, `douyin-video-${i + 1}.mp4`));
+      okCount++;
+      if (n < targets.length - 1) await sleep(1500);
+    }
+    queryClient.invalidateQueries({ queryKey: ["me"] });
+    queryClient.invalidateQueries({ queryKey: ["history"] });
+    setBatchRunning(false);
+    setBatchStatus(null);
+    setBatchSummary(
+      [
+        t("dl.batch_done", { ok: String(okCount), total: String(targets.length), s: targets.length === 1 ? "" : "s" }),
+        failed.length > 0
+          ? t("dl.batch_failed", { n: String(failed.length), list: failed.slice(0, 3).join(" · ") }) + (failed.length > 3 ? ` ${t("dl.and_more", { n: String(failed.length - 3) })}` : "")
+          : null,
+        t("dl.batch_fallback"),
+      ].filter(Boolean).join(" "),
+    );
+    if (hitLimit) onGoPlans();
+  }
+
+  async function handleDownloadZip() {
+    const targets = batchTargets();
+    if (targets.length === 0 || zipRunning) return;
+    setZipRunning(true);
+    setZipSummary(null);
+    const zip = new JSZip();
+    const usedNames = new Set<string>();
+    let added = 0;
+    const failed: string[] = [];
+    let hitLimit = false;
+    for (let n = 0; n < targets.length; n++) {
+      const entry = targets[n];
+      if (!entry) continue;
+      const { it, i } = entry;
+      const video = it.result!.videos[it.selectedVideo]!;
+      const name = it.result!.title || t("dy.douyin_video") + ` ${i + 1}`;
+      setZipStatus(t("dl.zip_preparing_n", { n: String(n + 1), total: String(targets.length), name }));
+      const prep = await prepareOne(video.url);
+      if (!prep.ok) {
+        failed.push(`${name}: ${prep.error}`);
+        if (prep.limitReached) {
+          hitLimit = true;
+          break;
+        }
+        continue;
+      }
+      try {
+        const res = await fetch(prep.downloadUrl);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const blob = await res.blob();
+        if (blob.size === 0) throw new Error("empty file");
+        zip.file(
+          uniqueZipName(slugFilename(it.result!.title, `douyin-video-${i + 1}.mp4`), usedNames),
+          blob,
+        );
+        added++;
+      } catch {
+        failed.push(t("dl.zip_failed_read", { name }));
+      }
+    }
+    if (added === 0) {
+      setZipRunning(false);
+      setZipStatus(null);
+      setZipSummary(
+        `${t("dl.zip_none")} ${failed.slice(0, 3).join(" · ")}`,
+      );
+      if (hitLimit) onGoPlans();
+      return;
+    }
+    setZipStatus(t("dl.zipping", { n: String(added), s: added === 1 ? "" : "s" }));
+    try {
+      // MP4s are already compressed, so STORE keeps zipping fast and light.
+      const zipBlob = await zip.generateAsync({ type: "blob", compression: "STORE" });
+      const url = URL.createObjectURL(zipBlob);
+      triggerBrowserDownload(url, "douyin-videos.zip");
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+      setZipSummary(
+        [
+          t("dl.zip_ready", { n: String(added), s: added === 1 ? "" : "s" }),
+          failed.length > 0
+            ? t("dl.zip_skipped", { n: String(failed.length), list: failed.slice(0, 3).join(" · ") }) + (failed.length > 3 ? ` ${t("dl.and_more", { n: String(failed.length - 3) })}` : "")
+            : null,
+        ].filter(Boolean).join(" "),
+      );
+    } catch {
+      setZipSummary(t("dl.zip_failed"));
+    }
+    queryClient.invalidateQueries({ queryKey: ["me"] });
+    queryClient.invalidateQueries({ queryKey: ["history"] });
+    setZipRunning(false);
+    setZipStatus(null);
+    if (hitLimit) onGoPlans();
+  }
+
+  const doneCount = items.filter((it) => it.status === "done").length;
+
+  return (
+    <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
+      <main className="flex min-w-0 flex-col gap-6">
+        <PageHero icon="🎵" title={t("menu.douyin")} subtitle={t("dy.subtitle")} />
+        <p className="mx-auto flex max-w-full flex-wrap items-center justify-center gap-2 border border-[rgba(251,191,36,0.4)] bg-[var(--warn-bg)] px-4 py-2 text-center text-sm font-bold text-[var(--warn-text)]" style={{ borderRadius: 999 }}>
+          {t("dl.public_only")}
+        </p>
+
+        <SectionCard className="border-[rgba(0,233,154,0.35)] shadow-[0_0_45px_rgba(0,233,154,0.10)]">
+          {/* Single / Bulk mode toggle */}
+          <div className="flex gap-2" role="tablist" aria-label={t("dl.download_mode")}>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "single"}
+              onClick={() => setMode("single")}
+              className={`flex-1 px-4 py-2.5 text-sm font-extrabold ${mode === "single" ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "border border-[var(--border)] bg-[var(--surface)]"}`}
+              style={{ borderRadius: "var(--radius)" }}
+            >
+              {t("dl.single")}
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={mode === "bulk"}
+              onClick={() => setMode("bulk")}
+              className={`flex-1 px-4 py-2.5 text-sm font-extrabold ${mode === "bulk" ? "bg-[var(--accent)] text-[var(--accent-ink)]" : "border border-[var(--border)] bg-[var(--surface)]"}`}
+              style={{ borderRadius: "var(--radius)" }}
+            >
+              {t("dl.bulk", { n: String(DOUYIN_BULK_MAX_LINKS) })}
+            </button>
+          </div>
+
+          {mode === "single" && (
+            <>
+              <h2 className="mt-5 flex items-center gap-2 text-xl font-extrabold">
+                <span className="text-[var(--accent)]">🔗</span> {t("dy.paste_heading")}
+              </h2>
+              <p className="mt-1 text-sm text-[var(--dim)]">
+                {t("dy.paste_hint")}
+              </p>
+              <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                <textarea
+                  {...FIELDS.resolveDouyinLink.text}
+                  id="douyin-link"
+                  aria-label={t("dy.link_aria")}
+                  value={linkText}
+                  onChange={(e) => { setLinkText(e.target.value); if (linkError) setLinkError(null); }}
+                  placeholder="https://v.douyin.com/xxxxx"
+                  rows={2}
+                  className="min-w-0 flex-1 border border-[var(--border)] bg-[var(--bg)] p-3 text-base break-all"
+                  style={{ borderRadius: "var(--radius)" }}
+                />
+                <div className="flex gap-2 sm:flex-col">
+                  <button type="button" onClick={handlePaste} className="glass flex-1 border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-2 text-sm font-bold sm:flex-none" style={{ borderRadius: "var(--radius)" }}>
+                    {t("dl.paste")}
+                  </button>
+                  <button type="button" onClick={() => { setLinkText(""); setResult(null); setLinkError(null); }} className="flex-1 border border-[var(--border)] px-4 py-2 text-sm font-bold text-[var(--dim)] sm:flex-none" style={{ borderRadius: "var(--radius)" }}>
+                    {t("dl.clear")}
+                  </button>
+                </div>
+              </div>
+              <p className="mt-2 text-xs text-[var(--dim)]">
+                {t("dy.tip_share_text")}
+              </p>
+              {linkError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{linkError}</p>}
+              <button
+                type="button"
+                disabled={resolve.isPending}
+                onClick={handleResolve}
+                className="cta-gradient mt-3 w-full px-5 py-3.5 text-lg font-extrabold disabled:opacity-50"
+                style={{ borderRadius: "var(--radius)" }}
+              >
+                {resolve.isPending ? t("dl.fetching") : t("dl.get_video")}
+              </button>
+              <p className="mt-3 flex flex-wrap items-center justify-center gap-x-3 gap-y-1 text-center text-sm font-semibold text-[var(--dim)]">
+                <span><span className="text-[var(--accent)]">✓</span> {t("dl.free_start")}</span>
+                <span aria-hidden="true" className="text-[var(--border)]">|</span>
+                <span><span className="text-[var(--accent)]">⚡</span> {t("dl.original_mp4")}</span>
+                <span aria-hidden="true" className="text-[var(--border)]">|</span>
+                <span><span className="text-[var(--accent)]">✓</span> {t("dl.no_login")}</span>
+              </p>
+              {pasteMsg && <p className="mt-2 text-sm text-[var(--dim)]">{pasteMsg}</p>}
+
+              {/* Single result */}
+              {result && !result.ok && (
+                <div className="mt-4 bg-[var(--err-bg)] p-4 text-sm font-semibold text-[var(--err-text)]" style={{ borderRadius: "var(--radius)" }} role="alert">
+                  {result.error}
+                  {result.note && <p className="mt-1 font-normal">{result.note}</p>}
+                  {result.sourceUrl && (
+                    <p className="mt-2 break-all font-normal">
+                      {t("dl.link_found")} <span className="font-mono text-xs">{result.sourceUrl}</span>
+                      <br />
+                      {t("dy.link_incomplete")}
+                    </p>
+                  )}
+                </div>
+              )}
+              {result?.ok && chosenVideo && (
+                <div className="mt-5">
+                  <div className="flex flex-col items-center gap-1 text-center">
+                    <span className="flex h-12 w-12 items-center justify-center bg-[var(--accent)] text-2xl font-extrabold text-[var(--accent-ink)] shadow-[0_0_28px_rgba(0,233,154,0.4)]" style={{ borderRadius: 999 }}>✓</span>
+                    <h3 className="mt-1 text-2xl font-extrabold">{t("dl.ready")}</h3>
+                    <p className="text-sm text-[var(--dim)]">{t("dl.ready_sub")}</p>
+                  </div>
+                  {result.note && <p className="mt-3 mb-2 text-sm text-[var(--dim)]">{result.note}</p>}
+                  <video
+                    key={chosenVideo.url}
+                    src={chosenVideo.url}
+                    poster={result.coverUrl ?? undefined}
+                    controls
+                    playsInline
+                    width={chosenVideo.width ?? undefined}
+                    height={chosenVideo.height ?? undefined}
+                    className="mx-auto max-h-[75vh] w-auto max-w-full bg-black object-contain"
+                    style={{
+                      borderRadius: "var(--radius)",
+                      ...(chosenVideo.width && chosenVideo.height
+                        ? { aspectRatio: `${chosenVideo.width} / ${chosenVideo.height}` }
+                        : {}),
+                    }}
+                  />
+                  {chosenVideo.width && chosenVideo.height && (
+                    <p className="mt-1 text-center text-xs text-[var(--dim)]">
+                      {t("dl.file_size", { w: String(chosenVideo.width), h: String(chosenVideo.height) })}
+                    </p>
+                  )}
+                  {result.title && <p className="mt-2 text-sm font-semibold">{result.title}</p>}
+
+                  <p className="mt-4 text-sm font-bold">{t("dl.choose_quality")}</p>
+                  <div className="mt-2 flex flex-col gap-2" role="radiogroup" aria-label="Video quality options">
+                    {result.videos.map((v, i) => (
+                      <button
+                        key={v.url}
+                        type="button"
+                        role="radio"
+                        aria-checked={i === selectedVideo}
+                        onClick={() => setSelectedVideo(i)}
+                        className={`flex items-center justify-between gap-2 border px-4 py-2.5 text-left text-sm font-semibold ${i === selectedVideo ? "border-[var(--accent)] bg-[var(--surface-alt)]" : "border-[var(--border)]"}`}
+                        style={{ borderRadius: "var(--radius)" }}
+                      >
+                        <span className="min-w-0 flex-1 truncate">🎵 {v.label}</span>
+                        <span className="shrink-0 text-xs text-[var(--dim)]">
+                          {[v.width && v.height ? `${v.width}×${v.height}` : null, formatBytes(v.sizeBytes), "MP4"]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-2 text-xs text-[var(--dim)]">{t("dy.quality_note")}</p>
+                  <button
+                    type="button"
+                    disabled={downloading === "main"}
+                    onClick={() => onDownload(chosenVideo.url, "douyin-no-watermark.mp4", "main")}
+                    className="cta-gradient mt-3 w-full px-5 py-3 text-base font-extrabold disabled:opacity-50"
+                    style={{ borderRadius: "var(--radius)" }}
+                  >
+                    {downloading === "main" ? t("dl.preparing") : t("dl.download_mp4")}
+                  </button>
+                  {downloadNote && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{downloadNote}</p>}
+                  {prepared?.tag === "main" && (
+                    <SavePanel prepared={prepared} onShare={() => onShare("main")} />
+                  )}
+                  <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+                    <button
+                      type="button"
+                      onClick={() => { setResult(null); setLinkText(""); setLinkError(null); setPasteMsg(null); }}
+                      className="flex-1 border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-sm font-extrabold"
+                      style={{ borderRadius: "var(--radius)" }}
+                    >
+                      {t("dl.download_another")}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={onGoHistory}
+                      className="flex-1 border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-sm font-extrabold"
+                      style={{ borderRadius: "var(--radius)" }}
+                    >
+                      {t("dl.saved_history")}
+                    </button>
+                    <FavoriteButton downloadId={result.downloadId} label={chosenVideo.label} />
+                  </div>
+                  <p className="mt-3 flex flex-wrap items-center justify-center gap-2 border border-[rgba(0,233,154,0.35)] bg-[rgba(0,233,154,0.08)] px-4 py-2.5 text-center text-sm font-bold text-[var(--accent)]" style={{ borderRadius: "var(--radius)" }}>
+                    {t("dl.tip_offline")}
+                  </p>
+                  <p className="mt-2 text-xs text-[var(--dim)]">
+                    {t("dl.how_save")}
+                  </p>
+                  <p className="mt-2 text-xs text-[var(--dim)]">
+                    {t("dy.personal_note")}
+                  </p>
+                </div>
+              )}
+              {result?.ok && <SmartLinkBanner smartLink={smartLink} />}
+            </>
+          )}
+
+          {mode === "bulk" && (
+            <>
+              <div className="mt-5 flex flex-col items-center gap-1 border-2 border-dashed border-[var(--ad-border)] bg-[var(--surface-alt)] px-4 py-5 text-center" style={{ borderRadius: "var(--radius)" }}>
+                <span className="text-4xl" aria-hidden="true">☁️</span>
+                <p className="text-base font-extrabold">{t("dl.bulk_intro_title")}</p>
+                <p className="text-sm text-[var(--dim)]">{t("dy.bulk_intro_text", { n: String(DOUYIN_BULK_MAX_LINKS) })}</p>
+              </div>
+              <label htmlFor="douyin-bulk-links" className="mt-4 block text-sm font-bold">{t("dy.bulk_label")}</label>
+              <textarea
+                id="douyin-bulk-links"
+                aria-label={t("dy.bulk_links_aria")}
+                value={bulkText}
+                onChange={(e) => { setBulkText(e.target.value); if (bulkTextError) setBulkTextError(null); }}
+                placeholder={"https://v.douyin.com/xxxxx\nhttps://v.douyin.com/yyyyy"}
+                rows={6}
+                className="mt-2 w-full border border-[var(--border)] bg-[var(--bg)] p-3 text-base break-all"
+                style={{ borderRadius: "var(--radius)" }}
+              />
+              {bulkTextError && <p className="mt-2 text-sm font-semibold text-[var(--err-text)]" role="alert">{bulkTextError}</p>}
+              <button
+                type="button"
+                disabled={bulkRunning}
+                onClick={handleBulk}
+                className="cta-gradient mt-3 w-full px-5 py-3 text-base font-extrabold disabled:opacity-50"
+                style={{ borderRadius: "var(--radius)" }}
+              >
+                {bulkRunning ? t("dl.fetching_videos") : t("dl.fetch_all_n", { n: String(DOUYIN_BULK_MAX_LINKS) })}
+              </button>
+              {items.length > 0 && (
+                <div className="mt-4" role="status">
+                  <div className="flex justify-between text-sm font-bold">
+                    <span>{bulkRunning ? t("dl.progress_working", { done: String(doneCount), total: String(items.length) }) : t("dl.progress_done", { done: String(doneCount), total: String(items.length) })}</span>
+                    <span>{Math.round((doneCount / Math.max(1, items.length)) * 100)}%</span>
+                  </div>
+                  <div className="mt-1 h-3 w-full overflow-hidden bg-[var(--surface-alt)]" style={{ borderRadius: 999 }}>
+                    <div className="h-full bg-[var(--accent)] transition-all" style={{ width: `${Math.round((doneCount / Math.max(1, items.length)) * 100)}%` }} />
+                  </div>
+                </div>
+              )}
+              {doneCount > 0 && (
+                <div className="mt-4 flex flex-col gap-2 sm:flex-row">
+                  <button
+                    type="button"
+                    disabled={batchRunning || zipRunning || bulkRunning}
+                    onClick={handleDownloadAll}
+                    className="flex-1 bg-[var(--accent)] px-4 py-3 text-sm font-extrabold text-[var(--accent-ink)] disabled:opacity-50"
+                    style={{ borderRadius: "var(--radius)" }}
+                  >
+                    {batchRunning ? (batchStatus ?? t("dl.downloading")) : t("dl.download_all_n", { n: String(doneCount) })}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={batchRunning || zipRunning || bulkRunning}
+                    onClick={handleDownloadZip}
+                    className="flex-1 border border-[var(--accent)] bg-[var(--surface)] px-4 py-3 text-sm font-extrabold text-[var(--accent)] disabled:opacity-50"
+                    style={{ borderRadius: "var(--radius)" }}
+                  >
+                    {zipRunning ? (zipStatus ?? t("dl.preparing_zip")) : t("dl.download_zip_n", { n: String(doneCount) })}
+                  </button>
+                </div>
+              )}
+              {batchSummary && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{batchSummary}</p>}
+              {zipSummary && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{zipSummary}</p>}
+              {(batchRunning || zipRunning) && (
+                <p className="mt-2 text-xs text-[var(--dim)]">
+                  {t("dl.limit_note")}
+                </p>
+              )}
+              {downloadNote && <p className="mt-2 text-sm font-semibold text-[var(--accent)]" role="status">{downloadNote}</p>}
+              <ul className="mt-3 flex flex-col gap-3">
+                {items.map((item, i) => {
+                  const video = item.result?.ok ? item.result.videos[item.selectedVideo] : undefined;
+                  const tag = `bulk-${i}`;
+                  return (
+                    <li key={i} className="glass card-hover border border-[var(--border)] bg-[var(--surface)] p-3" style={{ borderRadius: "var(--radius)" }}>
+                      <div className="flex gap-3">
+                        {item.result?.ok && item.result.coverUrl ? (
+                          <img src={item.result.coverUrl} alt="" className="h-20 w-16 shrink-0 object-cover" style={{ borderRadius: 10 }} />
+                        ) : (
+                          <div className="flex h-20 w-16 shrink-0 items-center justify-center bg-[var(--surface-alt)] text-2xl" style={{ borderRadius: 10 }}>🎵</div>
+                        )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <p className="min-w-0 flex-1 truncate text-xs text-[var(--dim)]">{item.line}</p>
+                            {item.status === "waiting" && <StatusPill tone="gray" label={t("dl.status_waiting")} />}
+                            {item.status === "working" && <StatusPill tone="amber" label={t("dl.status_fetching")} pulse />}
+                            {item.status === "done" && <StatusPill tone="green" label={t("dl.status_done")} />}
+                            {item.status === "error" && <StatusPill tone="red" label={t("dl.status_error")} />}
+                          </div>
+                          {item.status === "waiting" && <p className="mt-1 text-sm font-semibold text-[var(--dim)]">{t("dl.waiting_turn")}</p>}
+                          {item.status === "working" && <p className="mt-1 text-sm font-semibold">{t("dl.fetching")}</p>}
+                          {item.status === "error" && item.result && !item.result.ok && (
+                            <p className="mt-1 text-sm font-semibold text-[var(--err-text)]">{item.result.error}</p>
+                          )}
+                          {item.status === "done" && item.result?.ok && (
+                            <>
+                              <p className="mt-1 truncate text-sm font-bold">{item.result.title || "Douyin video"}</p>
+                              {video ? (
+                                <>
+                                  <label className="mt-2 block text-xs font-bold text-[var(--dim)]" htmlFor={`douyin-bulk-quality-${i}`}>
+                                    {t("dl.choose_quality_bulk")}
+                                  </label>
+                                  <select
+                                    id={`douyin-bulk-quality-${i}`}
+                                    aria-label={t("dl.export_quality_for", { n: String(i + 1) })}
+                                    value={item.selectedVideo}
+                                    onChange={(e) => {
+                                      const next = Number(e.target.value);
+                                      setItems((prev) => prev.map((it, j) => (j === i ? { ...it, selectedVideo: next } : it)));
+                                    }}
+                                    className="mt-1 w-full border border-[var(--border)] bg-[var(--bg)] px-3 py-2 text-sm font-semibold"
+                                    style={{ borderRadius: "var(--radius)" }}
+                                  >
+                                    {item.result.videos.map((v, vi) => (
+                                      <option key={v.url} value={vi}>
+                                        {v.label}
+                                        {[v.width && v.height ? ` ${v.width}×${v.height}` : null, formatBytes(v.sizeBytes) ? ` · ${formatBytes(v.sizeBytes)}` : null]
+                                          .filter(Boolean)
+                                          .join("")}
+                                      </option>
+                                    ))}
+                                  </select>
+                                  <p className="mt-1 text-xs text-[var(--dim)]">
+                                    {[video.label, video.width && video.height ? `${video.width}×${video.height}` : null, formatBytes(video.sizeBytes), "MP4"].filter(Boolean).join(" · ")}
+                                  </p>
+                                  <button
+                                    type="button"
+                                    disabled={downloading === tag}
+                                    onClick={() => onDownload(video.url, slugFilename(item.result!.title, `douyin-video-${i + 1}.mp4`), tag)}
+                                    className="mt-1.5 bg-[var(--accent)] px-3 py-1.5 text-xs font-bold text-[var(--accent-ink)] disabled:opacity-50"
+                                    style={{ borderRadius: 8 }}
+                                  >
+                                    {downloading === tag ? t("dl.preparing") : t("dl.download_mp4")}
+                                  </button>
+                                  <span className="mt-1.5 inline-block">
+                                    <FavoriteButton downloadId={item.result.downloadId} label={video.label} />
+                                  </span>
+                                </>
+                              ) : (
+                                <p className="mt-1 text-sm font-semibold">{t("dl.no_video_bulk")}</p>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                      {prepared?.tag === tag && (
+                        <SavePanel prepared={prepared} onShare={() => onShare(prepared.tag)} />
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+              {items.length > 0 && <SmartLinkBanner smartLink={smartLink} />}
+            </>
+          )}
+        </SectionCard>
+      </main>
+
+      {/* Sidebar */}
+      <aside className="flex min-w-0 flex-col gap-6">
+        <SectionCard>
+          <h2 className="flex items-center gap-2 text-lg font-extrabold">
+            <span className="flex h-6 w-6 items-center justify-center bg-[var(--accent)] text-sm font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>✓</span>
+            Supported links
+          </h2>
+          <ul className="mt-3 space-y-2 text-sm">
+            {[
+              "v.douyin.com/xxxxx",
+              "douyin.com/video/…",
+              "iesdouyin.com/share/video/…",
+            ].map((link) => (
+              <li key={link} className="flex items-center gap-2">
+                <span className="flex h-5 w-5 shrink-0 items-center justify-center bg-[rgba(0,233,154,0.15)] text-xs font-extrabold text-[var(--accent)]" style={{ borderRadius: 999 }}>✓</span>
+                <span className="break-all">{link}</span>
+              </li>
+            ))}
+          </ul>
+          <p className="mt-3 flex items-start gap-2 border-t border-[var(--border)] pt-3 text-sm text-[var(--dim)]">
+            <span className="text-[var(--accent)]">ℹ️</span> {t("dy.supported_note")}
+          </p>
+          <p className="mt-2 text-sm text-[var(--dim)]">{t("dy.personal_note")}</p>
+        </SectionCard>
+        <AdSlot label="Advertisement · Sidebar" sub="300 × 250" saved={sidebarAdSaved} code={sidebarAdCode} tall />
+        <SectionCard>
+          <h2 className="flex items-center gap-2 text-lg font-extrabold">
+            <span className="flex h-6 w-6 items-center justify-center bg-[var(--accent)] text-sm font-extrabold text-[var(--accent-ink)]" style={{ borderRadius: 999 }}>?</span>
+            {t("home.need_help")}
+          </h2>
+          <div className="mt-3 flex flex-col">
+            <button type="button" onClick={() => onGoHistory()} className="flex items-center justify-between border-b border-[var(--border)] py-2.5 text-left text-sm font-bold text-[var(--accent)]">
+              <span>{t("menu.history")}</span><span aria-hidden="true">›</span>
+            </button>
+            <p className="py-2.5 text-sm text-[var(--dim)]">Tip: on a phone, open the playing video's ⋮ menu → Share → Save to save it straight to your gallery.</p>
+          </div>
+        </SectionCard>
+      </aside>
+    </div>
+  );
+}
+
 function WhatIsJimengPage() {
   const t = useT();
   return (
