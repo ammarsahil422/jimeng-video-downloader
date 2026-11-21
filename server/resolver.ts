@@ -754,4 +754,411 @@ export async function resolveBuiltIn(
   };
 }
 
+// Douyin resolver
+//
+// Verified live end-to-end 2026-11-21 (test video v.douyin.com/uMHo9UvlQFM/
+// → ID 7645140600261463348, a 212s food video; the full chain below —
+// ttwid mint, share page, _ROUTER_DATA parse, playwm→play swap, ratio
+// probes — returned real no-watermark MP4 tiers from the zjcdn CDN).
+// The chain, exactly as verified:
+//  1. Video ID: follow the v.douyin.com short link's 302 to
+//     iesdouyin.com/share/video/<id>/, or parse douyin.com/video/<id>
+//     directly.
+//  2. Mint an anonymous ttwid cookie: POST
+//     ttwid.bytedance.com/ttwid/union/register/ with the EXACT JSON body
+//     below and an iOS User-Agent. (The old iesdouyin iteminfo API is
+//     dead — HTTP 200 with a 0-byte body — and is NOT used.)
+//  3. Fetch iesdouyin.com/share/video/<id>/ with the ttwid cookie and
+//     parse window._ROUTER_DATA, depth-first searching for the item
+//     whose video.play_addr carries the play URL.
+//  4. No watermark: swap playwm → play in the play URL.
+//  5. Quality tiers: probe the ratio ladder (720p, 1080p, 480p, 360p)
+//     with 2-byte ranged GETs + Referer and dedupe by the Content-Range
+//     total size — some ratios collapse to one tier (480p and 360p
+//     returned the 1080p file's size in testing), so only tiers with a
+//     distinct size are offered. Nothing is invented: a tier exists only
+//     because Douyin's own CDN confirmed its size.
+// Without a ttwid the share page is an anti-bot shell (no play_addr), so
+// the ttwid is rotated and the fetch retried once when a shell comes
+// back; transient network failures also get one retry. One ttwid is
+// cached and reused across resolves (including a whole Bulk batch).
+// ---------------------------------------------------------------------------
+
+export const DOUYIN_HOSTS = new Set([
+  "v.douyin.com",
+  "www.douyin.com",
+  "douyin.com",
+  "www.iesdouyin.com",
+  "iesdouyin.com",
+]);
+
+export const DOUYIN_UA =
+  "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1";
+
+const DOUYIN_RATIO_LADDER = ["720p", "1080p", "480p", "360p"] as const;
+
+let douyinTtwidCache: { value: string; mintedAt: number } | null = null;
+const DOUYIN_TTWID_TTL_MS = 30 * 60 * 1000;
+
+async function mintDouyinTtwid(): Promise<string | null> {
+  try {
+    const res = await fetchWithTimeout(
+      "https://ttwid.bytedance.com/ttwid/union/register/",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "User-Agent": DOUYIN_UA },
+        body: JSON.stringify({
+          region: "cn",
+          aid: 1768,
+          needFid: false,
+          service: "www.ixigua.com",
+          migrate_info: { ticket: "", source: "node" },
+          cbUrlProtocol: "https",
+          union: true,
+        }),
+      },
+      15000,
+    );
+    const cookies =
+      typeof res.headers.getSetCookie === "function"
+        ? res.headers.getSetCookie()
+        : [res.headers.get("set-cookie") ?? ""];
+    for (const c of cookies) {
+      const m = c.match(/ttwid=([^;]+)/);
+      if (m?.[1]) return m[1];
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function getDouyinTtwid(forceFresh: boolean): Promise<string | null> {
+  if (
+    !forceFresh &&
+    douyinTtwidCache &&
+    Date.now() - douyinTtwidCache.mintedAt < DOUYIN_TTWID_TTL_MS
+  ) {
+    return douyinTtwidCache.value;
+  }
+  const fresh = await mintDouyinTtwid();
+  if (fresh) douyinTtwidCache = { value: fresh, mintedAt: Date.now() };
+  return fresh;
+}
+
+function douyinIdFromUrl(url: string): string | null {
+  const m = url.match(/\/(?:share\/)?video\/(\d{10,22})/);
+  return m?.[1] ?? null;
+}
+
+/** The video ID for a Douyin share link: parsed directly from
+ *  douyin.com/video/<id> links, otherwise read off the short link's
+ *  redirect target (v.douyin.com → iesdouyin.com/share/video/<id>/). */
+async function resolveDouyinVideoId(shareUrl: string): Promise<string | null> {
+  const direct = douyinIdFromUrl(shareUrl);
+  if (direct) return direct;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetchWithTimeout(
+        shareUrl,
+        { headers: { "User-Agent": DOUYIN_UA }, redirect: "follow" },
+        20000,
+      );
+      const fromFinal = douyinIdFromUrl(res.url || "");
+      if (fromFinal) return fromFinal;
+      const body = await res.text().catch(() => "");
+      const inBody = body.match(/share\/video\/(\d{10,22})/);
+      if (inBody?.[1]) return inBody[1];
+      return null;
+    } catch {
+      /* one retry on transient network failure */
+    }
+  }
+  return null;
+}
+
+/** Extracts the JSON object assigned to window._ROUTER_DATA by
+ *  bracket-matching from the first "{" after the assignment (the object
+ *  contains nested braces and escaped quotes, so a regex won't do). */
+function extractRouterData(html: string): unknown | null {
+  const marker = "window._ROUTER_DATA";
+  const idx = html.indexOf(marker);
+  if (idx < 0) return null;
+  const start = html.indexOf("{", idx);
+  if (start < 0) return null;
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < html.length; i++) {
+    const ch = html[i];
+    if (ch === undefined) break;
+    if (inStr) {
+      if (esc) esc = false;
+      else if (ch === "\\") esc = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        try {
+          return JSON.parse(html.slice(start, i + 1));
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/** Depth-first search for the item object whose video.play_addr carries
+ *  a url_list — the shape the share page's own JS reads. */
+function findDouyinItem(node: unknown): Record<string, unknown> | null {
+  if (!node || typeof node !== "object") return null;
+  const rec = node as Record<string, unknown>;
+  const video = asRecord(rec.video);
+  const playAddr = asRecord(video?.play_addr);
+  if (playAddr && Array.isArray(playAddr.url_list)) return rec;
+  for (const v of Object.values(rec)) {
+    const found = findDouyinItem(v);
+    if (found) return found;
+  }
+  return null;
+}
+
+async function fetchDouyinSharePage(
+  videoId: string,
+  ttwid: string,
+): Promise<string | null> {
+  try {
+    const res = await fetchWithTimeout(
+      `https://www.iesdouyin.com/share/video/${videoId}/`,
+      {
+        headers: {
+          "User-Agent": DOUYIN_UA,
+          "Accept-Language": "zh-CN,zh;q=0.9",
+          Cookie: `ttwid=${ttwid}`,
+        },
+      },
+      25000,
+    );
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+/** Total file size for one play URL, from a 2-byte ranged GET: the
+ *  Content-Range total after the 302 to the CDN. Null when the CDN does
+ *  not confirm a size (that ratio is then not offered as a tier). */
+async function probeDouyinTierSize(playUrl: string): Promise<number | null> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const res = await fetchWithTimeout(
+        playUrl,
+        {
+          headers: {
+            "User-Agent": DOUYIN_UA,
+            Referer: "https://www.iesdouyin.com/",
+            Range: "bytes=0-1",
+          },
+          redirect: "follow",
+        },
+        20000,
+      );
+      const contentRange = res.headers.get("content-range");
+      const contentType = res.headers.get("content-type") ?? "";
+      try {
+        await res.body?.cancel();
+      } catch {
+        /* headers are all we needed */
+      }
+      if (!contentType.includes("video")) return null;
+      const m = contentRange?.match(/\/(\d+)\s*$/);
+      if (m?.[1]) return Number(m[1]);
+      // A 200 answer to a ranged request means the CDN ignored the
+      // range and is sending the whole file — its Content-Length is
+      // the total size.
+      const len = Number(res.headers.get("content-length") ?? 0);
+      if (res.status === 200 && len > 0) return len;
+      return null;
+    } catch {
+      /* one retry on transient network failure */
+    }
+  }
+  return null;
+}
+
+/** The quality tiers for one Douyin item: the ratio ladder probed
+ *  against Douyin's CDN and deduped by total size. 720p sorts first
+ *  (the default — Douyin files are big: 1080p can be ~98 MB), the rest
+ *  follow by height. When no probe confirms a size, the single URL
+ *  Douyin itself returned is offered as-is rather than inventing tiers. */
+async function buildDouyinVideos(
+  item: Record<string, unknown>,
+): Promise<VideoOption[]> {
+  const video = asRecord(item.video);
+  const playAddr = asRecord(video?.play_addr);
+  const urlList = Array.isArray(playAddr?.url_list) ? playAddr.url_list : [];
+  const rawPlay = strField(urlList[0]);
+  if (!rawPlay) return [];
+  const basePlay = rawPlay.replace("playwm", "play");
+  const srcW = numField(video?.width);
+  const srcH = numField(video?.height);
+
+  const tiers: { ratio: string; url: string; sizeBytes: number }[] = [];
+  const seenSizes = new Set<number>();
+  for (const ratio of DOUYIN_RATIO_LADDER) {
+    let u: URL;
+    try {
+      u = new URL(basePlay);
+    } catch {
+      break;
+    }
+    u.searchParams.set("ratio", ratio);
+    const size = await probeDouyinTierSize(u.toString());
+    if (size === null || size <= 0) continue;
+    if (seenSizes.has(size)) continue; // collapsed tier — same file
+    seenSizes.add(size);
+    tiers.push({ ratio, url: u.toString(), sizeBytes: size });
+  }
+
+  if (tiers.length === 0) {
+    let ratioParam: string | null = null;
+    try {
+      ratioParam = new URL(basePlay).searchParams.get("ratio");
+    } catch {
+      ratioParam = null;
+    }
+    return [
+      {
+        url: basePlay,
+        label: ratioParam
+          ? `${ratioParam} · No Watermark`
+          : "Original quality · No Watermark",
+        kind: "origin",
+        width: srcW,
+        height: srcH,
+        sizeBytes: null,
+      },
+    ];
+  }
+
+  const heightOf = (ratio: string) => Number(ratio.replace(/p$/i, "")) || 0;
+  tiers.sort((a, b) => {
+    if (a.ratio === "720p") return -1;
+    if (b.ratio === "720p") return 1;
+    return heightOf(b.ratio) - heightOf(a.ratio);
+  });
+  return tiers.map((t) => {
+    const h = heightOf(t.ratio);
+    return {
+      url: t.url,
+      label: `${t.ratio} · No Watermark`,
+      kind: "origin" as const,
+      width:
+        srcW && srcH && h > 0 ? Math.round((srcW * h) / srcH) : null,
+      height: h > 0 ? h : null,
+      sizeBytes: t.sizeBytes,
+    };
+  });
+}
+
+export async function resolveDouyinBuiltIn(
+  shareUrl: string,
+): Promise<ResolveOk | ResolveErr> {
+  const videoId = await resolveDouyinVideoId(shareUrl);
+  if (!videoId) {
+    return {
+      ok: false,
+      sourceUrl: shareUrl,
+      error:
+        "The video ID could not be found in this Douyin link — the link may have expired or been copied incompletely. Open the video in the Douyin app, tap Share, copy the full share link again and paste it here.",
+      usedCustomApi: false,
+      note: null,
+    };
+  }
+
+  let item: Record<string, unknown> | null = null;
+  let sawShell = false;
+  let ttwid = await getDouyinTtwid(false);
+  for (let attempt = 0; attempt < 2 && !item; attempt++) {
+    if (!ttwid) break;
+    const html = await fetchDouyinSharePage(videoId, ttwid);
+    if (html) {
+      const data = extractRouterData(html);
+      const found = data ? findDouyinItem(data) : null;
+      if (found) {
+        item = found;
+        break;
+      }
+      // Anti-bot shell (no play_addr): rotate the ttwid and retry once.
+      sawShell = true;
+      ttwid = await getDouyinTtwid(true);
+    }
+  }
+
+  if (!item) {
+    if (!ttwid) {
+      return {
+        ok: false,
+        sourceUrl: shareUrl,
+        error:
+          "Could not connect to Douyin — the anonymous session Douyin requires could not be created from our server. Please try again in a while.",
+        usedCustomApi: false,
+        note: null,
+      };
+    }
+    return {
+      ok: false,
+      sourceUrl: shareUrl,
+      error: sawShell
+        ? "Douyin returned an anti-bot page instead of the video data, even after a retry with a fresh session. Please try again in a while."
+        : "No video was found for this Douyin link — it may be private, deleted, or not a video post. Copy the share link of a public Douyin video and try again.",
+      usedCustomApi: false,
+      note: null,
+    };
+  }
+
+  const video = asRecord(item.video);
+  const author = asRecord(item.author);
+  const desc = (strField(item.desc) ?? "").replace(/\s+/g, " ").slice(0, 200);
+  const nickname = strField(author?.nickname);
+  const title = desc || (nickname ? `Douyin video by ${nickname}` : "Douyin video");
+  const firstUrl = (rec: Record<string, unknown> | null): string | null =>
+    strField(Array.isArray(rec?.url_list) ? rec.url_list[0] : null);
+  const coverUrl =
+    firstUrl(asRecord(video?.cover)) ??
+    firstUrl(asRecord(video?.origin_cover)) ??
+    firstUrl(asRecord(video?.dynamic_cover));
+
+  const videos = await buildDouyinVideos(item);
+  if (videos.length === 0) {
+    return {
+      ok: false,
+      sourceUrl: shareUrl,
+      error:
+        "Douyin returned this video's page but no playable video file — it may be an image post or a restricted video. Copy the share link of a public Douyin video and try again.",
+      usedCustomApi: false,
+      note: null,
+    };
+  }
+
+  return {
+    ok: true,
+    sourceUrl: shareUrl,
+    title,
+    coverUrl,
+    videos,
+    images: [],
+    usedCustomApi: false,
+    note: null,
+  };
+}
+
 export { fetchWithTimeout, resolveViaCustomApi };
+
