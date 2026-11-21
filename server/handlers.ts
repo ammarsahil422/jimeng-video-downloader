@@ -19,9 +19,12 @@ import { blobKeyForUrl, type FileStore } from "./files";
 import {
   ALLOWED_HOSTS,
   BROWSER_UA,
+  DOUYIN_HOSTS,
+  DOUYIN_UA,
   extractCandidateUrls,
   fetchWithTimeout,
   resolveBuiltIn,
+  resolveDouyinBuiltIn,
   resolveViaCustomApi,
 } from "./resolver";
 
@@ -722,6 +725,10 @@ const DOWNLOAD_HOST_SUFFIXES = [
   // vlab VOD CDN (e.g. v3-artist.vlabvod.com) — without this suffix the
   // download proxy would refuse the very file the site promises.
   "vlabvod.com",
+  // Douyin: the no-watermark play endpoint lives on aweme.snssdk.com and
+  // 302-redirects to the zjcdn.com CDN — both are ByteDance hosts.
+  "snssdk.com",
+  "zjcdn.com",
 ];
 
 function isDownloadableHost(hostname: string): boolean {
@@ -759,6 +766,11 @@ function ensureSubscriptionSchema(env: Env): void {
   }
   if (!names.has("anon_id")) {
     env.store.db.exec("ALTER TABLE downloads ADD COLUMN anon_id TEXT");
+  }
+  if (!names.has("platform")) {
+    env.store.db.exec(
+      "ALTER TABLE downloads ADD COLUMN platform TEXT NOT NULL DEFAULT 'jimeng'",
+    );
   }
 }
 
@@ -867,6 +879,81 @@ async function resolveLink(env: Env, args: unknown): Promise<ResolveResponse> {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Douyin resolve — mirrors resolveLink, but for public Douyin share links
+// (v.douyin.com short link or douyin.com/video/<id>). The resolver is the
+// verified ttwid chain in resolver.ts (anonymous ttwid mint → iesdouyin
+// share page → window._ROUTER_DATA → playwm→play swap); the dead
+// iteminfo API is never used. History rows are labelled platform "douyin".
+// Downloads themselves go through prepareDownload, so the free daily
+// limit / plan quota applies exactly as for Jimeng.
+// ---------------------------------------------------------------------------
+
+async function resolveDouyinLink(env: Env, args: unknown): Promise<ResolveResponse> {
+  ensureSubscriptionSchema(env);
+  const text = reqString(args, "text", 4000);
+  // Who fetched this — same attribution as resolveLink; resolving
+  // itself is public.
+  const me = authUser(env, optToken(args));
+  const ownerId = me?.id ?? null;
+  const ownerAnon = me ? null : (optString(args, "anonId", 100) || null);
+  const candidates = extractCandidateUrls(text);
+  const hostOf = (u: string): string => {
+    try {
+      return new URL(u).hostname.toLowerCase();
+    } catch {
+      return "";
+    }
+  };
+  const shareUrl = candidates.find((u) => DOUYIN_HOSTS.has(hostOf(u)));
+  if (!shareUrl) {
+    if (candidates.length > 0) {
+      return {
+        ok: false, sourceUrl: candidates[0] ?? "", title: "", coverUrl: null,
+        videos: [], images: [], usedCustomApi: false, note: null,
+        error:
+          "A link was found in the pasted text, but it is not a Douyin link. Only public share links from douyin.com or v.douyin.com work here — Jimeng links go in the Jimeng Downloader.",
+        downloadId: null,
+      };
+    }
+    return {
+      ok: false, sourceUrl: "", title: "", coverUrl: null, videos: [], images: [],
+      usedCustomApi: false, note: null,
+      error:
+        "No link was found. Paste Douyin's full share text — the link will be extracted from it automatically.",
+      downloadId: null,
+    };
+  }
+
+  const result = await resolveDouyinBuiltIn(shareUrl);
+  if (result.ok) {
+    const first = result.videos[0];
+    let downloadId: number | null = null;
+    if (first) {
+      downloadId = env.store.insertDownload({
+        sourceUrl: shareUrl,
+        title: result.title,
+        videoUrl: first.url,
+        coverUrl: result.coverUrl,
+        platform: "douyin",
+        userId: ownerId,
+        anonId: ownerAnon,
+      });
+    }
+    return {
+      ok: true, sourceUrl: result.sourceUrl, title: result.title,
+      coverUrl: result.coverUrl, videos: result.videos, images: result.images,
+      usedCustomApi: false, note: null, error: null,
+      downloadId,
+    };
+  }
+  return {
+    ok: false, sourceUrl: result.sourceUrl, title: "", coverUrl: null,
+    videos: [], images: [], usedCustomApi: false, note: null, error: result.error,
+    downloadId: null,
+  };
+}
+
 async function prepareDownload(
   env: Env,
   args: unknown,
@@ -887,10 +974,16 @@ async function prepareDownload(
   if (parsed.protocol !== "https:" || !isDownloadableHost(parsed.hostname)) {
     return {
       ok: false, downloadUrl: null, sizeBytes: 0,
-      error: "This file is not on Jimeng's CDN, so the download could not be prepared on the server.",
+      error: "This file is not on a supported CDN (Jimeng / Douyin), so the download could not be prepared on the server.",
       limitReached: false,
     };
   }
+  // Douyin files are fetched from the Douyin play endpoint / CDN,
+  // which expects the iesdouyin Referer and the iOS UA the resolver
+  // used; Jimeng files keep the Jimeng Referer.
+  const isDouyinFile =
+    parsed.hostname.toLowerCase().endsWith("snssdk.com") ||
+    parsed.hostname.toLowerCase().endsWith("zjcdn.com");
 
   // --- Limits (checked BEFORE any file is fetched) -------------------
   // Suspended customers cannot download at all (server-enforced).
@@ -954,38 +1047,80 @@ async function prepareDownload(
       limitReached: false,
     };
   }
-  let res: Response;
-  try {
-    res = await fetchWithTimeout(
-      url,
-      { headers: { "User-Agent": BROWSER_UA, Referer: "https://jimeng.jianying.com/" } },
-      120000,
-    );
-  } catch {
-    return {
-      ok: false, downloadUrl: null, sizeBytes: 0,
-      error: "The file could not be loaded from Jimeng's CDN — this is an internet or CDN issue. Please try again in a while.",
-      limitReached: false,
-    };
+  // One retry on transient network failures — a dropped connection
+  // mid-download was observed on Douyin's CDN (and Douyin files are
+  // large: a 1080p tier can be ~98 MB), and a single retry fixed it.
+  // An HTTP error status is NOT retried: the CDN answered, and its
+  // answer (usually an expired link) will not change in a second.
+  const dlHeaders = isDouyinFile
+    ? { "User-Agent": DOUYIN_UA, Referer: "https://www.iesdouyin.com/" }
+    : { "User-Agent": BROWSER_UA, Referer: "https://jimeng.jianying.com/" };
+  let bytes: Uint8Array | null = null;
+  let contentType = "application/octet-stream";
+  let httpStatus: number | null = null;
+  let tooLarge = false;
+  for (let attempt = 0; attempt < 2 && !bytes && !tooLarge; attempt++) {
+    let res: Response;
+    try {
+      res = await fetchWithTimeout(url, { headers: dlHeaders }, 120000);
+    } catch {
+      continue; // transient network failure — retry once
+    }
+    if (!res.ok) {
+      httpStatus = res.status;
+      break;
+    }
+    const declared = Number(res.headers.get("content-length") ?? 0);
+    if (declared > 300_000_000) {
+      tooLarge = true;
+      break;
+    }
+    try {
+      const buf = new Uint8Array(await res.arrayBuffer());
+      if (buf.byteLength > 0) {
+        bytes = buf;
+        contentType =
+          res.headers.get("content-type")?.split(";")[0]?.trim() ||
+          "application/octet-stream";
+      }
+    } catch {
+      // Connection reset mid-body — retry once.
+      continue;
+    }
   }
-  if (!res.ok) {
-    return {
-      ok: false, downloadUrl: null, sizeBytes: 0,
-      error: `Jimeng's CDN refused to serve the file (HTTP ${res.status}) — the link may have expired. Fetch the video again and then download it.`,
-      limitReached: false,
-    };
-  }
-  const declared = Number(res.headers.get("content-length") ?? 0);
-  if (declared > 300_000_000) {
+  if (tooLarge) {
     return { ok: false, downloadUrl: null, sizeBytes: 0, error: "The file is too large (over 300 MB) and cannot be prepared for download on the server.", limitReached: false };
   }
-  const bytes = new Uint8Array(await res.arrayBuffer());
-  if (bytes.byteLength === 0) {
-    return { ok: false, downloadUrl: null, sizeBytes: 0, error: "An empty file was received from the CDN — please try again.", limitReached: false };
+  if (!bytes) {
+    if (httpStatus !== null) {
+      return {
+        ok: false, downloadUrl: null, sizeBytes: 0,
+        error: `The CDN refused to serve the file (HTTP ${httpStatus}) — the link may have expired. Fetch the video again and then download it.`,
+        limitReached: false,
+      };
+    }
+    return {
+      ok: false, downloadUrl: null, sizeBytes: 0,
+      error: "The file could not be loaded from the CDN — this is an internet or CDN issue. Please try again in a while.",
+      limitReached: false,
+    };
   }
-  const contentType =
-    res.headers.get("content-type")?.split(";")[0]?.trim() ||
-    "application/octet-stream";
+  // A "successful" fetch is not always a video: Douyin's play endpoint
+  // answers an unknown path with HTTP 200 plus a tiny JSON error body
+  // ({"status_code":0,"status_msg":"url doesn't match"}). Storing that
+  // as a video blob and charging a download for it would be wrong, so
+  // reject BEFORE storing the blob and BEFORE logging the download
+  // event — a rejected fetch consumes no quota.
+  const firstByte = bytes[0];
+  const bodyLooksJson =
+    contentType === "application/json" || firstByte === 0x7b; // '{'
+  if (bodyLooksJson) {
+    return {
+      ok: false, downloadUrl: null, sizeBytes: 0,
+      error: "The CDN did not return a video file — the link may have expired. Fetch the video again and then download it.",
+      limitReached: false,
+    };
+  }
   const stored = await env.files.store(key, bytes, contentType);
   logDownload(bytes.byteLength);
   return {
@@ -1312,6 +1447,7 @@ function listHistory(env: Env, args: unknown): {
     title: string;
     videoUrl: string;
     coverUrl: string | null;
+    platform: "jimeng" | "douyin";
     createdAt: string;
   }[];
 } {
@@ -1343,6 +1479,7 @@ function listHistory(env: Env, args: unknown): {
       title: r.title,
       videoUrl: r.videoUrl,
       coverUrl: r.coverUrl,
+      platform: r.platform,
       createdAt: r.createdAt.toISOString(),
     })),
   };
@@ -3784,6 +3921,7 @@ export type ActionHandler = (env: Env, args: unknown) => Promise<unknown> | unkn
 
 export const ACTIONS: Record<string, ActionHandler> = {
   resolveLink,
+  resolveDouyinLink,
   prepareDownload,
   getSettings,
   getSiteSeo,

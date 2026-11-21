@@ -4,9 +4,10 @@
 
 -- Key/value settings: api_key, api_base_url, adsense_head, adsense_top,
 -- adsense_incontent, adsense_sidebar, adsense_bottom, adsense_socialbar,
--- smart_link_url, smart_link_enabled, seo_title, seo_description,
--- seo_keywords, free_daily_limit. adsense_top / adsense_head /
--- adsense_incontent / adsense_socialbar default to the owner's Adsterra
+-- adsense_mobile, smart_link_url, smart_link_enabled, seo_title,
+-- seo_description, seo_keywords, free_daily_limit. adsense_top /
+-- adsense_head / adsense_incontent / adsense_sidebar / adsense_bottom /
+-- adsense_socialbar / adsense_mobile default to the owner's Adsterra
 -- codes when never set (see getAdSlotCodeValues in handlers.ts); an
 -- explicit remove writes an empty value so the default does not return.
 CREATE TABLE IF NOT EXISTS settings (
@@ -20,6 +21,10 @@ CREATE TABLE IF NOT EXISTS downloads (
   title TEXT NOT NULL DEFAULT '',
   video_url TEXT NOT NULL,
   cover_url TEXT,
+  -- Which downloader produced the row ("jimeng" or "douyin") so History
+  -- can label it; older rows default to "jimeng". Old databases gain the
+  -- column via the PRAGMA-guarded ALTER in the Store constructor.
+  platform TEXT NOT NULL DEFAULT 'jimeng',
   created_at INTEGER NOT NULL
 );
 

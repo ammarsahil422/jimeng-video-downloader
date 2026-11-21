@@ -14,6 +14,9 @@ export type DownloadRow = {
   title: string;
   videoUrl: string;
   coverUrl: string | null;
+  // Which downloader produced the row ("jimeng" or "douyin") so History
+  // can label it; older rows default to "jimeng".
+  platform: "jimeng" | "douyin";
   createdAt: Date;
   userId: number | null;
   anonId: string | null;
@@ -228,6 +231,14 @@ export class Store {
     if (!names.has("anon_id")) {
       this.db.exec("ALTER TABLE downloads ADD COLUMN anon_id TEXT");
     }
+    // Douyin platform column (added with the Douyin downloader): which
+    // downloader produced the history row. Same PRAGMA-guarded pattern
+    // as user_id / anon_id above, so old databases keep working.
+    if (!names.has("platform")) {
+      this.db.exec(
+        "ALTER TABLE downloads ADD COLUMN platform TEXT NOT NULL DEFAULT 'jimeng'",
+      );
+    }
     // Phase 4 columns (added after the first release): the admin's
     // two-factor secret/enabled flag and the session last-seen stamp.
     // Added here at startup, BEFORE any auth query — this is the
@@ -300,19 +311,21 @@ export class Store {
     title: string;
     videoUrl: string;
     coverUrl: string | null;
+    platform?: "jimeng" | "douyin";
     userId?: number | null;
     anonId?: string | null;
   }): number {
     const info = this.db
       .query(
-        "INSERT INTO downloads (source_url, title, video_url, cover_url, user_id, anon_id, created_at) " +
-          "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO downloads (source_url, title, video_url, cover_url, platform, user_id, anon_id, created_at) " +
+          "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       )
       .run(
         row.sourceUrl,
         row.title,
         row.videoUrl,
         row.coverUrl,
+        row.platform ?? "jimeng",
         row.userId ?? null,
         row.anonId ?? null,
         Date.now(),
@@ -326,6 +339,7 @@ export class Store {
     title: string;
     video_url: string;
     cover_url: string | null;
+    platform: string | null;
     user_id: number | null;
     anon_id: string | null;
     created_at: number;
@@ -336,6 +350,7 @@ export class Store {
       title: r.title,
       videoUrl: r.video_url,
       coverUrl: r.cover_url,
+      platform: r.platform === "douyin" ? "douyin" : "jimeng",
       createdAt: new Date(r.created_at),
       userId: r.user_id,
       anonId: r.anon_id,
@@ -345,7 +360,7 @@ export class Store {
   listDownloads(limit: number): DownloadRow[] {
     const rows = this.db
       .query(
-        "SELECT id, source_url, title, video_url, cover_url, user_id, anon_id, created_at " +
+        "SELECT id, source_url, title, video_url, cover_url, platform, user_id, anon_id, created_at " +
           "FROM downloads ORDER BY id DESC LIMIT ?",
       )
       .all(limit) as {
@@ -354,6 +369,7 @@ export class Store {
       title: string;
       video_url: string;
       cover_url: string | null;
+      platform: string | null;
       user_id: number | null;
       anon_id: string | null;
       created_at: number;
@@ -365,7 +381,7 @@ export class Store {
   listDownloadsForUser(userId: number, limit: number): DownloadRow[] {
     const rows = this.db
       .query(
-        "SELECT id, source_url, title, video_url, cover_url, user_id, anon_id, created_at " +
+        "SELECT id, source_url, title, video_url, cover_url, platform, user_id, anon_id, created_at " +
           "FROM downloads WHERE user_id = ? ORDER BY id DESC LIMIT ?",
       )
       .all(userId, limit) as {
@@ -374,6 +390,7 @@ export class Store {
       title: string;
       video_url: string;
       cover_url: string | null;
+      platform: string | null;
       user_id: number | null;
       anon_id: string | null;
       created_at: number;
@@ -387,7 +404,7 @@ export class Store {
   listDownloadsForAnon(anonId: string, limit: number): DownloadRow[] {
     const rows = this.db
       .query(
-        "SELECT id, source_url, title, video_url, cover_url, user_id, anon_id, created_at " +
+        "SELECT id, source_url, title, video_url, cover_url, platform, user_id, anon_id, created_at " +
           "FROM downloads WHERE anon_id = ? OR (user_id IS NULL AND anon_id IS NULL) " +
           "ORDER BY id DESC LIMIT ?",
       )
@@ -397,6 +414,7 @@ export class Store {
       title: string;
       video_url: string;
       cover_url: string | null;
+      platform: string | null;
       user_id: number | null;
       anon_id: string | null;
       created_at: number;
@@ -1170,7 +1188,7 @@ export class Store {
   getDownloadById(id: number): DownloadRow | null {
     const row = this.db
       .query(
-        "SELECT id, source_url, title, video_url, cover_url, user_id, anon_id, created_at " +
+        "SELECT id, source_url, title, video_url, cover_url, platform, user_id, anon_id, created_at " +
           "FROM downloads WHERE id = ? LIMIT 1",
       )
       .get(id) as {
@@ -1179,6 +1197,7 @@ export class Store {
       title: string;
       video_url: string;
       cover_url: string | null;
+      platform: string | null;
       user_id: number | null;
       anon_id: string | null;
       created_at: number;
@@ -1770,7 +1789,7 @@ export class Store {
   listAllDownloads(): DownloadRow[] {
     const rows = this.db
       .query(
-        "SELECT id, source_url, title, video_url, cover_url, user_id, anon_id, created_at " +
+        "SELECT id, source_url, title, video_url, cover_url, platform, user_id, anon_id, created_at " +
           "FROM downloads ORDER BY id ASC",
       )
       .all() as {
@@ -1779,6 +1798,7 @@ export class Store {
       title: string;
       video_url: string;
       cover_url: string | null;
+      platform: string | null;
       user_id: number | null;
       anon_id: string | null;
       created_at: number;
